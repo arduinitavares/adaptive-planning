@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none';">
+  <title>Live Plan</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header" role="banner">
+      <div class="header-top">
+        <div class="header-brand">
+          <span class="brand-title">LIVE PLAN</span>
+          <div id="conn-pill" class="status-pill status-pill--connecting" role="status" aria-live="polite">
+            <span class="pill-dot" aria-hidden="true"></span>
+            <span id="conn-label">Connecting…</span>
+          </div>
+        </div>
+
+        <div class="header-meta">
+          <div class="meta-item">
+            <span class="meta-label">Status</span>
+            <span id="task-status-val" class="badge badge--neutral">Waiting</span>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Mode</span>
+            <span id="exec-mode-val" class="badge badge--neutral">—</span>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Revision</span>
+            <span id="rev-val" class="meta-value tabular">—</span>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Published</span>
+            <time id="time-ago-val" class="meta-value tabular">—</time>
+          </div>
+          <div id="next-step-meta" class="meta-item" hidden>
+            <span class="meta-label">Next Step</span>
+            <span id="next-step-val" class="meta-value tabular">—</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="header-goal">
+        <h1 id="goal-heading" class="goal-text">Waiting for published plan…</h1>
+        <div id="task-id-row" class="task-id-row" hidden>
+          <span class="meta-label">Task ID:</span>
+          <code id="task-id-val" class="task-id-code"></code>
+        </div>
+      </div>
+
+      <div id="reconnect-banner" class="banner banner--warning" hidden role="alert">
+        <span class="banner-icon" aria-hidden="true">!</span>
+        <span id="reconnect-text">Disconnected from server. Reconnecting… Displaying last confirmed state.</span>
+      </div>
+    </header>
+
+    <main class="dashboard-grid">
+      <!-- Primary: Dependency Map -->
+      <section class="panel panel--graph" aria-label="Step Dependency Map">
+        <div class="panel-header">
+          <h2 class="panel-title">Dependency Map</h2>
+          <div class="legend" aria-label="Legend">
+            <span class="legend-item"><span class="legend-marker marker--complete" aria-hidden="true">[x]</span> Complete</span>
+            <span class="legend-item"><span class="legend-marker marker--in-progress" aria-hidden="true">[&gt;]</span> Working</span>
+            <span class="legend-item"><span class="legend-marker marker--blocked" aria-hidden="true">[!]</span> Blocked</span>
+            <span class="legend-item"><span class="legend-marker marker--pending" aria-hidden="true">[ ]</span> Pending</span>
+          </div>
+        </div>
+
+        <div class="graph-container" id="graph-container">
+          <div id="graph-empty" class="empty-message">No plan steps published yet. Waiting for initial agent publish.</div>
+          <div id="graph-viewport" class="graph-viewport" hidden>
+            <svg id="graph-svg" class="graph-svg" aria-hidden="true">
+              <defs>
+                <marker id="arrow-default" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                  <path d="M 0 1 L 10 5 L 0 9 z" fill="#8c827a"></path>
+                </marker>
+                <marker id="arrow-complete" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                  <path d="M 0 1 L 10 5 L 0 9 z" fill="#3f624d"></path>
+                </marker>
+                <marker id="arrow-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                  <path d="M 0 1 L 10 5 L 0 9 z" fill="#0f766e"></path>
+                </marker>
+              </defs>
+            </svg>
+            <div id="graph-nodes" class="graph-nodes"></div>
+          </div>
+        </div>
+
+        <!-- Retired Steps Collapsible Section -->
+        <div id="retired-section" class="retired-section" hidden>
+          <details id="retired-details" class="retired-details">
+            <summary id="retired-summary" class="retired-summary">
+              <span class="retired-summary-title">Retired (<span id="retired-count">0</span>)</span>
+            </summary>
+            <div id="retired-list" class="retired-list"></div>
+          </details>
+        </div>
+      </section>
+
+      <!-- Secondary: Split view for Details and History -->
+      <aside class="sidebar-panels">
+        <!-- Step details Panel -->
+        <section class="panel panel--details" aria-labelledby="details-title">
+          <div class="panel-header">
+            <h2 id="details-title" class="panel-title">Step details</h2>
+          </div>
+          <div id="details-container" class="details-body">
+            <p class="empty-message">Select a node in the dependency map to view checks and evidence.</p>
+          </div>
+        </section>
+
+        <!-- Revision History Panel -->
+        <section class="panel panel--history" aria-labelledby="history-title">
+          <div class="panel-header">
+            <h2 id="history-title" class="panel-title">Change History</h2>
+          </div>
+          <div class="history-body">
+            <div id="history-empty" class="empty-message">No revisions recorded.</div>
+            <ol id="history-list" class="history-list" reversed></ol>
+          </div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

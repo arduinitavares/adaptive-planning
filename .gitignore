@@ -1,0 +1,25 @@
+# Generated Python files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Task state, proposals, logs, and local artifacts
+/work/
+/outputs/
+live_plan.json
+live_plan.lock
+live_plan.corrupt.*.json
+server.json
+server.json.lock
+*.log
+*.tmp.*
+
+# Local configuration
+.env
+.env.*
+.DS_Store
+Thumbs.db

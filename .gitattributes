@@ -1,0 +1,3 @@
+* text=auto eol=lf
+# Preserve the exact legacy compatibility fixture bytes.
+tests/fixtures/live_plan_v1.py -text
