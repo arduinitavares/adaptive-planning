@@ -179,12 +179,84 @@
 
     // Status visual configurations
     const STATUS_CONFIG = {
-      complete: { marker: '[x]', label: 'Complete', class: 'complete', markerClass: 'marker--complete' },
-      'in-progress': { marker: '[>]', label: 'Working', class: 'in-progress', markerClass: 'marker--in-progress' },
-      blocked: { marker: '[!]', label: 'Blocked', class: 'blocked', markerClass: 'marker--blocked' },
-      pending: { marker: '[ ]', label: 'Pending', class: 'pending', markerClass: 'marker--pending' },
-      retired: { marker: '[-]', label: 'Retired', class: 'retired', markerClass: 'marker--retired' }
+      complete: { label: 'Complete', iconType: 'complete', class: 'complete' },
+      'in-progress': { label: 'Working', iconType: 'working', class: 'in-progress' },
+      running: { label: 'Working', iconType: 'working', class: 'running' },
+      blocked: { label: 'Blocked', iconType: 'blocked', class: 'blocked' },
+      pending: { label: 'Pending', iconType: 'pending', class: 'pending' },
+      planning: { label: 'Planning', iconType: 'planning', class: 'planning' },
+      stopped: { label: 'Stopped', iconType: 'stopped', class: 'stopped' },
+      retired: { label: 'Retired', iconType: 'retired', class: 'retired' }
     };
+
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+
+    function createSvgIcon(type) {
+      const svg = document.createElementNS(SVG_NS, 'svg');
+      svg.setAttribute('viewBox', '0 0 16 16');
+      svg.setAttribute('width', '16');
+      svg.setAttribute('height', '16');
+      svg.setAttribute('fill', 'none');
+      svg.setAttribute('stroke', 'currentColor');
+      svg.setAttribute('stroke-width', '1.7');
+      svg.setAttribute('stroke-linecap', 'round');
+      svg.setAttribute('stroke-linejoin', 'round');
+      svg.setAttribute('aria-hidden', 'true');
+      svg.setAttribute('focusable', 'false');
+      svg.classList.add('status-icon');
+
+      if (type === 'complete') {
+        const path = document.createElementNS(SVG_NS, 'path');
+        path.setAttribute('d', 'm4 8 3 3 5-6');
+        svg.appendChild(path);
+      } else if (type === 'working' || type === 'in-progress' || type === 'running') {
+        const circle = document.createElementNS(SVG_NS, 'circle');
+        circle.setAttribute('cx', '8');
+        circle.setAttribute('cy', '8');
+        circle.setAttribute('r', '6');
+        const path = document.createElementNS(SVG_NS, 'path');
+        path.setAttribute('d', 'M8 4v4l3 2');
+        svg.appendChild(circle);
+        svg.appendChild(path);
+      } else if (type === 'blocked') {
+        const triangle = document.createElementNS(SVG_NS, 'path');
+        triangle.setAttribute('d', 'm8 2 7 12H1Z');
+        const mark = document.createElementNS(SVG_NS, 'path');
+        mark.setAttribute('d', 'M8 6v3m0 2v.1');
+        svg.appendChild(triangle);
+        svg.appendChild(mark);
+      } else if (type === 'pending') {
+        const circle = document.createElementNS(SVG_NS, 'circle');
+        circle.setAttribute('cx', '8');
+        circle.setAttribute('cy', '8');
+        circle.setAttribute('r', '6');
+        svg.appendChild(circle);
+      } else if (type === 'stopped' || type === 'pause') {
+        const path = document.createElementNS(SVG_NS, 'path');
+        path.setAttribute('d', 'M5 3v10M11 3v10');
+        svg.appendChild(path);
+      } else if (type === 'planning') {
+        const path = document.createElementNS(SVG_NS, 'path');
+        path.setAttribute('d', 'M4 2h8v12H4zM6 5h4M6 8h4M6 11h2');
+        svg.appendChild(path);
+      } else if (type === 'retired') {
+        const path = document.createElementNS(SVG_NS, 'path');
+        path.setAttribute('d', 'M2 8h12');
+        svg.appendChild(path);
+      }
+      return svg;
+    }
+
+    function renderStatusBadge(container, statusKey, customLabel) {
+      const conf = STATUS_CONFIG[statusKey] || STATUS_CONFIG.pending;
+      container.textContent = '';
+      const icon = createSvgIcon(conf.iconType);
+      container.appendChild(icon);
+      const labelSpan = document.createElement('span');
+      setText(labelSpan, customLabel || conf.label);
+      container.appendChild(labelSpan);
+      return container;
+    }
 
     function setText(el, text) {
       if (el) el.textContent = text != null ? String(text) : '';
@@ -278,7 +350,7 @@
       // Task status badge (stopped has own distinct style)
       const tStatus = plan.status || 'planning';
       taskStatusVal.className = `badge badge--${tStatus}`;
-      setText(taskStatusVal, tStatus);
+      renderStatusBadge(taskStatusVal, tStatus);
 
       // Execution mode badge (mode badge is neutral)
       const eMode = plan.executionMode || '—';
@@ -358,7 +430,7 @@
       const nodeWidth = horizontal
         ? Math.min(248, (available - padding * 2 - gap * (Math.max(1, layers.length) - 1)) / Math.max(1, layers.length))
         : Math.max(138, Math.min(240, (available - padding * 2 - 16 * (maxSiblings - 1)) / maxSiblings));
-      const nodeHeight = horizontal ? 104 : 112;
+      const nodeHeight = 128;
       const positions = new Map();
       const totalWidth = horizontal ? available : Math.max(available, maxSiblings * (nodeWidth + 16) - 16 + padding * 2);
       const totalHeight = horizontal
@@ -452,8 +524,7 @@
           headerEl.className = 'node-header';
 
           const idWrap = document.createElement('span');
-          idWrap.style.display = 'inline-flex';
-          idWrap.style.alignItems = 'center';
+          idWrap.className = 'node-id-group';
 
           const idEl = document.createElement('span');
           idEl.className = 'node-id';
@@ -469,12 +540,12 @@
 
           const badgeEl = document.createElement('span');
           badgeEl.className = 'node-status-badge';
-          headerEl.appendChild(badgeEl);
 
           const titleEl = document.createElement('div');
           titleEl.className = 'node-title';
 
           nodeEl.appendChild(headerEl);
+          nodeEl.appendChild(badgeEl);
           nodeEl.appendChild(titleEl);
 
           nodeEl.addEventListener('click', () => selectStep(step.id));
@@ -489,15 +560,15 @@
           nodeElementsMap.set(step.id, nodeEl);
         }
 
+        const sConf = STATUS_CONFIG[step.status] || STATUS_CONFIG.pending;
         nodeEl.style.transform = `translate(${pos.x}px, ${pos.y}px)`;
         nodeEl.style.width = `${pos.width}px`;
         nodeEl.style.height = `${pos.height}px`;
-        nodeEl.setAttribute('aria-label', `Step ${step.id}: ${step.title}`);
+        nodeEl.setAttribute('aria-label', `Step ${step.id} (${sConf.label}): ${step.title}`);
         nodeEl.title = step.title;
         const statusChanged = !isNew && nodeEl.dataset.status !== step.status;
         nodeEl.dataset.status = step.status;
 
-        const sConf = STATUS_CONFIG[step.status] || STATUS_CONFIG.pending;
         nodeEl.className = `step-node step-node--${sConf.class}`;
         if (statusChanged) {
           nodeEl.classList.add('step-node--changed');
@@ -517,6 +588,8 @@
 
         setText(idEl, step.id);
         setText(titleEl, step.title);
+        titleEl.title = step.title;
+        titleEl.setAttribute('aria-label', step.title);
 
         const isNext = plan && plan.nextStepId === step.id && step.status !== 'complete' && step.status !== 'retired';
         if (nextBadge) {
@@ -526,14 +599,8 @@
           nodeEl.classList.add('step-node--next');
         }
 
-        badgeEl.textContent = '';
-        const markerSpan = document.createElement('span');
-        markerSpan.className = sConf.markerClass;
-        setText(markerSpan, sConf.marker);
-        const textSpan = document.createElement('span');
-        setText(textSpan, ` ${sConf.label}`);
-        badgeEl.appendChild(markerSpan);
-        badgeEl.appendChild(textSpan);
+        badgeEl.className = `node-status-badge badge badge--${sConf.class}`;
+        renderStatusBadge(badgeEl, step.status);
       });
     }
 
@@ -554,6 +621,9 @@
       retiredSteps.forEach(step => {
         const itemEl = document.createElement('div');
         itemEl.className = 'retired-item';
+        itemEl.setAttribute('role', 'button');
+        itemEl.setAttribute('tabindex', '0');
+        itemEl.setAttribute('aria-label', `Retired step ${step.id}: ${step.title}`);
         if (step.id === selectedStepId) {
           itemEl.classList.add('retired-item--selected');
         }
@@ -581,6 +651,12 @@
         }
 
         itemEl.addEventListener('click', () => selectStep(step.id));
+        itemEl.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            selectStep(step.id);
+          }
+        });
         retiredList.appendChild(itemEl);
       });
     }
@@ -667,9 +743,7 @@
       const titleSec = document.createElement('div');
       titleSec.className = 'detail-section';
       const titleHeader = document.createElement('div');
-      titleHeader.style.display = 'flex';
-      titleHeader.style.justifyContent = 'space-between';
-      titleHeader.style.alignItems = 'baseline';
+      titleHeader.className = 'detail-title-header';
 
       const idTag = document.createElement('code');
       idTag.className = 'task-id-code';
@@ -677,7 +751,7 @@
 
       const statusBadge = document.createElement('span');
       statusBadge.className = `badge badge--${sConf.class}`;
-      setText(statusBadge, `${sConf.marker} ${sConf.label}`);
+      renderStatusBadge(statusBadge, step.status);
 
       titleHeader.appendChild(idTag);
       titleHeader.appendChild(statusBadge);
@@ -761,22 +835,23 @@
           const depTag = document.createElement('button');
           depTag.type = 'button';
           depTag.className = 'dep-tag';
-          depTag.setAttribute('aria-label', `Jump to prerequisite step ${depId}`);
+          depTag.setAttribute('aria-label', `Jump to prerequisite step ${depId} (${depConf.label})`);
 
-          const marker = document.createElement('span');
-          marker.className = depConf.markerClass;
-          setText(marker, depConf.marker);
+          const depStatusBadge = document.createElement('span');
+          depStatusBadge.className = `dep-status-badge badge badge--${depConf.class}`;
+          renderStatusBadge(depStatusBadge, depStep ? depStep.status : 'pending');
 
-          const label = document.createElement('span');
-          setText(label, ` ${depId}`);
+          const depIdSpan = document.createElement('span');
+          depIdSpan.className = 'dep-tag-id';
+          setText(depIdSpan, depId);
 
-          depTag.appendChild(marker);
-          depTag.appendChild(label);
+          depTag.appendChild(depStatusBadge);
+          depTag.appendChild(depIdSpan);
 
           depTag.addEventListener('click', () => {
             selectStep(depId);
             const targetNode = nodeElementsMap.get(depId);
-            if (targetNode) targetNode.focus();
+            if (targetNode && typeof targetNode.focus === 'function') targetNode.focus();
           });
           depList.appendChild(depTag);
         });

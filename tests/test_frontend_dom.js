@@ -68,6 +68,8 @@ assert.equal(el('graph-nodes').children.length, 2); // retirement excluded from 
 assert.equal(el('exec-mode-val').className, 'badge badge--neutral');
 assert.ok(el('graph-nodes').children[0].classList.contains('step-node--in-progress'));
 assert.ok(el('graph-nodes').children[1].classList.contains('step-node--pending'));
+assert.equal(el('graph-nodes').children[0].querySelector('.status-icon').getAttribute('aria-hidden'), 'true');
+assert.equal(el('graph-nodes').children[0].getAttribute('aria-label'), 'Step A (Working): A');
 assert.equal(el('retired-count').textContent, '1');
 assert.equal(el('retired-section').hidden, false);
 assert.equal(el('retired-section').open, false);
@@ -106,14 +108,24 @@ const newer = {...initial, revision: 2, status: 'stopped', nextStepId: 'B',
 send(newer);
 assert.equal(el('reconnect-banner').hidden, true);
 assert.equal(el('task-status-val').className, 'badge badge--stopped');
+assert.equal(el('task-status-val').querySelector('.status-icon').getAttribute('aria-hidden'), 'true');
 send(initial); // positive valid revision 1 below current revision 2
 assert.match(el('reconnect-text').textContent, /consistency conflict/);
 const replacement = {...initial, generation: 'g2', objective: 'Replacement task', nextStepId: 'B',
-  status: 'planning', steps: [step('A', 'pending'), step('B', 'pending')]};
+  status: 'planning', steps: [step('A', 'pending'), {...step('B', 'pending'), dependsOn: ['A']}]};
 send(replacement);
 assert.equal(el('reconnect-banner').hidden, true);
 assert.equal(el('details-container').querySelector('.task-id-code').textContent, 'B');
 assert.equal(el('retired-section').hidden, true);
+const depTag = el('details-container').querySelector('.dep-tag');
+assert.equal(depTag.getAttribute('aria-label'), 'Jump to prerequisite step A (Pending)');
+assert.equal(depTag.querySelector('.status-icon').getAttribute('aria-hidden'), 'true');
+assert.equal(depTag.querySelector('.dep-tag-id').textContent, 'A');
+depTag.listeners.click();
+assert.equal(el('details-container').querySelector('.task-id-code').textContent, 'A');
+assert.ok(el('graph-nodes').children[0].classList.contains('step-node--selected'));
+assert.equal(el('graph-nodes').children[0].getAttribute('aria-pressed'), 'true');
+assert.ok(el('graph-nodes').children[0].querySelector('.node-status-badge'));
 
 const replacementHistoryNode = el('history-list').children[0];
 now += 10000;
