@@ -27,6 +27,58 @@ Derive execution permission from the user's request:
 Skill invocation does not expand permissions. Preserve required
 approvals and applicable testing, debugging, and review workflows.
 
+## Plan language
+
+Use `simplified-technical-english` for all new natural-language planning
+and reporting text. Load its installed `SKILL.md` before authoring text.
+Resolve the companion through the agent's skill catalog or a supplied
+path. Read its applicable references. Do not assume an installation path.
+
+This policy covers objectives, acceptance criteria, constraints,
+assumptions, step titles, instructions, completion checks, explanations,
+blockers, authored evidence summaries, progress updates, and final reports.
+It also covers new dashboard summaries, details, retirement reasons,
+history summaries, and authorization or recovery explanations.
+
+Classify each block by its function. Apply procedure rules to instructions
+and safety text. Apply descriptive rules to explanations and observations.
+Treat headings and short labels as labels, not as incomplete instructions.
+Write one instruction per sentence. Keep related work and its verification
+in one planning step when appropriate. Sentence splitting does not require
+new graph nodes or different dependencies.
+
+Preserve technical meaning, uncertainty, negation, conditions, sequence,
+numbers, units, thresholds, safety information, and authorization boundaries.
+Keep code, commands, paths, URLs, identifiers, schema keys, enum values,
+quoted evidence, error text, and mandated wording exact. Preserve published
+history and protected step fields. Apply language review to new authored
+text before publication. Do not rewrite previous evidence or protected
+completed-step fields to satisfy the new policy.
+
+Use the companion's governing-issue and terminology checks. When the
+official dictionary or governed terminology is unavailable, produce only
+an Issue 9-oriented candidate. Do not claim full conformance or guess
+approved vocabulary. Missing sources block strict verification, not a
+useful provisional plan whose meaning is clear.
+
+Give one compact language verification note with the initial plan.
+Identify the issue, evidence mode, available or missing terminology
+sources, protected-literal checks, and material unresolved items.
+Update the note when new unresolved items or a different evidence mode
+appear. Keep it beside the canonical plan, not in a competing plan record.
+Do not add unsupported metadata to dashboard JSON.
+
+If the companion is unavailable, report the missing dependency.
+Do not silently substitute another writing style or claim STE review.
+Preserve the existing plan. Continue independent authorized work only
+when it does not depend on the missing review. Do not guess unresolved
+technical meaning that can change safety, legality, or product behavior.
+
+Preserve the user's requested language and applicable publication rules.
+Do not translate text solely to apply STE. Report non-English text as
+outside the STE language-review scope. Task deliverables retain their
+governing specifications and protected source wording.
+
 ## Establish state
 
 Record the objective, verifiable acceptance criteria, constraints,
@@ -81,20 +133,14 @@ evidence. Do not create competing plan records.
 
 ## Reporting
 
-For progress updates, checkpoints, and final task reports, apply
-`caveman` for compression and `pstack-plugin:unslop` for plain writing.
-Read their installed instructions when available. Use the user's
-chosen Caveman level, or its default full level. Scope this style to
-task reporting; write deliverables in their requested style.
+Apply the Plan language policy to progress updates, checkpoints, and
+final task reports. Keep complete sentences and explicit relationships.
+Do not use Caveman compression for this skill.
 
-These writing preferences must preserve the reports and ASCII maps
-required here. Keep evidence, uncertainty, negations, numbers,
-authorization boundaries, and technical meaning intact. Expand
-sentences whenever compression makes sequence or dependencies unclear.
-Keep the user's language and exact code, commands, and error text.
-
-If either writing skill is unavailable, use short, direct sentences,
-remove filler and stock phrases, and preserve the same information.
+If `pstack-plugin:unslop` is available, apply it only when its edits
+preserve STE requirements, technical meaning, and protected literals.
+It does not replace the required STE companion. Preserve the reports
+and ASCII maps required here.
 
 At each meaningful checkpoint, briefly cover the result and evidence,
 material downstream impact, plan changes or "unchanged after review",

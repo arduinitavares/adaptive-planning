@@ -1,6 +1,18 @@
 # Live dashboard
 
-Optional companion for `adaptive-planning`. Use when the user requests a live or HTML plan. Keep Caveman and Unslop reporting. The page shows the objective, dependencies, current work, checks, evidence, retired steps, and revision history. It updates when the agent publishes a snapshot. It does not observe hidden activity or authorize work.
+Optional companion for `adaptive-planning`. Use when the user requests a live or HTML plan. Apply the Plan language policy in [SKILL.md](../SKILL.md#plan-language). The page shows the objective, dependencies, current work, checks, evidence, retired steps, and revision history. It updates when the agent publishes a snapshot. It does not observe hidden activity or authorize work.
+
+Review new authored text with `simplified-technical-english` before publishing.
+This includes `objective`, step `title`, `check`, `summary`, `details`,
+`retiredReason`, `changeSummary`, and new authorization or recovery explanations.
+Apply descriptive rules to authored observations in `evidence`.
+Preserve quoted evidence and exact literals. Do not rewrite published history,
+completed step fields, or an existing evidence prefix for language cleanup.
+Language review does not change identifiers, statuses, dependencies, or scope.
+
+Report language verification beside the plan. Do not add schema fields.
+Missing dictionary or terminology sources permit an Issue 9-oriented candidate,
+not a full-conformance claim. A missing companion is a separate dependency gap.
 
 Requires Python 3.10+ with its standard library. No packages, cloud service, or startup registration. Bind only to `127.0.0.1`. Do not expose the server publicly. The examples use an installation under `.agents/skills`.
 
@@ -42,22 +54,22 @@ Minimal initial proposal:
   "status": "planning",
   "executionMode": "first-step",
   "nextStepId": "inspect",
-  "changeSummary": "Inspect the inputs before choosing the transformation.",
+  "changeSummary": "Before you choose the transformation, inspect the inputs.",
   "steps": [
     {
       "id": "inspect",
-      "title": "Inspect inputs",
+      "title": "Inspect the inputs",
       "status": "pending",
       "dependsOn": [],
-      "check": "Required columns and date range checked",
+      "check": "Check the required columns. Check the date range.",
       "evidence": []
     },
     {
       "id": "report",
-      "title": "Build and verify report",
+      "title": "Build and verify the report",
       "status": "pending",
       "dependsOn": ["inspect"],
-      "check": "Totals reconcile with the checked input",
+      "check": "The totals reconcile with the checked input.",
       "evidence": []
     }
   ]

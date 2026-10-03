@@ -58,7 +58,13 @@ Use an empty destination. If a copy is already installed, review its local
 changes before replacing or updating it. A development checkout can live
 elsewhere; the agent must be able to discover or read its `SKILL.md`.
 
-Ordinary planning needs only the Markdown instructions. The dashboard requires
+Install `simplified-technical-english` as a separate companion skill.
+The agent must be able to discover or read its `SKILL.md` and references.
+Adaptive planning loads this companion for new plan and report text.
+It does not silently substitute another writing style if the companion
+is unavailable.
+
+Ordinary planning uses the two skills' Markdown instructions. The dashboard requires
 Python 3.10+ and a browser. It uses the Python standard library and local assets,
 with no package installation or hosted service.
 
@@ -85,10 +91,23 @@ You can also give the agent the path to [SKILL.md](SKILL.md). The dashboard is
 optional. Its [reference](references/live-dashboard.md) covers launch commands,
 proposal JSON, publishing, authorization intervals, migration, and recovery.
 
-Checkpoints use concise prose and ASCII dependency maps. If the optional
-`caveman` and `pstack-plugin:unslop` writing skills are installed, the skill uses
-them for task reporting. Otherwise it uses short, direct sentences with the
-same evidence and scope boundaries.
+Plans and reports use `simplified-technical-english` for new human-readable
+text. Instructions and explanations follow their respective language rules.
+The policy covers plan fields, completion checks, checkpoints, final reports,
+and new dashboard descriptions and history summaries. One instruction per
+sentence does not require one graph node per sentence.
+
+Caveman compression is no longer part of this skill. The optional
+`pstack-plugin:unslop` skill can remove filler only when its edits preserve
+STE requirements. Preserve exact literals, quoted evidence, published
+history, protected completed-step fields, and existing evidence prefixes.
+Pending steps can still change within the planning and publisher rules.
+The requested language and governing publication rules remain authoritative.
+
+Without the official dictionary and governed terminology, the output is
+an Issue 9-oriented candidate. Full conformance is not verified.
+The initial plan includes a compact language verification note.
+Later updates report new unresolved items or changes in the evidence mode.
 
 ## Dashboard boundaries
 
