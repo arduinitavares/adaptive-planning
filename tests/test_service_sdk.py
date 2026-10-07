@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import errno
 import json
 import socket
-import sys
 from typing import Any
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -116,8 +115,11 @@ def extract_request_protocol_version(req: CapturedRequest) -> str | None:
 async def shutdown_probe_server(server: uvicorn.Server, task: asyncio.Task[None]) -> None:
     server.should_exit = True
     try:
-        # Shield keeps timeout/caller cancellation distinct from server cancellation.
-        await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+        # wait leaves the owned task running on timeout/caller cancellation.
+        done, _ = await asyncio.wait({task}, timeout=5.0)
+        if not done:
+            raise asyncio.TimeoutError
+        task.result()
     except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
         caller_cancelled = bool(asyncio.current_task().cancelling())
         task.cancel()
@@ -126,7 +128,11 @@ async def shutdown_probe_server(server: uvicorn.Server, task: asyncio.Task[None]
         except asyncio.CancelledError:
             if asyncio.current_task().cancelling() and not caller_cancelled:
                 raise
-        if caller_cancelled:
+        except Exception as drain_error:
+            if caller_cancelled or asyncio.current_task().cancelling():
+                raise asyncio.CancelledError from drain_error
+            raise
+        if caller_cancelled or asyncio.current_task().cancelling():
             raise asyncio.CancelledError from exc
         if isinstance(exc, asyncio.TimeoutError):
             raise RuntimeError("Server shutdown timed out") from exc
@@ -134,6 +140,7 @@ async def shutdown_probe_server(server: uvicorn.Server, task: asyncio.Task[None]
 
 
 async def probe_protocols() -> tuple[SdkProbe, ...]:
+    body_error: BaseException | None = None
     # Reserve an ephemeral socket once and hand that socket to Uvicorn
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -238,7 +245,10 @@ async def probe_protocols() -> tuple[SdkProbe, ...]:
                     if auth != "Bearer synthetic-test-token":
                         raise AssertionError(f"Expected synthetic bearer token, got {auth}")
 
-            arguments = call_req.json_data.get("params", {}).get("arguments")
+            call_params = call_req.json_data.get("params")
+            if not isinstance(call_params, dict):
+                raise AssertionError(f"Mode '{mode}' recorded arguments require object params, got {call_params!r}")
+            arguments = call_params.get("arguments")
             if arguments != {"message": message}:
                 raise AssertionError(f"Mode '{mode}' recorded arguments {arguments!r}, expected message {message!r}")
             if echoed != message:
@@ -282,9 +292,11 @@ async def probe_protocols() -> tuple[SdkProbe, ...]:
                 "path": list_req.path,
             })
 
+    except BaseException as exc:
+        body_error = exc
+        raise
     finally:
-        # Keep the body failure primary, with any shutdown failure attached as a note.
-        body_error = sys.exception()
+        # Keep only this probe's body failure primary, with shutdown failure as a note.
         try:
             if uv_server is not None and server_task is not None:
                 try:
@@ -420,6 +432,7 @@ class TestSdkProbeFailures(unittest.IsolatedAsyncioTestCase):
         with patch.object(uvicorn, "Server", FailingShutdownServer), patch.object(
             httpx2.AsyncClient, "post", AsyncMock(side_effect=body_error)
         ):
+            observed = None
             try:
                 await probe_protocols()
             except BaseException as exc:
@@ -441,6 +454,7 @@ class TestSdkProbeFailures(unittest.IsolatedAsyncioTestCase):
         with patch.object(uvicorn, "Server", CancelledServer), patch.object(
             httpx2.AsyncClient, "post", AsyncMock(side_effect=body_error)
         ):
+            observed = None
             try:
                 await probe_protocols()
             except BaseException as exc:
@@ -485,9 +499,10 @@ class TestSdkProbeFailures(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(serve())
         server = Mock()
         original_wait_for = asyncio.wait_for
-        async def short_wait(awaitable, timeout):
-            return await original_wait_for(awaitable, timeout=0.01)
-        with patch.object(asyncio, "wait_for", short_wait):
+        original_wait = asyncio.wait
+        async def short_wait(tasks, *, timeout):
+            return await original_wait(tasks, timeout=0.01)
+        with patch.object(asyncio, "wait", short_wait):
             with self.assertRaisesRegex(RuntimeError, "shutdown timed out"):
                 await shutdown_probe_server(server, task)
         self.assertTrue(task.done())
@@ -508,9 +523,10 @@ class TestSdkProbeFailures(unittest.IsolatedAsyncioTestCase):
                 stopped.set()
         server_task = asyncio.create_task(serve())
         original_wait_for = asyncio.wait_for
-        async def short_wait(awaitable, timeout):
-            return await original_wait_for(awaitable, timeout=0.01)
-        with patch.object(asyncio, "wait_for", short_wait):
+        original_wait = asyncio.wait
+        async def short_wait(tasks, *, timeout):
+            return await original_wait(tasks, timeout=0.01)
+        with patch.object(asyncio, "wait", short_wait):
             cleanup = asyncio.create_task(shutdown_probe_server(Mock(), server_task))
             await original_wait_for(draining.wait(), timeout=1)
             cleanup.cancel()
@@ -527,6 +543,111 @@ class TestSdkProbeFailures(unittest.IsolatedAsyncioTestCase):
             await shutdown_probe_server(Mock(), server_task)
         self.assertEqual(asyncio.current_task().cancelling(), 0)
         self.assertTrue(server_task.done())
+
+    async def test_successful_body_inside_except_still_reports_shutdown_failure(self):
+        original_shutdown = shutdown_probe_server
+        settled = []
+        async def fail_after_actual_shutdown(server, task):
+            await original_shutdown(server, task)
+            settled.append(task.done())
+            raise RuntimeError("synthetic post-shutdown failure")
+        unrelated = ValueError("synthetic unrelated caller error")
+        try:
+            raise unrelated
+        except ValueError:
+            with patch(__name__ + ".shutdown_probe_server", fail_after_actual_shutdown):
+                with self.assertRaisesRegex(RuntimeError, "synthetic post-shutdown failure"):
+                    await probe_protocols()
+        self.assertEqual(settled, [True], "actual server did not settle before injected shutdown failure")
+        self.assertFalse(hasattr(unrelated, "__notes__"), "unrelated caller exception was mutated")
+
+    async def test_caller_cancellation_survives_server_error_during_drain(self):
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+        async def serve():
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError("synthetic server error on cancellation")
+            finally:
+                stopped.set()
+        server_task = asyncio.create_task(serve())
+        await started.wait()
+        cleanup = asyncio.create_task(shutdown_probe_server(Mock(), server_task))
+        await asyncio.sleep(0)
+        cleanup.cancel()
+        observed = None
+        try:
+            await cleanup
+        except BaseException as exc:
+            observed = exc
+        self.assertIsInstance(observed, asyncio.CancelledError)
+        self.assertTrue(server_task.done())
+        self.assertTrue(stopped.is_set())
+
+    async def test_cancellation_arriving_during_timeout_drain_survives_server_error(self):
+        draining = asyncio.Event()
+        stopped = asyncio.Event()
+        async def serve():
+            try:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    draining.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        raise RuntimeError("synthetic server error during timeout drain")
+            finally:
+                stopped.set()
+        server_task = asyncio.create_task(serve())
+        original_wait_for = asyncio.wait_for
+        original_wait = asyncio.wait
+        async def short_wait(tasks, *, timeout):
+            return await original_wait(tasks, timeout=0.01)
+        with patch.object(asyncio, "wait", short_wait):
+            cleanup = asyncio.create_task(shutdown_probe_server(Mock(), server_task))
+            await original_wait_for(draining.wait(), timeout=1)
+            cleanup.cancel()
+            observed = None
+            try:
+                await cleanup
+            except BaseException as exc:
+                observed = exc
+        self.assertIsInstance(observed, asyncio.CancelledError)
+        self.assertTrue(server_task.done())
+        self.assertTrue(stopped.is_set())
+
+    async def test_caller_cancellation_retrieves_server_failure_without_loop_diagnostic(self):
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        diagnostics = []
+        started = asyncio.Event()
+        async def serve():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError("synthetic retrieved server failure")
+        loop.set_exception_handler(lambda _, context: diagnostics.append(context))
+        try:
+            server_task = asyncio.create_task(serve())
+            await started.wait()
+            cleanup = asyncio.create_task(shutdown_probe_server(Mock(), server_task))
+            await asyncio.sleep(0)
+            cleanup.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await cleanup
+            self.assertTrue(server_task.done())
+            self.assertEqual(str(server_task.exception()), "synthetic retrieved server failure")
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_handler)
+        self.assertEqual(
+            [context.get("message") for context in diagnostics], [],
+            "owned cleanup leaked a diagnostic despite retrieving the server failure",
+        )
 
 
 if __name__ == "__main__":
