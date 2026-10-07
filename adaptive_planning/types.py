@@ -30,6 +30,20 @@ JSONValue = Union[None, bool, int, float, str, list["JSONValue"], dict[str, "JSO
 class FrozenDict(dict):
     """An immutable dictionary that rejects mutation and supports JSON serialization."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        for k, v in list(self.items()):
+            if isinstance(v, Mapping) and not isinstance(v, FrozenDict):
+                super().__setitem__(k, FrozenDict(v))
+            elif isinstance(v, (list, tuple)):
+                super().__setitem__(
+                    k,
+                    tuple(
+                        FrozenDict(item) if isinstance(item, Mapping) and not isinstance(item, FrozenDict) else item
+                        for item in v
+                    ),
+                )
+
     def __setitem__(self, key: Any, value: Any) -> None:
         raise TypeError(f"'{self.__class__.__name__}' object does not support item assignment")
 
@@ -51,6 +65,9 @@ class FrozenDict(dict):
     def popitem(self) -> Any:
         raise TypeError(f"'{self.__class__.__name__}' object is immutable")
 
+    def __ior__(self, other: Any) -> Any:
+        raise TypeError(f"'{self.__class__.__name__}' object is immutable")
+
     def __copy__(self) -> FrozenDict:
         return self
 
@@ -58,7 +75,7 @@ class FrozenDict(dict):
         return self
 
     def __hash__(self) -> int:
-        return hash(tuple(sorted((k, v if not isinstance(v, list) else tuple(v)) for k, v in self.items())))
+        return hash(tuple(sorted((k, v if not isinstance(v, (list, tuple)) else tuple(v)) for k, v in self.items())))
 
 # Clock returning timezone-aware UTC datetime
 Clock = Callable[[], datetime]
@@ -816,8 +833,6 @@ _PAYLOAD_REQUIRED_FIELDS: dict[str, set[str]] = {
     "append_late_evidence": {"origin_attempt_id", "evidence", "stopped_resource_ids", "reason"},
     "import_plan": {
         "host_id",
-        "source_directory_id",
-        "source_directory_claim",
         "original_task_id",
         "original_snapshot",
         "provenance",
@@ -865,6 +880,9 @@ def _check_finite_floats(val: Any) -> None:
     elif isinstance(val, (list, tuple)):
         for item in val:
             _check_finite_floats(item)
+    elif dataclasses.is_dataclass(val) and not isinstance(val, type):
+        for f in dataclasses.fields(val):
+            _check_finite_floats(getattr(val, f.name))
 
 
 def _freeze_nested(val: Any) -> Any:

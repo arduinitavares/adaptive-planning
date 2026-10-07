@@ -7,7 +7,7 @@ from __future__ import annotations
 import copy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 import uuid
 
 from adaptive_planning.types import (
@@ -22,6 +22,7 @@ from adaptive_planning.types import (
     DocumentRef,
     Evidence,
     ExecutionContext,
+    HoldView,
     Metadata,
     MutationReceipt,
     PlanDraft,
@@ -246,24 +247,30 @@ def legacy_proposal() -> dict[str, JSONValue]:
     }
 
 
-def coordination(attempts: tuple[AttemptView, ...] = ()) -> CoordinationView:
+def coordination(
+    attempts: Sequence[AttemptView] = (),
+    holds: Sequence[HoldView] = (),
+    store_hold: bool = False,
+) -> CoordinationView:
     """Create a CoordinationView fixture with empty views/no store hold/store_sequence=0."""
+    att_tuple = tuple(attempts)
+    hold_tuple = tuple(holds)
     return CoordinationView(
-        attempts=attempts,
+        attempts=att_tuple,
         reservations=(),
-        holds=(),
+        holds=hold_tuple,
         reviews=(),
         result_versions={},
-        store_hold=False,
+        store_hold=store_hold,
         restore_cutoff=None,
         ownership_actor="synthetic-orchestrator",
         ownership_version=1,
         store_sequence=0,
         next_cursor=None,
-        total_counts={"attempts": len(attempts)},
-        has_live_attempts=any(a.state in ("assigned", "active") for a in attempts),
+        total_counts={"attempts": len(att_tuple), "holds": len(hold_tuple)},
+        has_live_attempts=any(a.state in ("assigned", "active") for a in att_tuple),
         has_unresolved_uses=False,
-        has_plan_holds=False,
+        has_plan_holds=len(hold_tuple) > 0,
     )
 
 
@@ -320,7 +327,7 @@ class ServiceFixture:
                 generation = receipt.current_metadata.generation
                 if exp_rev is None:
                     exp_rev = receipt.current_metadata.revision
-                ownership_version = receipt.current_metadata.ownership_version
+                ownership_version = receipt.committed_metadata.ownership_version
             else:
                 cmd_epoch = receipt.committed_metadata.epoch
                 generation = receipt.committed_metadata.generation
@@ -353,17 +360,19 @@ class ServiceFixture:
                         generation = getattr(pm, "generation", generation)
                         if expected_revision is None and hasattr(pm, "revision"):
                             exp_rev = pm.revision
-                        ownership_version = getattr(pm, "ownership_version", ownership_version)
+                        # Ownership version is strictly preserved from the caller's receipt/grant
+                        # to prevent silently acquiring new orchestrator capability after takeover.
                 except Exception:
                     pass
             if plan_id and attempt_id and hasattr(self.service, "read_coordination"):
                 try:
                     coord_page = self.service.read_coordination(plan_id)
                     for item in getattr(coord_page, "items", ()):
-                        val = getattr(item, "value", None)
-                        if getattr(val, "attempt_id", None) == attempt_id:
-                            attempt_version = getattr(val, "version", attempt_version)
-                            break
+                        if getattr(item, "kind", None) == "attempt":
+                            val = getattr(item, "value", None)
+                            if getattr(val, "attempt_id", None) == attempt_id:
+                                attempt_version = getattr(val, "version", attempt_version)
+                                break
                 except Exception:
                     pass
 
@@ -521,7 +530,7 @@ def make_service(directory: Path, clock: FakeClock | None = None) -> ServiceFixt
     from adaptive_planning.app import PlanningService
     from adaptive_planning.store import Store
 
-    store = Store(directory / "planning.sqlite", clock, host_id="synthetic-host")
+    store = Store(directory / "planning.sqlite", clock)
     service = PlanningService(store, base_url="http://127.0.0.1:8000", clock=clock)
     epoch = store.installation_epoch()
     return ServiceFixture(service=service, store=store, directory=directory, clock=clock, epoch=epoch)

@@ -560,26 +560,44 @@ def validate_service_graph(
         )
 
     if task_status in ("blocked", "stopped") and in_progress_steps:
-        stale_step_ids = {
-            att.step_id
-            for att in getattr(coordination, "attempts", ())
-            if getattr(att, "state", None) == "stale"
-        }
+        has_global_hold = getattr(coordination, "store_hold", False) or any(
+            getattr(h, "step_id", None) is None for h in getattr(coordination, "holds", ())
+        )
         hold_step_ids = {
-            hold.step_id
+            getattr(hold, "step_id", None)
             for hold in getattr(coordination, "holds", ())
             if getattr(hold, "step_id", None) is not None
         }
-        has_general_hold = (
-            getattr(coordination, "has_plan_holds", False)
-            or getattr(coordination, "store_hold", False)
-            or any(getattr(h, "step_id", None) is None for h in getattr(coordination, "holds", ()))
-        )
-        for sid in in_progress_steps:
-            if not (has_general_hold or sid in stale_step_ids or sid in hold_step_ids):
-                raise PlanValidationError(
-                    f"In-progress step '{sid}' under '{task_status}' status requires backing stale attempt or hold in coordination"
-                )
+
+        if task_status == "stopped":
+            # Explicit stop takes precedence over live work (Design line 97).
+            # Retained in-progress steps are valid when backed by a matching active, submitted, or stale attempt for that step,
+            # or a step-specific hold or global hold.
+            stopped_valid_states = {"active", "submitted", "stale"}
+            stopped_backed_step_ids = {
+                getattr(att, "step_id", None)
+                for att in getattr(coordination, "attempts", ())
+                if getattr(att, "state", None) in stopped_valid_states
+            }
+            for sid in in_progress_steps:
+                if not (has_global_hold or sid in stopped_backed_step_ids or sid in hold_step_ids):
+                    raise PlanValidationError(
+                        f"In-progress step '{sid}' under 'stopped' status requires backing attempt or hold in coordination"
+                    )
+
+        elif task_status == "blocked":
+            # Blocked plan with in-progress step requires stale attempt for that step,
+            # an explicit hold for that step, or a global hold.
+            stale_step_ids = {
+                getattr(att, "step_id", None)
+                for att in getattr(coordination, "attempts", ())
+                if getattr(att, "state", None) == "stale"
+            }
+            for sid in in_progress_steps:
+                if not (has_global_hold or sid in stale_step_ids or sid in hold_step_ids):
+                    raise PlanValidationError(
+                        f"In-progress step '{sid}' under 'blocked' status requires backing stale attempt or hold in coordination"
+                    )
 
 
 def validate_execution_scope(

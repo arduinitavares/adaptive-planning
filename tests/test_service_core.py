@@ -42,6 +42,7 @@ from adaptive_planning.types import (
     Evidence,
     ExecutionContext,
     ExecutionContextClaims,
+    HoldView,
     HostWork,
     InstallationView,
     Metadata,
@@ -82,7 +83,7 @@ class TestServiceCore(unittest.TestCase):
         # 1. Fresh isolated subprocess import proof with import blocker installed BEFORE import
         isolated_code = (
             "import sys\n"
-            "blocked = {'mcp', 'starlette', 'uvicorn', 'httpx2', 'pydantic'}\n"
+            "blocked = {'mcp', 'starlette', 'uvicorn', 'httpx', 'pydantic'}\n"
             "class BlockHook:\n"
             "    def find_spec(self, fullname, path, target=None):\n"
             "        top = fullname.split('.')[0]\n"
@@ -949,7 +950,26 @@ class TestServiceCore(unittest.TestCase):
         with self.assertRaises(TypeError):
             cmd.payload["new_field"] = "BAD"
 
-        # Nested mapping mutation raises TypeError
+        # Focused regression for in-place union (__ior__ / |=)
+        takeover_cmd = parse_command({
+            "kind": "takeover",
+            "epoch": "epoch-1",
+            "key": "k-to",
+            "actor": "orch",
+            "payload": {
+                "expected_ownership_version": 1,
+                "reason": "takeover",
+            },
+        })
+        p = takeover_cmd.payload
+        raw_json_before = json.dumps(takeover_cmd.payload)
+        with self.assertRaises(TypeError):
+            p |= {"changed": 1}
+        self.assertEqual(json.dumps(takeover_cmd.payload), raw_json_before)
+        self.assertNotIn("changed", takeover_cmd.payload)
+        self.assertNotIn("changed", p)
+
+        # Nested mapping mutation and in-place union raise TypeError
         import_cmd = parse_command({
             "kind": "import_plan",
             "epoch": "epoch-1",
@@ -968,6 +988,13 @@ class TestServiceCore(unittest.TestCase):
         })
         with self.assertRaises(TypeError):
             import_cmd.payload["original_snapshot"]["objective"] = "MUTATED"
+
+        snap = import_cmd.payload["original_snapshot"]
+        raw_snap_before = json.dumps(snap)
+        with self.assertRaises(TypeError):
+            snap |= {"changed": 1}
+        self.assertEqual(json.dumps(snap), raw_snap_before)
+        self.assertNotIn("changed", snap)
 
         # MutationReceipt.committed is frozen
         meta = Metadata("epoch-1", "p-1", "g-1", 1, 1, "url")
@@ -1008,17 +1035,62 @@ class TestServiceCore(unittest.TestCase):
             "actor": "orch",
         }
 
-        # 1. create_plan
-        c_pos = parse_command({**base_boot, "kind": "create_plan", "payload": {"creation_id": "c1", "draft": draft(), "new_plan_intent": None}})
+        # Common raw JSON draft dictionary for wire-format testing
+        raw_draft = {
+            "objective": "test obj",
+            "acceptance_criteria": ["ac1"],
+            "constraints": ["c1"],
+            "facts": ["f1"],
+            "assumptions": ["a1"],
+            "next_check": "chk",
+            "authorization": {
+                "mode": "plan-only",
+                "interval": "1h",
+                "since_revision": 0,
+                "note": "note",
+                "baseline": [],
+            },
+            "steps": [
+                {
+                    "step_id": "s1",
+                    "title": "t1",
+                    "dependencies": [],
+                    "completion_check": "chk",
+                    "definition_version": "v1",
+                    "review_required": False,
+                    "final_gate": False,
+                }
+            ],
+            "documents": [{"path": "p", "version": "v1"}],
+            "workspace_refs": ["w1"],
+        }
+
+        # 1. create_plan (wire-format raw JSON draft conversion to PlanDraft)
+        c_pos = parse_command({**base_boot, "kind": "create_plan", "payload": {"creation_id": "c1", "draft": raw_draft, "new_plan_intent": None}})
         self.assertEqual(c_pos.kind, "create_plan")
+        self.assertIsInstance(c_pos.payload["draft"], PlanDraft)
+        self.assertIsInstance(c_pos.payload["draft"].authorization, Authorization)
+        self.assertIsInstance(c_pos.payload["draft"].steps[0], StepDefinition)
+        self.assertIsInstance(c_pos.payload["draft"].documents[0], DocumentRef)
         with self.assertRaises(DomainError):
             parse_command({**base_boot, "kind": "create_plan", "payload": {"creation_id": "c1", "draft": "not-a-draft", "new_plan_intent": None}})
-
-        # 2. revise_plan
-        r_pos = parse_command({**base_orch, "kind": "revise_plan", "payload": {"draft": draft(), "reason": "rev", "authorization_change": None}})
-        self.assertEqual(r_pos.kind, "revise_plan")
+        bad_draft_mode = copy.deepcopy(raw_draft)
+        bad_draft_mode["authorization"]["mode"] = "invalid-mode"
         with self.assertRaises(DomainError):
-            parse_command({**base_orch, "kind": "revise_plan", "payload": {"draft": draft(), "reason": 123, "authorization_change": None}})
+            parse_command({**base_boot, "kind": "create_plan", "payload": {"creation_id": "c1", "draft": bad_draft_mode, "new_plan_intent": None}})
+
+        # 2. revise_plan (wire-format raw JSON nested authorization_change and retire_steps)
+        raw_auth_change = {"mode": "plan-only", "note": "revised"}
+        raw_retire = {"step_id": "s1", "reason": "retired"}
+        r_pos = parse_command({**base_orch, "kind": "revise_plan", "payload": {"draft": raw_draft, "reason": "rev", "authorization_change": raw_auth_change, "retire_steps": [raw_retire]}})
+        self.assertEqual(r_pos.kind, "revise_plan")
+        self.assertIsInstance(r_pos.payload["draft"], PlanDraft)
+        self.assertIsInstance(r_pos.payload["authorization_change"], AuthorizationChange)
+        self.assertIsInstance(r_pos.payload["retire_steps"][0], RetirementRequest)
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "revise_plan", "payload": {"draft": raw_draft, "reason": 123, "authorization_change": None}})
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "revise_plan", "payload": {"draft": raw_draft, "reason": "rev", "authorization_change": {"mode": "bad", "note": "n"}}})
 
         # 3. takeover
         t_pos = parse_command({**base_boot, "kind": "takeover", "payload": {"expected_ownership_version": 2, "reason": "takeover"}})
@@ -1026,24 +1098,28 @@ class TestServiceCore(unittest.TestCase):
         with self.assertRaises(DomainError):
             parse_command({**base_boot, "kind": "takeover", "payload": {"expected_ownership_version": -1, "reason": "takeover"}})
 
-        # 4. register_resource
-        rr_pos = parse_command({**base_orch, "kind": "register_resource", "payload": {"claim": workspace("/p", 1)}})
+        # 4. register_resource (wire-format raw JSON claim conversion to ResourceClaim)
+        raw_claim = {"host_id": "h", "kind": "workspace", "case_insensitive": False, "canonical_path": "/p"}
+        rr_pos = parse_command({**base_orch, "kind": "register_resource", "payload": {"claim": raw_claim}})
         self.assertEqual(rr_pos.kind, "register_resource")
+        self.assertIsInstance(rr_pos.payload["claim"], ResourceClaim)
         with self.assertRaises(DomainError):
-            parse_command({**base_orch, "kind": "register_resource", "payload": {"claim": {"host_id": "h", "kind": "invalid-kind"}}})
+            parse_command({**base_orch, "kind": "register_resource", "payload": {"claim": {"host_id": "h", "kind": "invalid-kind", "case_insensitive": False}}})
 
         # 5. reconcile_resources
-        rec_pos = parse_command({**base_orch, "kind": "reconcile_resources", "payload": {"resource_ids": ("r1",), "canonical_claim": workspace("/p", 1), "reason": "rec"}})
+        rec_pos = parse_command({**base_orch, "kind": "reconcile_resources", "payload": {"resource_ids": ("r1",), "canonical_claim": raw_claim, "reason": "rec"}})
         self.assertEqual(rec_pos.kind, "reconcile_resources")
+        self.assertIsInstance(rec_pos.payload["canonical_claim"], ResourceClaim)
         with self.assertRaises(DomainError):
-            parse_command({**base_orch, "kind": "reconcile_resources", "payload": {"resource_ids": "not-a-tuple", "canonical_claim": workspace("/p", 1), "reason": "rec"}})
+            parse_command({**base_orch, "kind": "reconcile_resources", "payload": {"resource_ids": "not-a-tuple", "canonical_claim": raw_claim, "reason": "rec"}})
 
-        # 6. invalidate_result
-        inv_ev = Evidence("ev", None, None, "chk", "failed", (), ())
-        ir_pos = parse_command({**base_orch, "kind": "invalidate_result", "payload": {"step_id": "s1", "result_version": "v1", "reason": "inv", "evidence": (inv_ev,)}})
+        # 6. invalidate_result (wire-format raw JSON evidence conversion to Evidence)
+        raw_ev = {"summary": "ev", "check": "chk", "result": "failed"}
+        ir_pos = parse_command({**base_orch, "kind": "invalidate_result", "payload": {"step_id": "s1", "result_version": "v1", "reason": "inv", "evidence": [raw_ev]}})
         self.assertEqual(ir_pos.kind, "invalidate_result")
+        self.assertIsInstance(ir_pos.payload["evidence"][0], Evidence)
         with self.assertRaises(DomainError):
-            parse_command({**base_orch, "kind": "invalidate_result", "payload": {"step_id": "s1", "result_version": "v1", "reason": "inv", "evidence": ("not-evidence",)}})
+            parse_command({**base_orch, "kind": "invalidate_result", "payload": {"step_id": "s1", "result_version": "v1", "reason": "inv", "evidence": ({"summary": "s", "check": "c", "result": "bad-result"},)}})
 
         # 7. resolve_invalidation
         rinv_pos = parse_command({**base_orch, "kind": "resolve_invalidation", "payload": {"invalidation_id": "i1", "affected_step_id": "s1", "disposition": "revalidated", "corrective_step_id": None, "corrected_result_version": None, "evidence": (), "reason": "ok"}})
@@ -1051,18 +1127,22 @@ class TestServiceCore(unittest.TestCase):
         with self.assertRaises(DomainError):
             parse_command({**base_orch, "kind": "resolve_invalidation", "payload": {"invalidation_id": "i1", "affected_step_id": "s1", "disposition": "invalid-disp", "corrective_step_id": None, "corrected_result_version": None, "evidence": (), "reason": "ok"}})
 
-        # 8. assign_step
-        as_pos = parse_command({**base_orch, "kind": "assign_step", "payload": {"step_id": "s1", "assignee": "w1", "context": context(None)}})
+        # 8. assign_step (wire-format raw JSON context conversion to ExecutionContext)
+        raw_ctx = {"kind": "repository", "repository_exclusive": True, "writes": True}
+        as_pos = parse_command({**base_orch, "kind": "assign_step", "payload": {"step_id": "s1", "assignee": "w1", "context": raw_ctx}})
         self.assertEqual(as_pos.kind, "assign_step")
+        self.assertIsInstance(as_pos.payload["context"], ExecutionContext)
         with self.assertRaises(DomainError):
-            parse_command({**base_orch, "kind": "assign_step", "payload": {"step_id": "s1", "assignee": "w1", "context": "not-a-context"}})
+            parse_command({**base_orch, "kind": "assign_step", "payload": {"step_id": "s1", "assignee": "w1", "context": {"kind": "bad-kind", "repository_exclusive": True, "writes": True}}})
 
-        # 9. bind_availability
-        avail = Availability("s0", "v1", "ancestor", "base", None, Evidence("s", None, None, "c", "passed", (), ()))
-        ba_pos = parse_command({**base_orch, "kind": "bind_availability", "payload": {"bindings": (avail,), "checked_base": "base"}})
+        # 9. bind_availability (wire-format raw JSON availability conversion)
+        raw_avail = {"prerequisite": "s0", "result_version": "v1", "method": "ancestor", "checked_base": "base", "evidence": raw_ev}
+        ba_pos = parse_command({**base_orch, "kind": "bind_availability", "payload": {"bindings": [raw_avail], "checked_base": "base"}})
         self.assertEqual(ba_pos.kind, "bind_availability")
+        self.assertIsInstance(ba_pos.payload["bindings"][0], Availability)
+        self.assertIsInstance(ba_pos.payload["bindings"][0].evidence, Evidence)
         with self.assertRaises(DomainError):
-            parse_command({**base_orch, "kind": "bind_availability", "payload": {"bindings": ("not-avail",), "checked_base": "base"}})
+            parse_command({**base_orch, "kind": "bind_availability", "payload": {"bindings": [{"prerequisite": "s0", "result_version": "v1", "method": "bad-method", "checked_base": "base", "evidence": raw_ev}], "checked_base": "base"}})
 
         # 10. start_step
         ss_pos = parse_command({**base_worker, "kind": "start_step", "payload": {"origin_worker": "worker-a", "relay": None, "observed_activity": "act"}})
@@ -1076,11 +1156,30 @@ class TestServiceCore(unittest.TestCase):
         with self.assertRaises(DomainError):
             parse_command({**base_worker, "kind": "report_activity", "payload": {"origin_worker": "worker-a", "relay": None, "observed_activity": None}})
 
-        # 12. record_checkpoint
-        rc_pos = parse_command({**base_worker, "kind": "record_checkpoint", "payload": {"checkpoint": checkpoint()}})
+        # 12. record_checkpoint (wire-format raw JSON checkpoint conversion to Checkpoint)
+        raw_checkpoint = {
+            "outcome": "passed",
+            "check": "chk",
+            "origin_worker": "worker-a",
+            "evidence": [raw_ev],
+            "reassessment": {
+                "summary": "s",
+                "disposition": "unchanged",
+                "reason": "r",
+                "unbounded": False,
+            },
+        }
+        rc_pos = parse_command({**base_worker, "kind": "record_checkpoint", "payload": {"checkpoint": raw_checkpoint}})
         self.assertEqual(rc_pos.kind, "record_checkpoint")
+        self.assertIsInstance(rc_pos.payload["checkpoint"], Checkpoint)
+        self.assertIsInstance(rc_pos.payload["checkpoint"].reassessment, Reassessment)
+        self.assertIsInstance(rc_pos.payload["checkpoint"].evidence[0], Evidence)
         with self.assertRaises(DomainError):
             parse_command({**base_worker, "kind": "record_checkpoint", "payload": {"checkpoint": "not-a-checkpoint"}})
+        bad_cp_outcome = copy.deepcopy(raw_checkpoint)
+        bad_cp_outcome["outcome"] = "bad-outcome"
+        with self.assertRaises(DomainError):
+            parse_command({**base_worker, "kind": "record_checkpoint", "payload": {"checkpoint": bad_cp_outcome}})
 
         # 13. resolve_reassessment
         rr_pos2 = parse_command({**base_orch, "kind": "resolve_reassessment", "payload": {"checkpoint_id": "cp1", "decision": "apply", "reason": "r", "draft": None, "affected_steps": (), "unbounded": False}})
@@ -1100,31 +1199,46 @@ class TestServiceCore(unittest.TestCase):
         with self.assertRaises(DomainError):
             parse_command({**base_orch, "kind": "sweep_stale", "payload": {"extra": "forbidden"}})
 
-        # 16. record_review
-        rev = Review("reviewer-1", ArtifactRef("code", "art-1", "v1", None, "summary"), "passed", (), (), None)
-        rv_pos = parse_command({**base_orch, "kind": "record_review", "payload": {"step_id": "s1", "review": rev}})
+        # 16. record_review (wire-format raw JSON review conversion to Review)
+        raw_review = {
+            "reviewer": "reviewer-1",
+            "artifact": {"kind": "code", "identity": "art-1", "version": "v1", "summary": "summary"},
+            "verdict": "passed",
+            "findings": ["finding 1"],
+            "evidence": [raw_ev],
+        }
+        rv_pos = parse_command({**base_orch, "kind": "record_review", "payload": {"step_id": "s1", "review": raw_review}})
         self.assertEqual(rv_pos.kind, "record_review")
+        self.assertIsInstance(rv_pos.payload["review"], Review)
+        self.assertIsInstance(rv_pos.payload["review"].artifact, ArtifactRef)
         with self.assertRaises(DomainError):
             parse_command({**base_orch, "kind": "record_review", "payload": {"step_id": "s1", "review": "not-a-review"}})
+        bad_rev_verdict = copy.deepcopy(raw_review)
+        bad_rev_verdict["verdict"] = "bad-verdict"
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "record_review", "payload": {"step_id": "s1", "review": bad_rev_verdict}})
 
         # 17. accept_step
-        acc_art = ArtifactRef("code", "art-1", "v1", None, "summary")
-        ac_pos = parse_command({**base_orch, "kind": "accept_step", "payload": {"step_id": "s1", "artifact": acc_art, "stopped_resource_ids": (), "stopped_reason": None}})
+        raw_art = {"kind": "code", "identity": "art-1", "version": "v1", "summary": "summary"}
+        ac_pos = parse_command({**base_orch, "kind": "accept_step", "payload": {"step_id": "s1", "artifact": raw_art, "stopped_resource_ids": (), "stopped_reason": None}})
         self.assertEqual(ac_pos.kind, "accept_step")
+        self.assertIsInstance(ac_pos.payload["artifact"], ArtifactRef)
         with self.assertRaises(DomainError):
             parse_command({**base_orch, "kind": "accept_step", "payload": {"step_id": "s1", "artifact": "not-an-artifact", "stopped_resource_ids": (), "stopped_reason": None}})
 
         # 18. resolve_attempt
-        ra_pos2 = parse_command({**base_orch, "kind": "resolve_attempt", "payload": {"resolution": "confirm-owner", "reason": "ok", "next_step_state": "pending", "stopped_resource_ids": (), "replacement_assignee": None, "replacement_context": None, "attached_context": None}})
+        ra_pos2 = parse_command({**base_orch, "kind": "resolve_attempt", "payload": {"resolution": "confirm-owner", "reason": "ok", "next_step_state": "pending", "stopped_resource_ids": (), "replacement_assignee": None, "replacement_context": raw_ctx, "attached_context": None}})
         self.assertEqual(ra_pos2.kind, "resolve_attempt")
+        self.assertIsInstance(ra_pos2.payload["replacement_context"], ExecutionContext)
         with self.assertRaises(DomainError):
             parse_command({**base_orch, "kind": "resolve_attempt", "payload": {"resolution": "unknown-res", "reason": "ok", "next_step_state": "pending", "stopped_resource_ids": (), "replacement_assignee": None, "replacement_context": None, "attached_context": None}})
 
         # 19. reserve_verification
-        rv_pos2 = parse_command({**base_orch, "kind": "reserve_verification", "payload": {"step_id": "s1", "verifier": "v1", "context": context(None), "handoff_from": None, "stopped_reason": None}})
+        rv_pos2 = parse_command({**base_orch, "kind": "reserve_verification", "payload": {"step_id": "s1", "verifier": "v1", "context": raw_ctx, "handoff_from": None, "stopped_reason": None}})
         self.assertEqual(rv_pos2.kind, "reserve_verification")
+        self.assertIsInstance(rv_pos2.payload["context"], ExecutionContext)
         with self.assertRaises(DomainError):
-            parse_command({**base_orch, "kind": "reserve_verification", "payload": {"step_id": "s1", "verifier": 123, "context": context(None), "handoff_from": None, "stopped_reason": None}})
+            parse_command({**base_orch, "kind": "reserve_verification", "payload": {"step_id": "s1", "verifier": 123, "context": raw_ctx, "handoff_from": None, "stopped_reason": None}})
 
         # 20. release_resource_use
         ru_pos = parse_command({**base_orch, "kind": "release_resource_use", "payload": {"use_id": "u1", "resource_ids": (), "reason": "rel", "stopped": True}})
@@ -1133,33 +1247,121 @@ class TestServiceCore(unittest.TestCase):
             parse_command({**base_orch, "kind": "release_resource_use", "payload": {"use_id": "u1", "resource_ids": (), "reason": "rel", "stopped": "not-bool"}})
 
         # 21. append_late_evidence
-        ale_pos = parse_command({**base_orch, "kind": "append_late_evidence", "payload": {"origin_attempt_id": "att-1", "evidence": (), "stopped_resource_ids": (), "reason": "ok"}})
+        ale_pos = parse_command({**base_orch, "kind": "append_late_evidence", "payload": {"origin_attempt_id": "att-1", "evidence": [raw_ev], "stopped_resource_ids": (), "reason": "ok"}})
         self.assertEqual(ale_pos.kind, "append_late_evidence")
+        self.assertIsInstance(ale_pos.payload["evidence"][0], Evidence)
         with self.assertRaises(DomainError):
             parse_command({**base_orch, "kind": "append_late_evidence", "payload": {"origin_attempt_id": 123, "evidence": (), "stopped_resource_ids": (), "reason": "ok"}})
 
-        # 22. import_plan
-        doc = DocumentRef("path", None, None, "v1", None)
-        ip_pos = parse_command({**base_boot, "kind": "import_plan", "payload": {"host_id": "h", "source_directory_id": "d1", "source_directory_claim": None, "original_task_id": "t1", "original_snapshot": {"schemaVersion": 2}, "provenance": doc, "writers_stopped": "yes", "known_contexts": {}}})
+        # 22. import_plan (wire-format raw JSON provenance and known_contexts, omitting source_directory_claim)
+        raw_prov = {"path": "path", "version": "v1"}
+        ip_pos = parse_command({
+            **base_boot,
+            "kind": "import_plan",
+            "payload": {
+                "host_id": "h",
+                "source_directory_id": "d1",
+                "original_task_id": "t1",
+                "original_snapshot": {"schemaVersion": 2},
+                "provenance": raw_prov,
+                "writers_stopped": "yes",
+                "known_contexts": {"s1": raw_ctx},
+            },
+        })
         self.assertEqual(ip_pos.kind, "import_plan")
+        self.assertIsInstance(ip_pos.payload["provenance"], DocumentRef)
+        self.assertIsInstance(ip_pos.payload["known_contexts"]["s1"], ExecutionContext)
         with self.assertRaises(DomainError):
-            parse_command({**base_boot, "kind": "import_plan", "payload": {"host_id": "h", "source_directory_id": None, "source_directory_claim": None, "original_task_id": "t1", "original_snapshot": {"schemaVersion": 2}, "provenance": doc, "writers_stopped": "yes", "known_contexts": {}}})
+            parse_command({**base_boot, "kind": "import_plan", "payload": {"host_id": "h", "source_directory_id": None, "source_directory_claim": None, "original_task_id": "t1", "original_snapshot": {"schemaVersion": 2}, "provenance": raw_prov, "writers_stopped": "yes", "known_contexts": {}}})
 
-        # 23. resolve_store_hold
-        rsh_pos = parse_command({**base_orch, "kind": "resolve_store_hold", "payload": {"backup_cutoff": "2026-10-06T00:00:00Z", "inventory_complete": True, "absent_work_inventory": (), "resource_resolutions": (), "reason": "ok"}})
+        # 23. resolve_store_hold (wire-format raw JSON absent_work_inventory and resource_resolutions)
+        raw_work = {
+            "work_id": "w1",
+            "actor": "act",
+            "state": "stopped",
+            "resource_ids": ["r1"],
+            "resource_claims": [raw_claim],
+            "evidence": [raw_ev],
+        }
+        raw_res = {
+            "resource_ids": ["r1"],
+            "resolution": "stopped",
+            "reason": "done",
+        }
+        rsh_pos = parse_command({
+            **base_orch,
+            "kind": "resolve_store_hold",
+            "payload": {
+                "backup_cutoff": "2026-10-06T00:00:00Z",
+                "inventory_complete": True,
+                "absent_work_inventory": [raw_work],
+                "resource_resolutions": [raw_res],
+                "reason": "ok",
+            },
+        })
         self.assertEqual(rsh_pos.kind, "resolve_store_hold")
+        self.assertIsInstance(rsh_pos.payload["absent_work_inventory"][0], HostWork)
+        self.assertIsInstance(rsh_pos.payload["resource_resolutions"][0], ResourceResolution)
         with self.assertRaises(DomainError):
             parse_command({**base_orch, "kind": "resolve_store_hold", "payload": {"backup_cutoff": "2026-10-06T00:00:00Z", "inventory_complete": "not-bool", "absent_work_inventory": (), "resource_resolutions": (), "reason": "ok"}})
 
-        # Non-finite float test
-        with self.assertRaises(DomainError):
-            parse_command({**base_boot, "kind": "takeover", "expected_revision": float("nan"), "payload": {"expected_ownership_version": 1, "reason": "r"}})
+        # Non-finite float tests inside nested JSON (original_snapshot in import_plan)
+        with self.assertRaises(DomainError) as ctx_nan:
+            parse_command({
+                **base_boot,
+                "kind": "import_plan",
+                "payload": {
+                    "host_id": "h",
+                    "source_directory_id": "d1",
+                    "original_task_id": "t1",
+                    "original_snapshot": {"schemaVersion": 2, "metric": float("nan")},
+                    "provenance": raw_prov,
+                    "writers_stopped": "yes",
+                    "known_contexts": {},
+                },
+            })
+        self.assertIn("Non-finite float", str(ctx_nan.exception))
+
+        with self.assertRaises(DomainError) as ctx_inf:
+            parse_command({
+                **base_boot,
+                "kind": "import_plan",
+                "payload": {
+                    "host_id": "h",
+                    "source_directory_id": "d1",
+                    "original_task_id": "t1",
+                    "original_snapshot": {"schemaVersion": 2, "metric": float("inf")},
+                    "provenance": raw_prov,
+                    "writers_stopped": "yes",
+                    "known_contexts": {},
+                },
+            })
+        self.assertIn("Non-finite float", str(ctx_inf.exception))
+
+        with self.assertRaises(DomainError) as ctx_ninf:
+            parse_command({
+                **base_boot,
+                "kind": "import_plan",
+                "payload": {
+                    "host_id": "h",
+                    "source_directory_id": "d1",
+                    "original_task_id": "t1",
+                    "original_snapshot": {"schemaVersion": 2, "metric": float("-inf")},
+                    "provenance": raw_prov,
+                    "writers_stopped": "yes",
+                    "known_contexts": {},
+                },
+            })
+        self.assertIn("Non-finite float", str(ctx_ninf.exception))
 
     def test_prepare_publication_propagates_internal_type_error(self):
         """Validator-internal TypeError propagates and max_history is never silently dropped."""
         prop = legacy_proposal()
+        call_records = []
         def faulty_validator(published, **kwargs):
-            raise TypeError("Internal bug in validator implementation")
+            call_records.append(kwargs)
+            if "max_history" in kwargs:
+                raise TypeError("Internal bug in validator implementation with max_history")
 
         with self.assertRaises(TypeError) as ctx:
             prepare_publication(
@@ -1168,33 +1370,71 @@ class TestServiceCore(unittest.TestCase):
                 max_file_bytes=10000, max_history=10,
                 validate_snapshot_fn=faulty_validator,
             )
-        self.assertIn("Internal bug in validator implementation", str(ctx.exception))
+        self.assertIn("Internal bug in validator implementation with max_history", str(ctx.exception))
+        self.assertEqual(len(call_records), 1)
+        self.assertEqual(call_records[0].get("max_file_bytes"), 10000)
+        self.assertEqual(call_records[0].get("max_history"), 10)
 
     def test_service_status_coordination_backing_and_planning_rejection(self):
-        """planning with in-progress step is rejected; blocked/stopped requires backing stale attempt in coordination."""
+        """planning with in-progress step is rejected; blocked requires stale attempt or hold; stopped allows active/submitted/stale attempt or hold."""
         prop = legacy_proposal()
         prop["steps"][0]["status"] = "in-progress"
         stale_attempt = AttemptView(
             "x", "step-1", "worker-a", "stale", "active", 1, "v1", "2026-10-06T00:00:00Z",
             context(None, writes=False), True, None
         )
-        # 1. planning status with in-progress step ALWAYS rejected even if coordination has attempts
+        active_attempt = dataclasses.replace(stale_attempt, state="active")
+        submitted_attempt = dataclasses.replace(stale_attempt, state="submitted")
+
+        hold_step1 = HoldView("h1", "reassessment", "step-1", "src1", "hold on step-1")
+        hold_step2 = HoldView("h2", "reassessment", "step-2", "src2", "hold on step-2")
+        hold_global = HoldView("hg", "reassessment", None, "src3", "plan-wide hold")
+
+        # 1. planning status with in-progress step ALWAYS rejected under all coordination states
         prop["status"] = "planning"
         with self.assertRaises(PlanValidationError):
             validate_service_graph(prop, None, coordination((stale_attempt,)))
+        with self.assertRaises(PlanValidationError):
+            validate_service_graph(prop, None, coordination(holds=(hold_global,)))
+        with self.assertRaises(PlanValidationError):
+            validate_service_graph(prop, None, coordination(store_hold=True))
 
-        # 2. blocked/stopped status with in-progress step without backing coordination attempt is rejected
-        for st in ("blocked", "stopped"):
-            prop["status"] = st
-            # Empty coordination has no stale attempt backing step-1
-            with self.assertRaises(PlanValidationError):
-                validate_service_graph(prop, None, coordination(()))
-            # Active/non-stale attempt does not back retained in-progress under blocked/stopped
-            active_attempt = dataclasses.replace(stale_attempt, state="active")
-            with self.assertRaises(PlanValidationError):
-                validate_service_graph(prop, None, coordination((active_attempt,)))
-            # Stale attempt for step-1 backs it -> succeeds
-            validate_service_graph(prop, None, coordination((stale_attempt,)))
+        # 2. blocked status with in-progress step:
+        # Requires stale attempt for step-1, step-1 hold, or global hold.
+        # Live attempts (active/submitted) or unrelated step holds do NOT back in-progress under blocked.
+        prop["status"] = "blocked"
+        with self.assertRaises(PlanValidationError):
+            validate_service_graph(prop, None, coordination(()))
+        with self.assertRaises(PlanValidationError):
+            validate_service_graph(prop, None, coordination((active_attempt,)))
+        with self.assertRaises(PlanValidationError):
+            validate_service_graph(prop, None, coordination((submitted_attempt,)))
+        with self.assertRaises(PlanValidationError):
+            validate_service_graph(prop, None, coordination(holds=(hold_step2,)))
+
+        # Passing conditions under blocked:
+        validate_service_graph(prop, None, coordination((stale_attempt,)))
+        validate_service_graph(prop, None, coordination(holds=(hold_step1,)))
+        validate_service_graph(prop, None, coordination(holds=(hold_global,)))
+        validate_service_graph(prop, None, coordination(store_hold=True))
+
+        # 3. stopped status with in-progress step (Design line 97 explicit stop precedence):
+        # In-progress step is valid when backed by active, submitted, or stale attempt for step-1,
+        # or step-1 hold, or global hold.
+        # Unbacked or unrelated step holds are rejected.
+        prop["status"] = "stopped"
+        with self.assertRaises(PlanValidationError):
+            validate_service_graph(prop, None, coordination(()))
+        with self.assertRaises(PlanValidationError):
+            validate_service_graph(prop, None, coordination(holds=(hold_step2,)))
+
+        # Passing conditions under stopped:
+        validate_service_graph(prop, None, coordination((active_attempt,)))
+        validate_service_graph(prop, None, coordination((submitted_attempt,)))
+        validate_service_graph(prop, None, coordination((stale_attempt,)))
+        validate_service_graph(prop, None, coordination(holds=(hold_step1,)))
+        validate_service_graph(prop, None, coordination(holds=(hold_global,)))
+        validate_service_graph(prop, None, coordination(store_hold=True))
 
     def test_service_fixture_metadata_and_attempt_version(self):
         """ServiceFixture reads current metadata and attempt version when refresh_metadata=True, freezes on False."""
@@ -1246,6 +1486,7 @@ class TestServiceCore(unittest.TestCase):
         self.assertEqual(cmd_refreshed.generation, "gen-curr")
         self.assertEqual(cmd_refreshed.expected_revision, 5)
         self.assertEqual(cmd_refreshed.attempt_version, 4)
+        self.assertEqual(cmd_refreshed.ownership_version, 1)
 
         # refresh_metadata=False freezes original metadata and attempt version (1)
         cmd_frozen = fixture.command(
@@ -1259,6 +1500,7 @@ class TestServiceCore(unittest.TestCase):
         self.assertEqual(cmd_frozen.generation, "gen-orig")
         self.assertEqual(cmd_frozen.expected_revision, 1)
         self.assertEqual(cmd_frozen.attempt_version, 1)
+        self.assertEqual(cmd_frozen.ownership_version, 1)
 
 
 if __name__ == "__main__":
