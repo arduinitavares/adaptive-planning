@@ -70,7 +70,7 @@ class PlanningService:
         try:
             receipt = handler(db, command)
         except DomainError as error:
-            if error.current_metadata is None and error.code in ("stale_generation", "conflict") and command.plan_id:
+            if error.current_metadata is None and error.code in ("stale", "conflict") and command.plan_id:
                 try:
                     error.current_metadata = plans._metadata(db, command.plan_id)
                 except DomainError:

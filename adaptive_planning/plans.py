@@ -15,7 +15,7 @@ import json
 import sqlite3
 import uuid
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Callable, Iterator, Mapping
 
 from adaptive_planning.core import (
@@ -79,10 +79,7 @@ class ServiceContext:
     clock: Callable[[], datetime]
 
 
-_CONTEXT: ContextVar[ServiceContext] = ContextVar(
-    "adaptive_planning_service_context",
-    default=ServiceContext("", lambda: datetime.now(timezone.utc)),
-)
+_CONTEXT: ContextVar[ServiceContext] = ContextVar("adaptive_planning_service_context")
 
 
 @contextlib.contextmanager
@@ -94,8 +91,15 @@ def service_context(base_url: str, clock: Callable[[], datetime]) -> Iterator[No
         _CONTEXT.reset(token)
 
 
+def _context() -> ServiceContext:
+    try:
+        return _CONTEXT.get()
+    except LookupError:
+        raise RuntimeError("service context is not set; run inside plans.service_context") from None
+
+
 def _now() -> datetime:
-    return _CONTEXT.get().clock()
+    return _context().clock()
 
 
 # --------------------------------------------------------------------------------------
@@ -223,7 +227,7 @@ def _metadata(connection: sqlite3.Connection, plan_id: PlanId) -> Metadata:
     if row is None:
         raise DomainError("not_found", f"Plan {plan_id!r} does not exist")
     return Metadata(epoch=_installation_epoch(connection), plan_id=plan_id, generation=row[0], revision=row[1],
-                    ownership_version=row[2], dashboard_url=f"{_CONTEXT.get().base_url}/plans/{plan_id}")
+                    ownership_version=row[2], dashboard_url=f"{_context().base_url}/plans/{plan_id}")
 
 
 # --------------------------------------------------------------------------------------
@@ -289,6 +293,8 @@ def _derive_status(plan: _Plan, agg: _Aggregates) -> str:
     if draft.get("block_reason") or agg.store_hold or agg.has_global_hold or agg.has_stale_attempt:
         return "blocked"
     if states and all(state in ("complete", "retired") for state in states):
+        if agg.has_live_attempts or agg.has_unresolved_uses or agg.has_plan_holds:
+            return "blocked"
         return "complete"
     if "in-progress" in states or agg.has_live_attempts:
         return "running"
@@ -320,10 +326,9 @@ def _history(connection: sqlite3.Connection, plan: _Plan) -> list[dict[str, Any]
         entry["summary"] = data.get("summary") or kind
         if data.get("authorization_note"):
             entry["authorizationNote"] = data["authorization_note"]
-    history = []
-    for revision in range(first, plan.revision + 1):
-        history.append(by_revision.get(revision) or {
-            "revision": revision, "timestamp": plan.updated_at, "summary": f"Revision {revision}"})
+    history = [by_revision[revision] for revision in sorted(by_revision)]
+    if plan.revision not in by_revision:
+        raise DomainError("history_incomplete", f"No event is recorded for revision {plan.revision} of this plan")
     return history
 
 
@@ -480,31 +485,50 @@ def decode_cursor(cursor: str) -> dict[str, Any]:
 
 
 def _coordination_page(
-    connection: sqlite3.Connection, plan: _Plan, key: tuple[int, int, int], limit: int, budget: int,
-    *, strict: bool,
+    connection: sqlite3.Connection, plan: _Plan, key: tuple[int, int, int], limit: int, base_size: int,
+    *, strict: bool, per_kind_arrays: bool,
 ) -> tuple[list[CoordinationItem], str | None]:
-    """Collect priority-ordered rows after `key` within the row and byte budget; rows are never truncated."""
+    """Collect priority-ordered rows after `key` so the whole serialized response stays within MAX_PAGE_BYTES.
+
+    `base_size` is the exact canonical size of the response with no rows and a null cursor. Each accepted row
+    adds its own bytes, a separating comma when its array is already non-empty, and, when more rows follow, the
+    growth of the cursor replacing `null`. Rows are never truncated.
+    """
     rows = connection.execute(_PAGE_SQL, {
         "p": plan.plan_id, "a": key[0], "b": key[1], "c": key[2], "n": limit + 1}).fetchall()
+    epoch, sequence = _installation_epoch(connection), _store_sequence(connection)
+
+    def cursor_for(position: tuple[int, int, int]) -> str:
+        return encode_cursor(epoch, plan.plan_id, plan.revision, sequence, position)
+
     items: list[CoordinationItem] = []
-    used = 0
+    filled: set[str | None] = set()
+    used = base_size
     last = key
-    stopped = len(rows) > limit
-    for prio, kind_rank, rid, kind in rows[:limit]:
+    fits = True
+    for index, (prio, kind_rank, rid, kind) in enumerate(rows[:limit]):
         item = _load_item(connection, plan.plan_id, kind, rid)
-        size = len(canonical_bytes(item))
-        if strict and size > MAX_PAGE_BYTES:
-            raise DomainError("limit_exceeded", "A coordination row exceeds the 10MB page limit")
-        if used + size > budget:
-            stopped = True
+        array = kind if per_kind_arrays else None
+        if per_kind_arrays and kind == "invalidation":
+            delta = 0  # the plan view carries no invalidation array
+        else:
+            delta = len(canonical_bytes(item.value if per_kind_arrays else item)) + (1 if array in filled else 0)
+        position = (prio, kind_rank, rid)
+        more_follow = index < len(rows) - 1
+        cursor_growth = len(cursor_for(position)) - 2 if more_follow else 0
+        if used + delta + cursor_growth > MAX_PAGE_BYTES:
+            fits = False
             break
         items.append(item)
-        used += size
-        last = (prio, kind_rank, rid)
-    if not stopped:
+        filled.add(array)
+        used += delta
+        last = position
+    if fits and len(rows) <= limit:
         return items, None
-    epoch, sequence = _installation_epoch(connection), _store_sequence(connection)
-    return items, encode_cursor(epoch, plan.plan_id, plan.revision, sequence, last)
+    if not items:
+        if strict or used + len(cursor_for(last)) - 2 > MAX_PAGE_BYTES:
+            raise DomainError("limit_exceeded", "The next coordination row does not fit the 10MB response limit")
+    return items, cursor_for(last)
 
 
 def _coordination_view(
@@ -542,9 +566,14 @@ def read_coordination_page(
                               _metadata(connection, plan_id))
         key = tuple(cursor["k"])  # type: ignore[assignment]
     agg = _aggregates(connection, plan_id)
-    items, next_cursor = _coordination_page(connection, plan, key, limit, MAX_PAGE_BYTES, strict=True)
-    return CoordinationPage(plan_id=plan_id, revision=plan.revision, store_sequence=sequence,
-                            items=tuple(items), next_cursor=next_cursor, total_counts=dict(agg.counts))
+    empty = CoordinationPage(plan_id=plan_id, revision=plan.revision, store_sequence=sequence,
+                             items=(), next_cursor=None, total_counts=dict(agg.counts))
+    base_size = len(canonical_bytes(empty))
+    if base_size > MAX_PAGE_BYTES:
+        raise DomainError("limit_exceeded", "The coordination page envelope exceeds the 10MB response limit")
+    items, next_cursor = _coordination_page(
+        connection, plan, key, limit, base_size, strict=True, per_kind_arrays=False)
+    return dataclasses.replace(empty, items=tuple(items), next_cursor=next_cursor)
 
 
 # --------------------------------------------------------------------------------------
@@ -555,15 +584,17 @@ def _project(connection: sqlite3.Connection, plan_id: PlanId) -> PlanView:
     agg = _aggregates(connection, plan_id)
     status = _derive_status(plan, agg)
     snapshot = _snapshot(connection, plan, status)
-    graph_bytes = len(canonical_bytes(snapshot)) + len(canonical_bytes(plan.draft_json))
-    items, next_cursor = _coordination_page(
-        connection, plan, _START_KEY, COORDINATION_SUMMARY_LIMIT, max(0, MAX_PAGE_BYTES - graph_bytes),
-        strict=False)
-    return PlanView(
+    view = PlanView(
         plan_id=plan_id, metadata=_metadata(connection, plan_id), draft=plan.draft(), legacy_snapshot=snapshot,
         legacy_publication=_publication(snapshot),
-        coordination=_coordination_view(connection, plan, agg, items, next_cursor),
+        coordination=_coordination_view(connection, plan, agg, [], None),
         status=status, published_at=snapshot["updatedAt"])
+    base_size = len(canonical_bytes(view))
+    if base_size > MAX_PAGE_BYTES:
+        raise DomainError("limit_exceeded", "The plan view exceeds the 10MB response limit")
+    items, next_cursor = _coordination_page(
+        connection, plan, _START_KEY, COORDINATION_SUMMARY_LIMIT, base_size, strict=False, per_kind_arrays=True)
+    return dataclasses.replace(view, coordination=_coordination_view(connection, plan, agg, items, next_cursor))
 
 
 def project_plan(connection: sqlite3.Connection, plan_id: PlanId) -> PlanView:
@@ -850,7 +881,7 @@ def _check_preconditions(plan: _Plan, command: Command) -> None:
     if command.generation is None:
         raise DomainError("invalid", "generation is required")
     if command.generation != plan.generation:
-        raise DomainError("stale_generation", "The plan generation has changed; re-read the plan")
+        raise DomainError("stale", "The plan generation has changed; re-read the plan")
     if command.expected_revision is None:
         raise DomainError("invalid", "expected_revision is required")
     if command.expected_revision != plan.revision:

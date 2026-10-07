@@ -40,14 +40,14 @@ def authenticate_orchestrator(connection: sqlite3.Connection, command: Command, 
     """Require a current, unrevoked orchestrator capability for the command's plan."""
     token = command.orchestrator_token
     if not token or command.plan_id is None:
-        raise DomainError("unauthorized", "An orchestrator capability for the plan is required")
+        raise DomainError("forbidden", "An orchestrator capability for the plan is required")
     row = connection.execute(
         "SELECT valid_until FROM capabilities WHERE plan_id = ? AND role = 'orchestrator' AND secret_hash = ? "
         "AND revoked = 0 AND epoch = ?",
         (command.plan_id, hash_token(token), _installation_epoch(connection)),
     ).fetchone()
     if row is None or (row[0] is not None and row[0] <= now.isoformat()):
-        raise DomainError("unauthorized", "Orchestrator capability is not valid for this plan")
+        raise DomainError("forbidden", "Orchestrator capability is not valid for this plan")
 
 
 def current_ownership(connection: sqlite3.Connection, plan_id: PlanId) -> tuple[str, int]:

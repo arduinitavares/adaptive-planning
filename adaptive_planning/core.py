@@ -287,10 +287,13 @@ def validate_plan_steps_and_graph(
                 )
 
     if exec_mode == "plan-only" and not legacy:
-        if task_status not in ("planning", "blocked"):
+        allowed = ("planning", "blocked", "stopped", "complete") if allow_service_in_progress else ("planning", "blocked")
+        if task_status not in allowed:
             raise PlanValidationError(f"plan-only mode task status must be 'planning' or 'blocked', got '{task_status}'")
+        # Retained work under a service stop or block is vetted per step by validate_service_graph.
+        retains_work = allow_service_in_progress and task_status in ("blocked", "stopped")
         for sid, step in steps_by_id.items():
-            if step["status"] == "in-progress":
+            if step["status"] == "in-progress" and not retains_work:
                 raise PlanValidationError(f"plan-only mode cannot have in-progress step '{sid}'")
 
 

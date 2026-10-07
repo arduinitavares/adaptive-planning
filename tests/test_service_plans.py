@@ -12,6 +12,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
+from adaptive_planning import plans
 from adaptive_planning.core import PlanValidationError, validate_published_snapshot
 from adaptive_planning.types import (
     ArtifactRef,
@@ -87,6 +88,43 @@ def foreign_orphan_release(store, use_id: str = "use-orphan") -> None:
         db.execute("INSERT INTO events (plan_id, plan_revision, kind, actor, published_at, payload) "
                    "VALUES (NULL, NULL, 'release_resource_use', 'other', 'ts', '{}')")
     store.write(run)
+
+
+OBLIGATION_TABLES = ("attempts", "resource_uses", "holds", "reviews", "result_versions", "capabilities")
+
+
+def table_rows(store, *tables: str) -> list:
+    return store.read(lambda db: [
+        (name, db.execute(f"SELECT * FROM {name} ORDER BY rowid").fetchall()) for name in tables])
+
+
+def wire_bytes(dto) -> int:
+    """Size of a returned DTO in canonical JSON, measured independently of the production serializer."""
+    return len(json.dumps(dataclasses.asdict(dto), sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False, allow_nan=False).encode("utf-8"))
+
+
+def complete_all_steps(store, plan_id: str, step_ids=("a", "b", "c")) -> None:
+    for step_id in step_ids:
+        set_step_state(store, plan_id, step_id, "complete", ("verified",))
+
+
+def insert_owned_use(store, plan_id: str, step_id: str = "b", status: str = "unresolved") -> None:
+    insert_attempt(store, plan_id, f"att-use-{step_id}", step_id, "accepted")
+
+    def run(db):
+        db.execute("INSERT OR IGNORE INTO resources (resource_id, host_id, kind, status, created_at) "
+                   "VALUES ('res-own', 'synthetic-host', 'workspace', 'active', 'ts')")
+        db.execute("INSERT INTO resource_uses (use_id, resource_id, plan_id, attempt_id, scope, status, "
+                   "created_at) VALUES (?, 'res-own', ?, ?, 'workspace', ?, 'ts')",
+                   (f"use-own-{plan_id}", plan_id, f"att-use-{step_id}", status))
+    store.write(run)
+
+
+def insert_store_hold(store, epoch: str) -> None:
+    store.write(lambda db: db.execute(
+        "INSERT INTO store_hold_reasons (reason_id, epoch, kind, details, resolved, created_at) "
+        "VALUES ('r1', ?, 'restore', 'restored from backup', 0, 'ts')", (epoch,)))
 
 
 class PlanServiceTestCase(unittest.TestCase):
@@ -252,6 +290,7 @@ class TestRevisionsAndRetries(PlanServiceTestCase):
     def test_stale_revision_generation_and_epoch_fail_without_events(self):
         self.f.service.execute(self.revise("advance"))
         events_before = len(self.events())
+        before_dump = dump(self.f.store)
         stale_revision = self.revise("stale", expected_revision=1)
         with self.assertRaises(DomainError) as ctx:
             self.f.service.execute(stale_revision)
@@ -262,7 +301,9 @@ class TestRevisionsAndRetries(PlanServiceTestCase):
         with self.assertRaises(DomainError) as ctx:
             self.f.service.execute(self.revise("generation", receipt=wrong_generation,
                                                refresh_metadata=False, expected_revision=2))
-        self.assertEqual(ctx.exception.code, "stale_generation")
+        self.assertEqual(ctx.exception.code, "stale")
+        self.assertEqual(ctx.exception.current_metadata.revision, 2)
+        self.assertEqual(ctx.exception.current_metadata.generation, self.p.committed_metadata.generation)
 
         wrong_epoch = dataclasses.replace(
             self.p, committed_metadata=dataclasses.replace(self.p.committed_metadata, epoch="epoch-other"))
@@ -271,6 +312,7 @@ class TestRevisionsAndRetries(PlanServiceTestCase):
                                                refresh_metadata=False, expected_revision=2))
         self.assertEqual(ctx.exception.code, "stale_epoch")
         self.assertEqual(len(self.events()), events_before)
+        self.assertEqual(dump(self.f.store), before_dump)
 
     def test_missing_expected_revision_and_unknown_plan_rejected(self):
         command = dataclasses.replace(self.revise("no cas"), expected_revision=None)
@@ -280,17 +322,17 @@ class TestRevisionsAndRetries(PlanServiceTestCase):
         missing = dataclasses.replace(self.revise("missing plan"), plan_id="plan-missing")
         with self.assertRaises(DomainError) as ctx:
             self.f.service.execute(missing)
-        self.assertIn(ctx.exception.code, {"not_found", "unauthorized"})
+        self.assertEqual(ctx.exception.code, "forbidden")
 
     def test_orchestrator_capability_is_authenticated_before_mutation(self):
-        events_before = len(self.events())
+        before_dump = dump(self.f.store)
         for token in (None, "bogus-token"):
             with self.subTest(token=token):
                 command = dataclasses.replace(self.revise("auth"), orchestrator_token=token)
                 with self.assertRaises(DomainError) as ctx:
                     self.f.service.execute(command)
-                self.assertEqual(ctx.exception.code, "unauthorized")
-        self.assertEqual(len(self.events()), events_before)
+                self.assertEqual(ctx.exception.code, "forbidden")
+        self.assertEqual(dump(self.f.store), before_dump)
 
     def test_only_planning_mutations_are_enabled(self):
         command = self.f.command("sweep_stale", {}, receipt=self.p)
@@ -412,12 +454,14 @@ class TestRevisionsAndRetries(PlanServiceTestCase):
     def test_limits_without_truncation(self):
         before = counts(self.f.store)
         too_many = tuple(step(f"s{i}") for i in range(201))
-        with self.assertRaises(DomainError):
+        with self.assertRaises(DomainError) as ctx:
             self.f.create(steps=too_many, creation_id="too-many")
+        self.assertEqual(ctx.exception.code, "limit_exceeded")
         oversized = dataclasses.replace(draft(), objective="Oversized plan", facts=("x" * 1_000_000,) * 11)
-        with self.assertRaises(DomainError):
+        with self.assertRaises(DomainError) as ctx:
             self.f.service.execute(self.f.command(
                 "create_plan", {"creation_id": "oversized", "draft": oversized, "new_plan_intent": "x"}))
+        self.assertEqual(ctx.exception.code, "limit_exceeded")
         self.assertEqual(counts(self.f.store), before)
 
         maximum = tuple(step(f"s{i}") for i in range(200))
@@ -431,8 +475,9 @@ class TestRevisionsAndRetries(PlanServiceTestCase):
     def test_oversized_coordination_row_is_never_truncated(self):
         insert_attempt(self.f.store, self.plan_id, "att-huge", "a", "active",
                        {"last_activity": "x" * (11 * 1024 * 1024)})
-        with self.assertRaises(DomainError):
+        with self.assertRaises(DomainError) as ctx:
             self.f.service.read_coordination(self.plan_id)
+        self.assertEqual(ctx.exception.code, "limit_exceeded")
         view = self.f.service.read_plan(self.plan_id)
         self.assertEqual(view.coordination.attempts, ())
         self.assertIsNotNone(view.coordination.next_cursor)
@@ -790,6 +835,444 @@ class TestCoordinationPaging(PlanServiceTestCase):
         self.assertEqual(dict(view.coordination.result_versions), {"a": "rv-1"})
         kinds = [i.kind for i in self.f.service.read_coordination(self.plan_id).items]
         self.assertIn("invalidation", kinds)
+
+
+class TestPlanOnlyLifecycle(PlanServiceTestCase):
+    def plan_only(self, name, steps=None):
+        receipt = self.f.create(mode="plan-only", creation_id=f"po-{name}", steps=steps)
+        return receipt, receipt.current_metadata.plan_id
+
+    def change(self, receipt, plan_id, reason, *, change=None, retire=(), **draft_changes):
+        base = dataclasses.replace(self.f.service.read_plan(plan_id).draft, **draft_changes)
+        return self.f.command(
+            "revise_plan",
+            {"draft": base, "reason": reason, "authorization_change": change, "retire_steps": tuple(retire)},
+            receipt=receipt)
+
+    def test_plan_only_explicit_stop_and_restart(self):
+        receipt, plan_id = self.plan_only("stop")
+        before = self.f.service.read_plan(plan_id)
+        self.f.service.execute(self.change(receipt, plan_id, "stop", stop_reason="user stopped"))
+        stopped = self.f.service.read_plan(plan_id)
+        self.assertEqual((stopped.status, stopped.legacy_snapshot["status"]), ("stopped", "stopped"))
+        self.assertEqual(stopped.draft.stop_reason, "user stopped")
+        self.assertEqual(stopped.draft.authorization, before.draft.authorization)
+        self.assertIsNone(stopped.legacy_publication)
+        with self.assertRaises(PlanValidationError):
+            validate_published_snapshot(stopped.legacy_snapshot)
+
+        self.f.service.execute(self.change(receipt, plan_id, "restart", stop_reason=None))
+        restarted = self.f.service.read_plan(plan_id)
+        self.assertEqual(restarted.status, "planning")
+        self.assertIsNone(restarted.draft.stop_reason)
+        self.assertEqual(restarted.draft.authorization, before.draft.authorization)
+        self.assertEqual(restarted.draft.authorization.mode, "plan-only")
+        validate_published_snapshot(restarted.legacy_publication)
+
+    def test_plan_only_all_unassigned_retirement_completes_the_plan(self):
+        receipt, plan_id = self.plan_only("retire")
+        before = self.f.service.read_plan(plan_id)
+        retire = tuple(RetirementRequest(step_id, f"obsolete {step_id}") for step_id in "abc")
+        self.f.service.execute(self.change(receipt, plan_id, "retire everything", retire=retire))
+        view = self.f.service.read_plan(plan_id)
+        self.assertEqual(view.status, "complete")
+        self.assertEqual([(s["id"], s["status"], s["retiredReason"]) for s in view.legacy_snapshot["steps"]],
+                         [("a", "retired", "obsolete a"), ("b", "retired", "obsolete b"),
+                          ("c", "retired", "obsolete c")])
+        self.assertIsNone(view.legacy_snapshot["nextStepId"])
+        self.assertEqual(view.draft.authorization, before.draft.authorization)
+        self.assertIsNone(view.legacy_publication)
+        self.assertNotIn(plan_id, {v.plan_id for v in self.f.service.list_plans()})
+        self.assertIn(plan_id, {v.plan_id for v in self.f.service.list_plans(include_terminal=True)})
+
+    def test_plan_only_running_stays_rejected_atomically(self):
+        receipt, plan_id = self.plan_only("running-step")
+        set_step_state(self.f.store, plan_id, "a", "in-progress")
+        other_receipt, other_id = self.plan_only("running-attempt")
+        insert_attempt(self.f.store, other_id, "att-b", "b", "active")
+        for pid, rcpt in ((plan_id, receipt), (other_id, other_receipt)):
+            with self.subTest(plan=pid):
+                before = dump(self.f.store)
+                with self.assertRaises(DomainError) as ctx:
+                    self.f.service.execute(self.change(rcpt, pid, "unbacked running"))
+                self.assertEqual(ctx.exception.code, "invalid")
+                self.assertEqual(dump(self.f.store), before)
+
+    def test_plan_only_stop_preserves_authority_work_and_reservations_exactly(self):
+        for state in ("assigned", "active", "submitted", "stale"):
+            with self.subTest(state=state):
+                receipt, plan_id = self.plan_only(state, steps=(step("a"), step("b")))
+                if state != "assigned":
+                    set_step_state(self.f.store, plan_id, "a", "in-progress")
+                insert_attempt(self.f.store, plan_id, f"att-{state}", "a", state)
+                insert_owned_use(self.f.store, plan_id, "b")
+                insert_hold(self.f.store, plan_id, f"hold-{state}", "b")
+                obligations = table_rows(self.f.store, *OBLIGATION_TABLES)
+                authorization = self.f.service.read_plan(plan_id).draft.authorization
+                self.f.service.execute(self.change(receipt, plan_id, "stop", stop_reason="user stopped"))
+                view = self.f.service.read_plan(plan_id)
+                self.assertEqual(view.status, "stopped")
+                self.assertEqual(view.draft.authorization, authorization)
+                self.assertEqual(table_rows(self.f.store, *OBLIGATION_TABLES), obligations)
+                self.assertEqual(view.coordination.total_counts["attempts"], 2)
+                self.assertEqual(view.coordination.total_counts["reservations"], 1)
+                self.assertEqual(view.coordination.total_counts["holds"], 1)
+
+    def test_simultaneous_plan_only_renewal_rejects_unfinished_claimed_work_atomically(self):
+        for state in ("assigned", "active", "submitted", "stale"):
+            with self.subTest(state=state):
+                receipt = self.f.create(creation_id=f"renew-{state}", steps=(step("a"), step("b")))
+                plan_id = receipt.current_metadata.plan_id
+                if state != "assigned":
+                    set_step_state(self.f.store, plan_id, "a", "in-progress")
+                insert_attempt(self.f.store, plan_id, f"att-{state}", "a", state)
+                before = dump(self.f.store)
+                renewal = AuthorizationChange("plan-only", "stop and hold the plan")
+                with self.assertRaises(DomainError) as ctx:
+                    self.f.service.execute(self.change(
+                        receipt, plan_id, "stop and renew", change=renewal, stop_reason="halt"))
+                self.assertEqual(ctx.exception.code, "invalid")
+                self.assertEqual(dump(self.f.store), before)
+
+                self.f.service.execute(self.change(receipt, plan_id, "stop only", stop_reason="halt"))
+                view = self.f.service.read_plan(plan_id)
+                self.assertEqual(view.status, "stopped")
+                self.assertEqual(view.draft.authorization.mode, "complete-task")
+                self.assertEqual(view.coordination.attempts[0].state, state)
+
+    def test_plan_only_renewal_with_stop_succeeds_when_nothing_is_claimed(self):
+        receipt = self.f.create(creation_id="renew-clean", steps=(step("a"), step("b")))
+        plan_id = receipt.current_metadata.plan_id
+        renewal = AuthorizationChange("plan-only", "pause for planning")
+        self.f.service.execute(self.change(receipt, plan_id, "stop and renew", change=renewal, stop_reason="halt"))
+        view = self.f.service.read_plan(plan_id)
+        auth = view.draft.authorization
+        self.assertEqual(view.status, "stopped")
+        self.assertEqual((auth.mode, auth.since_revision, auth.baseline, auth.claimed),
+                         ("plan-only", 2, (), None))
+
+    def test_plan_only_in_progress_requires_matching_backing(self):
+        cases = (
+            ("stop-active", "stop", "active", None, True), ("stop-submitted", "stop", "submitted", None, True),
+            ("stop-stale", "stop", "stale", None, True), ("stop-step-hold", "stop", None, "a", True),
+            ("stop-global-hold", "stop", None, "*", True), ("stop-unrelated-hold", "stop", None, "b", False),
+            ("stop-nothing", "stop", None, None, False),
+            ("block-stale", "block", "stale", None, True), ("block-step-hold", "block", None, "a", True),
+            ("block-global-hold", "block", None, "*", True), ("block-active", "block", "active", None, False),
+            ("block-submitted", "block", "submitted", None, False),
+            ("block-unrelated-hold", "block", None, "b", False), ("block-nothing", "block", None, None, False),
+        )
+        for name, lifecycle, attempt_state, hold, valid in cases:
+            with self.subTest(case=name):
+                receipt, plan_id = self.plan_only(name, steps=(step("a"), step("b")))
+                set_step_state(self.f.store, plan_id, "a", "in-progress")
+                if attempt_state:
+                    insert_attempt(self.f.store, plan_id, "att-a", "a", attempt_state)
+                if hold:
+                    insert_hold(self.f.store, plan_id, f"hold-{plan_id}", None if hold == "*" else hold,
+                                kind="identity" if hold == "*" else "reassessment")
+                reason = {"stop_reason": "halt"} if lifecycle == "stop" else {"block_reason": "waiting"}
+                before = dump(self.f.store)
+                command = self.change(receipt, plan_id, lifecycle, **reason)
+                if not valid:
+                    with self.assertRaises(DomainError) as ctx:
+                        self.f.service.execute(command)
+                    self.assertEqual(ctx.exception.code, "invalid")
+                    self.assertEqual(dump(self.f.store), before)
+                    continue
+                self.f.service.execute(command)
+                view = self.f.service.read_plan(plan_id)
+                self.assertEqual(view.status, "stopped" if lifecycle == "stop" else "blocked")
+                self.assertEqual(next(s for s in view.legacy_snapshot["steps"] if s["id"] == "a")["status"],
+                                 "in-progress")
+                self.assertIsNone(view.legacy_publication)
+
+    def test_plan_only_in_progress_is_backed_by_store_hold(self):
+        stopping, stop_id = self.plan_only("store-stop", steps=(step("a"), step("b")))
+        blocking, block_id = self.plan_only("store-block", steps=(step("a"), step("b")))
+        for plan_id in (stop_id, block_id):
+            set_step_state(self.f.store, plan_id, "a", "in-progress")
+        insert_store_hold(self.f.store, self.f.epoch)
+        self.f.service.execute(self.change(stopping, stop_id, "stop", stop_reason="halt"))
+        self.f.service.execute(self.change(blocking, block_id, "block", block_reason="waiting"))
+        self.assertEqual(self.f.service.read_plan(stop_id).status, "stopped")
+        self.assertEqual(self.f.service.read_plan(block_id).status, "blocked")
+
+
+class TestCompletionDerivation(PlanServiceTestCase):
+    def terminal_plan(self, name):
+        receipt = self.f.create(creation_id=f"terminal-{name}", steps=(step("a"), step("b")))
+        plan_id = receipt.current_metadata.plan_id
+        complete_all_steps(self.f.store, plan_id, ("a", "b"))
+        return receipt, plan_id
+
+    def noop_revision(self, receipt, plan_id, reason="no-op", **draft_changes):
+        base = dataclasses.replace(self.f.service.read_plan(plan_id).draft, **draft_changes)
+        return self.f.command(
+            "revise_plan",
+            {"draft": base, "reason": reason, "authorization_change": None, "retire_steps": ()},
+            receipt=receipt)
+
+    def test_all_terminal_graph_without_obligations_is_complete(self):
+        _, plan_id = self.terminal_plan("clean")
+        view = self.f.service.read_plan(plan_id)
+        self.assertEqual((view.status, view.legacy_snapshot["status"]), ("complete", "complete"))
+
+    def test_all_terminal_graph_with_owned_obligation_stays_blocked(self):
+        def attempt(state):
+            return lambda pid: insert_attempt(self.f.store, pid, "att-live", "a", state)
+
+        cases = {
+            "assigned attempt": attempt("assigned"), "active attempt": attempt("active"),
+            "submitted attempt": attempt("submitted"), "stale attempt": attempt("stale"),
+            "unresolved use": lambda pid: insert_owned_use(self.f.store, pid, "b"),
+            "step hold": lambda pid: insert_hold(self.f.store, pid, f"hold-{pid}", "b"),
+            "plan hold": lambda pid: insert_hold(self.f.store, pid, f"hold-{pid}", None, kind="identity"),
+        }
+        for name, add in cases.items():
+            with self.subTest(case=name):
+                receipt, plan_id = self.terminal_plan(name.replace(" ", "-"))
+                add(plan_id)
+                obligations = table_rows(self.f.store, *OBLIGATION_TABLES)
+                events_before = len(self.f.service.read_events(plan_id, limit=1000))
+                view = self.f.service.read_plan(plan_id)
+                self.assertEqual((view.status, view.legacy_snapshot["status"]), ("blocked", "blocked"))
+                self.assertIn(plan_id, {v.plan_id for v in self.f.service.list_plans()})
+                self.assertEqual(table_rows(self.f.store, *OBLIGATION_TABLES), obligations)
+
+                self.f.service.execute(self.noop_revision(receipt, plan_id))
+                persisted = self.f.store.read(lambda db: db.execute(
+                    "SELECT status FROM plans WHERE plan_id = ?", (plan_id,)).fetchone()[0])
+                self.assertEqual(persisted, "blocked")
+                self.assertEqual(table_rows(self.f.store, *OBLIGATION_TABLES), obligations)
+                self.assertEqual(len(self.f.service.read_events(plan_id, limit=1000)), events_before + 1)
+
+    def test_resolved_or_terminal_obligations_do_not_block_completion(self):
+        _, plan_id = self.terminal_plan("resolved")
+        for index, state in enumerate(("accepted", "released", "rejected")):
+            insert_attempt(self.f.store, plan_id, f"att-{index}", "a", state)
+        insert_owned_use(self.f.store, plan_id, "b", status="released")
+        insert_hold(self.f.store, plan_id, "hold-off", "b")
+        self.f.store.write(lambda db: db.execute("UPDATE holds SET active = 0 WHERE hold_id = 'hold-off'"))
+        self.assertEqual(self.f.service.read_plan(plan_id).status, "complete")
+
+    def test_store_hold_blocks_all_terminal_graph(self):
+        _, plan_id = self.terminal_plan("store-hold")
+        insert_store_hold(self.f.store, self.f.epoch)
+        self.assertEqual(self.f.service.read_plan(plan_id).status, "blocked")
+
+    def test_foreign_plan_obligations_do_not_block_all_terminal_graph(self):
+        _, plan_id = self.terminal_plan("target")
+        foreign = self.f.create(creation_id="foreign", steps=(step("o"),)).current_metadata.plan_id
+        insert_attempt(self.f.store, foreign, "att-o", "o", "active")
+        insert_owned_use(self.f.store, foreign, "o")
+        insert_hold(self.f.store, foreign, "hold-o", "o")
+        view = self.f.service.read_plan(plan_id)
+        self.assertEqual(view.status, "complete")
+        self.assertEqual(view.coordination.total_counts["attempts"], 0)
+        self.assertEqual(self.f.service.read_plan(foreign).status, "running")
+
+    def test_explicit_stop_takes_precedence_over_blocking_obligations(self):
+        receipt, plan_id = self.terminal_plan("stop")
+        insert_attempt(self.f.store, plan_id, "att-live", "a", "active")
+        insert_hold(self.f.store, plan_id, "hold-1", "b")
+        obligations = table_rows(self.f.store, *OBLIGATION_TABLES)
+        self.f.service.execute(self.noop_revision(receipt, plan_id, "stop", stop_reason="user stopped"))
+        self.assertEqual(self.f.service.read_plan(plan_id).status, "stopped")
+        self.assertEqual(table_rows(self.f.store, *OBLIGATION_TABLES), obligations)
+
+
+class TestHistoryProvenance(PlanServiceTestCase):
+    def test_history_projects_actual_event_summaries_and_timestamps(self):
+        for reason in ("alpha", "beta"):
+            self.f.clock.advance(60)
+            self.f.service.execute(self.revise(reason))
+        history = self.f.service.read_plan(self.plan_id).legacy_snapshot["history"]
+        self.assertEqual([(h["revision"], h["timestamp"], h["summary"]) for h in history], [
+            (1, "2026-10-06T12:00:00+00:00", "Plan created"),
+            (2, "2026-10-06T12:01:00+00:00", "alpha"),
+            (3, "2026-10-06T12:02:00+00:00", "beta")])
+
+    def test_missing_intermediate_event_is_omitted_never_invented(self):
+        for reason in ("first", "second", "third"):
+            self.f.clock.advance(60)
+            self.f.service.execute(self.revise(reason))
+        self.f.store.write(lambda db: db.execute(
+            "DELETE FROM events WHERE plan_id = ? AND plan_revision = 2", (self.plan_id,)))
+        before = dump(self.f.store)
+        view = self.f.service.read_plan(self.plan_id)
+        history = view.legacy_snapshot["history"]
+        self.assertEqual([(h["revision"], h["summary"]) for h in history],
+                         [(1, "Plan created"), (3, "second"), (4, "third")])
+        self.assertEqual([h["timestamp"] for h in history], [
+            "2026-10-06T12:00:00+00:00", "2026-10-06T12:02:00+00:00", "2026-10-06T12:03:00+00:00"])
+        self.assertIsNone(view.legacy_publication)
+        self.assertEqual(dump(self.f.store), before)
+
+    def test_missing_current_revision_event_is_a_structured_error_without_repair(self):
+        self.f.service.execute(self.revise("second"))
+        self.f.store.write(lambda db: db.execute(
+            "DELETE FROM events WHERE plan_id = ? AND plan_revision = 2", (self.plan_id,)))
+        before = dump(self.f.store)
+        with self.assertRaises(DomainError) as ctx:
+            self.f.service.read_plan(self.plan_id)
+        self.assertEqual(ctx.exception.code, "history_incomplete")
+        with self.assertRaises(DomainError) as ctx:
+            self.f.service.list_plans()
+        self.assertEqual(ctx.exception.code, "history_incomplete")
+        self.assertEqual(dump(self.f.store), before)
+
+
+class TestServiceContext(PlanServiceTestCase):
+    def read_outside_context(self):
+        return self.f.store.read(lambda db: plans.project_plan(db, self.plan_id))
+
+    def test_domain_handlers_fail_outside_service_context_without_mutation(self):
+        before = dump(self.f.store)
+        with self.assertRaises(RuntimeError):
+            self.read_outside_context()
+        command = self.revise("outside context")
+        with self.assertRaises(RuntimeError):
+            self.f.store.write(lambda db: plans.revise_plan(db, command))
+        self.assertEqual(dump(self.f.store), before)
+
+    def test_service_calls_use_the_injected_base_url_and_clock(self):
+        self.f.clock.advance(90)
+        self.f.service.execute(self.revise("clocked"))
+        view = self.f.service.read_plan(self.plan_id)
+        self.assertEqual(view.metadata.dashboard_url, f"http://127.0.0.1:8790/plans/{self.plan_id}")
+        self.assertEqual(view.published_at, "2026-10-06T12:01:30+00:00")
+
+    def test_service_context_is_restored_after_success_failure_and_nesting(self):
+        with plans.service_context("http://outer", self.f.clock):
+            with plans.service_context("http://inner", self.f.clock):
+                self.assertEqual(self.read_outside_context().metadata.dashboard_url,
+                                 f"http://inner/plans/{self.plan_id}")
+            self.assertEqual(self.read_outside_context().metadata.dashboard_url,
+                             f"http://outer/plans/{self.plan_id}")
+        with self.assertRaises(RuntimeError):
+            self.read_outside_context()
+        with self.assertRaises(ValueError):
+            with plans.service_context("http://failing", self.f.clock):
+                raise ValueError("failure inside context")
+        with self.assertRaises(RuntimeError):
+            self.read_outside_context()
+
+    def test_canonical_serialization_needs_no_service_context(self):
+        command = self.revise("serialized")
+        self.assertEqual(plans.canonical_bytes({"b": (1, 2), "a": "é"}), '{"a":"é","b":[1,2]}'.encode("utf-8"))
+        self.assertEqual(plans.command_digest(command), plans.sha256_hex(plans.canonical_bytes(command)))
+        self.assertEqual(len(plans.command_digest(command)), 64)
+
+
+class TestResponseBounds(PlanServiceTestCase):
+    LIMIT = "adaptive_planning.plans.MAX_PAGE_BYTES"
+
+    def test_full_graph_over_ten_megabytes_fails_the_mutation_atomically(self):
+        big = tuple(dataclasses.replace(step(f"s{i}"), title="t" * 10000, completion_check="c" * 10000)
+                    for i in range(200))
+        base = self.f.service.read_plan(self.plan_id).draft
+        before = dump(self.f.store)
+        with self.assertRaises(DomainError) as ctx:
+            self.f.service.execute(self.revise("huge graph", base=dataclasses.replace(base, steps=big)))
+        self.assertEqual(ctx.exception.code, "limit_exceeded")
+        self.assertEqual(dump(self.f.store), before)
+        self.assertEqual(self.f.service.read_plan(self.plan_id).metadata.revision, 1)
+
+    def test_read_plan_counts_the_complete_serialized_view_at_the_boundary(self):
+        view = self.f.service.read_plan(self.plan_id)
+        self.assertIsNotNone(view.legacy_publication)
+        size = wire_bytes(view)
+        with mock.patch(self.LIMIT, size):
+            self.assertEqual(wire_bytes(self.f.service.read_plan(self.plan_id)), size)
+        with mock.patch(self.LIMIT, size - 1):
+            with self.assertRaises(DomainError) as ctx:
+                self.f.service.read_plan(self.plan_id)
+        self.assertEqual(ctx.exception.code, "limit_exceeded")
+
+    def test_read_plan_returns_only_rows_that_fit_the_remaining_budget(self):
+        for index in range(3):
+            insert_attempt(self.f.store, self.plan_id, f"att-{index}", "a", "active")
+        full = self.f.service.read_plan(self.plan_id)
+        self.assertEqual(len(full.coordination.attempts), 3)
+        self.assertIsNone(full.coordination.next_cursor)
+        full_size = wire_bytes(full)
+        cursor = self.f.service.read_coordination(self.plan_id, limit=1).next_cursor
+        summary_only = dataclasses.replace(
+            full, coordination=dataclasses.replace(full.coordination, attempts=(), next_cursor=cursor))
+        taken = []
+        for limit in range(wire_bytes(summary_only) + 8, full_size + 1):
+            with mock.patch(self.LIMIT, limit):
+                view = self.f.service.read_plan(self.plan_id)
+            self.assertLessEqual(wire_bytes(view), limit)
+            self.assertEqual(view.coordination.next_cursor is None, len(view.coordination.attempts) == 3)
+            taken.append(len(view.coordination.attempts))
+        self.assertEqual(taken, sorted(taken))
+        self.assertEqual((taken[0], taken[-1]), (0, 3))
+
+        graph_only = wire_bytes(dataclasses.replace(full, coordination=dataclasses.replace(
+            full.coordination, attempts=())))
+        with mock.patch(self.LIMIT, graph_only):
+            with self.assertRaises(DomainError) as ctx:
+                self.f.service.read_plan(self.plan_id)
+        self.assertEqual(ctx.exception.code, "limit_exceeded")
+
+    def test_coordination_page_counts_its_envelope_and_always_progresses(self):
+        for index in range(3):
+            insert_attempt(self.f.store, self.plan_id, f"att-{index}", "a", "active")
+        one_row = wire_bytes(self.f.service.read_coordination(self.plan_id, limit=1))
+        everything = self.f.service.read_coordination(self.plan_id, limit=500)
+        self.assertEqual(len(everything.items), 3)
+        self.assertIsNone(everything.next_cursor)
+        for limit in range(one_row - 5, wire_bytes(everything) + 1):
+            with mock.patch(self.LIMIT, limit):
+                if limit < one_row:
+                    with self.assertRaises(DomainError) as ctx:
+                        self.f.service.read_coordination(self.plan_id, limit=500)
+                    self.assertEqual(ctx.exception.code, "limit_exceeded")
+                    continue
+                page = self.f.service.read_coordination(self.plan_id, limit=500)
+            self.assertLessEqual(wire_bytes(page), limit)
+            self.assertTrue(page.items)
+            self.assertEqual(page.next_cursor is None, len(page.items) == 3)
+
+        with mock.patch(self.LIMIT, one_row):
+            cursor, seen_cursors, ids = None, set(), []
+            while True:
+                page = self.f.service.read_coordination(self.plan_id, after=cursor, limit=500)
+                self.assertTrue(page.items)
+                ids.extend(item.value.attempt_id for item in page.items)
+                if page.next_cursor is None:
+                    break
+                self.assertNotIn(page.next_cursor, seen_cursors)
+                seen_cursors.add(page.next_cursor)
+                cursor = page.next_cursor
+        self.assertEqual(ids, ["att-0", "att-1", "att-2"])
+
+    def test_strict_page_rejects_an_unfit_first_row_instead_of_repeating_its_cursor(self):
+        insert_attempt(self.f.store, self.plan_id, "att-small", "a", "active")
+        insert_attempt(self.f.store, self.plan_id, "att-huge", "a", "active",
+                       {"last_activity": "x" * (11 * 1024 * 1024)})
+        first = self.f.service.read_coordination(self.plan_id)
+        self.assertEqual([i.value.attempt_id for i in first.items], ["att-small"])
+        self.assertIsNotNone(first.next_cursor)
+        with self.assertRaises(DomainError) as ctx:
+            self.f.service.read_coordination(self.plan_id, after=first.next_cursor)
+        self.assertEqual(ctx.exception.code, "limit_exceeded")
+        summary = self.f.service.read_plan(self.plan_id)
+        self.assertEqual([a.attempt_id for a in summary.coordination.attempts], ["att-small"])
+        self.assertIsNotNone(summary.coordination.next_cursor)
+        self.assertLessEqual(wire_bytes(summary), 10 * 1024 * 1024)
+
+    def test_oversized_authority_yields_a_structured_size_error(self):
+        self.f.store.write(lambda db: db.execute(
+            "INSERT INTO result_versions (plan_id, result_version, step_id, identity, created_at) "
+            "VALUES (?, ?, 'a', 'repo', 'ts')", (self.plan_id, "rv-" + "x" * (11 * 1024 * 1024))))
+        before = dump(self.f.store)
+        with self.assertRaises(DomainError) as ctx:
+            self.f.service.read_plan(self.plan_id)
+        self.assertEqual(ctx.exception.code, "limit_exceeded")
+        self.assertEqual(dump(self.f.store), before)
 
 
 if __name__ == "__main__":

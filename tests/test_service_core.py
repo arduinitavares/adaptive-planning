@@ -1516,6 +1516,111 @@ class TestServiceCore(unittest.TestCase):
         validate_service_graph(prop, None, coordination(holds=(hold_global,)))
         validate_service_graph(prop, None, coordination(store_hold=True))
 
+    @staticmethod
+    def plan_only_proposal(status, step_status="pending"):
+        proposed = legacy_proposal()
+        proposed["executionMode"] = "plan-only"
+        proposed["status"] = status
+        for node in proposed["steps"]:
+            node["status"] = step_status
+            if step_status == "complete":
+                node["evidence"] = ["verified"]
+            if step_status == "retired":
+                node["retiredReason"] = "obsolete"
+        proposed["nextStepId"] = "step-1" if step_status == "pending" else None
+        return proposed
+
+    @staticmethod
+    def published_plan_only(status, step_status="pending"):
+        proposed = TestServiceCore.plan_only_proposal(status, step_status)
+        return {
+            **proposed,
+            "generation": "11111111-1111-1111-1111-111111111111",
+            "revision": 1,
+            "updatedAt": "2026-10-06T00:00:00+00:00",
+            "scope": {"mode": "plan-only", "sinceRevision": 1, "baseline": [], "claimed": None},
+            "history": [{"revision": 1, "timestamp": "2026-10-06T00:00:00+00:00",
+                         "summary": proposed["changeSummary"], "authorizationNote": "note"}],
+        }
+
+    def test_plan_only_lifecycle_statuses_are_service_only_while_legacy_stays_strict(self):
+        """Service opt-in permits plan-only planning/blocked/stopped/complete; every legacy path keeps rejecting."""
+        for status, step_status in (
+            ("planning", "pending"), ("blocked", "pending"), ("stopped", "pending"), ("complete", "retired"),
+        ):
+            with self.subTest(status=status):
+                proposed = self.plan_only_proposal(status, step_status)
+                validate_service_graph(proposed, None, coordination(()))
+                legacy_allowed = status in ("planning", "blocked")
+                if legacy_allowed:
+                    validate_plan(proposed)
+                    validate_published_snapshot(self.published_plan_only(status, step_status))
+                    continue
+                with self.assertRaises(PlanValidationError):
+                    validate_plan(proposed)
+                with self.assertRaises(PlanValidationError):
+                    validate_published_snapshot(self.published_plan_only(status, step_status))
+                with self.assertRaises(PlanValidationError):
+                    prepare_publication(
+                        proposed, None, timestamp="2026-10-06T12:00:00Z",
+                        generation="11111111-1111-1111-1111-111111111111", expected_revision=0,
+                        expected_generation=None, authorization_note="note", max_file_bytes=100000,
+                        max_history=10)
+
+    def test_plan_only_running_and_unbacked_in_progress_stay_rejected_by_service(self):
+        running = self.plan_only_proposal("running")
+        with self.assertRaises(PlanValidationError):
+            validate_service_graph(running, None, coordination(()))
+        running["steps"][0]["status"] = "in-progress"
+        with self.assertRaises(PlanValidationError):
+            validate_service_graph(running, None, coordination(()))
+        attempt = AttemptView("x", "step-1", "worker-a", "active", None, 1, "v1", "2026-10-06T00:00:00Z",
+                              context(None, writes=False), False, None)
+        for status in ("planning", "complete"):
+            with self.subTest(status=status):
+                prop = self.plan_only_proposal(status)
+                prop["steps"][0]["status"] = "in-progress"
+                with self.assertRaises(PlanValidationError):
+                    validate_service_graph(prop, None, coordination((attempt,)))
+
+    def test_plan_only_in_progress_backing_matches_service_rules(self):
+        """Retained plan-only in-progress work needs matching per-step coordination backing under stopped/blocked."""
+        prop = self.plan_only_proposal("stopped")
+        prop["steps"][0]["status"] = "in-progress"
+        prop["nextStepId"] = "step-1"
+        stale = AttemptView("x", "step-1", "worker-a", "stale", "active", 1, "v1", "2026-10-06T00:00:00Z",
+                            context(None, writes=False), True, None)
+        active = dataclasses.replace(stale, state="active")
+        submitted = dataclasses.replace(stale, state="submitted")
+        foreign_active = dataclasses.replace(active, step_id="step-2")
+        hold_step1 = HoldView("h1", "reassessment", "step-1", "src1", "hold on step-1")
+        hold_step2 = HoldView("h2", "reassessment", "step-2", "src2", "hold on step-2")
+        hold_global = HoldView("hg", "reassessment", None, "src3", "plan-wide hold")
+
+        for unbacked in (coordination(()), coordination((foreign_active,)), coordination(holds=(hold_step2,))):
+            with self.assertRaises(PlanValidationError):
+                validate_service_graph(prop, None, unbacked)
+        for backed in (
+            coordination((active,)), coordination((submitted,)), coordination((stale,)),
+            coordination(holds=(hold_step1,)), coordination(holds=(hold_global,)), coordination(store_hold=True),
+        ):
+            validate_service_graph(prop, None, backed)
+            with self.assertRaises(PlanValidationError):
+                validate_plan(prop)
+
+        prop["status"] = "blocked"
+        for unbacked in (
+            coordination(()), coordination((active,)), coordination((submitted,)),
+            coordination((foreign_active,)), coordination(holds=(hold_step2,)),
+        ):
+            with self.assertRaises(PlanValidationError):
+                validate_service_graph(prop, None, unbacked)
+        for backed in (
+            coordination((stale,)), coordination(holds=(hold_step1,)), coordination(holds=(hold_global,)),
+            coordination(store_hold=True),
+        ):
+            validate_service_graph(prop, None, backed)
+
     def test_service_fixture_metadata_and_attempt_version(self):
         """ServiceFixture reads current metadata and attempt version when refresh_metadata=True, freezes on False."""
         from unittest.mock import MagicMock
