@@ -27,22 +27,39 @@ RequestKey = str
 JSONValue = Union[None, bool, int, float, str, list["JSONValue"], dict[str, "JSONValue"]]
 
 
+class DomainError(ValueError):
+    """Domain error exception carrying an error code, message, and optional current metadata."""
+
+    def __init__(self, code: str, message: str, current_metadata: Any = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.current_metadata = current_metadata
+
+    def __repr__(self) -> str:
+        return f"DomainError(code={self.code!r}, message={self.message!r}, current_metadata={self.current_metadata!r})"
+
+
+def _freeze_value(val: Any) -> Any:
+    if isinstance(val, Mapping):
+        return FrozenDict(val)
+    elif isinstance(val, (list, tuple)):
+        return tuple(_freeze_value(x) for x in val)
+    return val
+
+
 class FrozenDict(dict):
     """An immutable dictionary that rejects mutation and supports JSON serialization."""
 
+    _initialized = False
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if getattr(self, "_initialized", False):
+            raise TypeError(f"'{self.__class__.__name__}' object is immutable")
         super().__init__(*args, **kwargs)
         for k, v in list(self.items()):
-            if isinstance(v, Mapping) and not isinstance(v, FrozenDict):
-                super().__setitem__(k, FrozenDict(v))
-            elif isinstance(v, (list, tuple)):
-                super().__setitem__(
-                    k,
-                    tuple(
-                        FrozenDict(item) if isinstance(item, Mapping) and not isinstance(item, FrozenDict) else item
-                        for item in v
-                    ),
-                )
+            super().__setitem__(k, _freeze_value(v))
+        self._initialized = True
 
     def __setitem__(self, key: Any, value: Any) -> None:
         raise TypeError(f"'{self.__class__.__name__}' object does not support item assignment")
@@ -74,8 +91,51 @@ class FrozenDict(dict):
     def __deepcopy__(self, memo: Any) -> FrozenDict:
         return self
 
+    def __reduce__(self) -> Any:
+        return (FrozenDict, (dict(self),))
+
     def __hash__(self) -> int:
         return hash(tuple(sorted((k, v if not isinstance(v, (list, tuple)) else tuple(v)) for k, v in self.items())))
+
+
+def _validate_and_freeze_json_tree(val: Any, seen: set[int] | None = None) -> Any:
+    if seen is None:
+        seen = set()
+    if val is None or isinstance(val, (bool, int, str)):
+        return val
+    if isinstance(val, float):
+        if not math.isfinite(val):
+            raise DomainError("invalid", "Non-finite float values are not permitted in JSON tree")
+        return val
+    if isinstance(val, Mapping):
+        ptr = id(val)
+        if ptr in seen:
+            raise DomainError("invalid", "Cyclic reference detected in JSON tree")
+        seen.add(ptr)
+        try:
+            res = {}
+            for k, v in val.items():
+                if not isinstance(k, str):
+                    raise DomainError("invalid", f"Mapping keys in JSON tree must be strings, got {type(k).__name__}")
+                res[k] = _validate_and_freeze_json_tree(v, seen)
+            return FrozenDict(res)
+        except RecursionError as e:
+            raise DomainError("invalid", f"Maximum nesting depth exceeded or cycle detected: {e}") from e
+        finally:
+            seen.remove(ptr)
+    if isinstance(val, (list, tuple)):
+        ptr = id(val)
+        if ptr in seen:
+            raise DomainError("invalid", "Cyclic reference detected in JSON tree")
+        seen.add(ptr)
+        try:
+            return tuple(_validate_and_freeze_json_tree(item, seen) for item in val)
+        except RecursionError as e:
+            raise DomainError("invalid", f"Maximum nesting depth exceeded or cycle detected: {e}") from e
+        finally:
+            seen.remove(ptr)
+    raise DomainError("invalid", f"Invalid JSON leaf of type {type(val).__name__}: {val!r}")
+
 
 # Clock returning timezone-aware UTC datetime
 Clock = Callable[[], datetime]
@@ -309,8 +369,14 @@ class PlanDraft:
     block_reason: str | None = None
 
     def __post_init__(self) -> None:
-        if self.workflow is not None and not isinstance(self.workflow, FrozenDict):
-            object.__setattr__(self, "workflow", FrozenDict(self.workflow))
+        if self.workflow is not None:
+            if not isinstance(self.workflow, Mapping):
+                raise DomainError("invalid", "PlanDraft workflow must be a mapping or null")
+            for k, v in self.workflow.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    raise DomainError("invalid", "PlanDraft workflow keys and values must be strings")
+            if not isinstance(self.workflow, FrozenDict):
+                object.__setattr__(self, "workflow", FrozenDict(self.workflow))
 
 
 @dataclass(frozen=True)
@@ -493,21 +559,7 @@ class MutationReceipt:
     private: PrivateGrant | None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.committed, FrozenDict):
-            object.__setattr__(self, "committed", FrozenDict(self.committed))
-
-
-class DomainError(ValueError):
-    """Domain error exception carrying an error code, message, and optional current metadata."""
-
-    def __init__(self, code: str, message: str, current_metadata: Metadata | None = None) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.current_metadata = current_metadata
-
-    def __repr__(self) -> str:
-        return f"DomainError(code={self.code!r}, message={self.message!r}, current_metadata={self.current_metadata!r})"
+        object.__setattr__(self, "committed", _validate_and_freeze_json_tree(self.committed))
 
 
 # Command Payload TypedDict variants (all 23 kinds)
@@ -833,6 +885,8 @@ _PAYLOAD_REQUIRED_FIELDS: dict[str, set[str]] = {
     "append_late_evidence": {"origin_attempt_id", "evidence", "stopped_resource_ids", "reason"},
     "import_plan": {
         "host_id",
+        "source_directory_id",
+        "source_directory_claim",
         "original_task_id",
         "original_snapshot",
         "provenance",
@@ -868,21 +922,44 @@ _ENVELOPE_ALLOWED_FIELDS: set[str] = {
 _ALL_KINDS = BOOTSTRAP_KINDS | WORKER_KINDS | ORCHESTRATOR_KINDS
 
 
-def _check_finite_floats(val: Any) -> None:
+def _check_finite_floats(val: Any, seen: set[int] | None = None) -> None:
+    if seen is None:
+        seen = set()
     if isinstance(val, float):
         if not math.isfinite(val):
             raise DomainError("invalid", "Non-finite float values are not permitted")
     elif isinstance(val, Mapping):
-        for k, v in val.items():
-            if not isinstance(k, str):
-                raise DomainError("invalid", "Mapping keys must be strings")
-            _check_finite_floats(v)
+        ptr = id(val)
+        if ptr in seen:
+            raise DomainError("invalid", "Cyclic reference detected")
+        seen.add(ptr)
+        try:
+            for k, v in val.items():
+                if not isinstance(k, str):
+                    raise DomainError("invalid", "Mapping keys must be strings")
+                _check_finite_floats(v, seen)
+        finally:
+            seen.remove(ptr)
     elif isinstance(val, (list, tuple)):
-        for item in val:
-            _check_finite_floats(item)
+        ptr = id(val)
+        if ptr in seen:
+            raise DomainError("invalid", "Cyclic reference detected")
+        seen.add(ptr)
+        try:
+            for item in val:
+                _check_finite_floats(item, seen)
+        finally:
+            seen.remove(ptr)
     elif dataclasses.is_dataclass(val) and not isinstance(val, type):
-        for f in dataclasses.fields(val):
-            _check_finite_floats(getattr(val, f.name))
+        ptr = id(val)
+        if ptr in seen:
+            raise DomainError("invalid", "Cyclic reference detected")
+        seen.add(ptr)
+        try:
+            for f in dataclasses.fields(val):
+                _check_finite_floats(getattr(val, f.name), seen)
+        finally:
+            seen.remove(ptr)
 
 
 def _freeze_nested(val: Any) -> Any:
@@ -908,7 +985,7 @@ def _to_artifact_ref(val: Any) -> ArtifactRef:
         unknown = set(val.keys()) - {"kind", "identity", "version", "digest", "summary"}
         if unknown:
             raise DomainError("invalid", f"ArtifactRef contains unknown field(s): {sorted(unknown)}")
-        missing = {"kind", "identity", "version", "summary"} - set(val.keys())
+        missing = {"kind", "identity", "version", "digest", "summary"} - set(val.keys())
         if missing:
             raise DomainError("invalid", f"ArtifactRef missing required field(s): {sorted(missing)}")
         kind = val["kind"]
@@ -916,7 +993,7 @@ def _to_artifact_ref(val: Any) -> ArtifactRef:
             raise DomainError("invalid", f"Invalid ArtifactRef kind: {kind!r}")
         if not isinstance(val["identity"], str) or not isinstance(val["version"], str) or not isinstance(val["summary"], str):
             raise DomainError("invalid", "ArtifactRef identity, version, and summary must be strings")
-        digest = val.get("digest")
+        digest = val["digest"]
         if digest is not None and not isinstance(digest, str):
             raise DomainError("invalid", "ArtifactRef digest must be a string or null")
         return ArtifactRef(kind=kind, identity=val["identity"], version=val["version"], digest=digest, summary=val["summary"])
@@ -938,18 +1015,18 @@ def _to_document_ref(val: Any) -> DocumentRef:
         unknown = set(val.keys()) - {"path", "branch", "commit", "version", "task_id"}
         if unknown:
             raise DomainError("invalid", f"DocumentRef contains unknown field(s): {sorted(unknown)}")
-        missing = {"path", "version"} - set(val.keys())
+        missing = {"path", "branch", "commit", "version", "task_id"} - set(val.keys())
         if missing:
             raise DomainError("invalid", f"DocumentRef missing required field(s): {sorted(missing)}")
         if not isinstance(val["path"], str) or not isinstance(val["version"], str):
             raise DomainError("invalid", "DocumentRef path and version must be strings")
-        branch = val.get("branch")
+        branch = val["branch"]
         if branch is not None and not isinstance(branch, str):
             raise DomainError("invalid", "DocumentRef branch must be a string or null")
-        commit = val.get("commit")
+        commit = val["commit"]
         if commit is not None and not isinstance(commit, str):
             raise DomainError("invalid", "DocumentRef commit must be a string or null")
-        task_id = val.get("task_id")
+        task_id = val["task_id"]
         if task_id is not None and not isinstance(task_id, str):
             raise DomainError("invalid", "DocumentRef task_id must be a string or null")
         return DocumentRef(path=val["path"], branch=branch, commit=commit, version=val["version"], task_id=task_id)
@@ -979,17 +1056,17 @@ def _to_step_definition(val: Any) -> StepDefinition:
         unknown = set(val.keys()) - {"step_id", "title", "dependencies", "completion_check", "document", "definition_version", "review_required", "final_gate"}
         if unknown:
             raise DomainError("invalid", f"StepDefinition contains unknown field(s): {sorted(unknown)}")
-        missing = {"step_id", "title", "completion_check", "definition_version", "review_required", "final_gate"} - set(val.keys())
+        missing = {"step_id", "title", "dependencies", "completion_check", "document", "definition_version", "review_required", "final_gate"} - set(val.keys())
         if missing:
             raise DomainError("invalid", f"StepDefinition missing required field(s): {sorted(missing)}")
         if not isinstance(val["step_id"], str) or not isinstance(val["title"], str) or not isinstance(val["completion_check"], str) or not isinstance(val["definition_version"], str):
             raise DomainError("invalid", "StepDefinition step_id, title, completion_check, and definition_version must be strings")
         if type(val["review_required"]) is not bool or type(val["final_gate"]) is not bool:
             raise DomainError("invalid", "StepDefinition review_required and final_gate must be booleans")
-        deps = val.get("dependencies", ())
+        deps = val["dependencies"]
         if not isinstance(deps, (tuple, list)) or not all(isinstance(d, str) for d in deps):
             raise DomainError("invalid", "StepDefinition dependencies must be a sequence of strings")
-        doc = _to_document_ref(val["document"]) if val.get("document") is not None else None
+        doc = _to_document_ref(val["document"]) if val["document"] is not None else None
         return StepDefinition(
             step_id=val["step_id"],
             title=val["title"],
@@ -1027,7 +1104,7 @@ def _to_authorization(val: Any) -> Authorization:
         unknown = set(val.keys()) - {"mode", "interval", "since_revision", "note", "baseline", "claimed"}
         if unknown:
             raise DomainError("invalid", f"Authorization contains unknown field(s): {sorted(unknown)}")
-        missing = {"mode", "interval", "since_revision", "note"} - set(val.keys())
+        missing = {"mode", "interval", "since_revision", "note", "baseline", "claimed"} - set(val.keys())
         if missing:
             raise DomainError("invalid", f"Authorization missing required field(s): {sorted(missing)}")
         mode = val["mode"]
@@ -1037,10 +1114,10 @@ def _to_authorization(val: Any) -> Authorization:
             raise DomainError("invalid", "Authorization interval and note must be strings")
         if type(val["since_revision"]) is not int or val["since_revision"] < 0:
             raise DomainError("invalid", "Authorization since_revision must be a non-negative integer")
-        baseline = val.get("baseline", ())
+        baseline = val["baseline"]
         if not isinstance(baseline, (tuple, list)) or not all(isinstance(b, str) for b in baseline):
             raise DomainError("invalid", "Authorization baseline must be a sequence of strings")
-        claimed = val.get("claimed")
+        claimed = val["claimed"]
         if claimed is not None and not isinstance(claimed, str):
             raise DomainError("invalid", "Authorization claimed must be a string or null")
         return Authorization(
@@ -1118,7 +1195,7 @@ def _to_resource_claim(val: Any) -> ResourceClaim:
         unknown = set(val.keys()) - {"host_id", "kind", "device", "inode", "canonical_path", "case_insensitive", "repository_id", "external_identity"}
         if unknown:
             raise DomainError("invalid", f"ResourceClaim contains unknown field(s): {sorted(unknown)}")
-        missing = {"host_id", "kind", "case_insensitive"} - set(val.keys())
+        missing = {"host_id", "kind", "device", "inode", "canonical_path", "case_insensitive", "repository_id", "external_identity"} - set(val.keys())
         if missing:
             raise DomainError("invalid", f"ResourceClaim missing required field(s): {sorted(missing)}")
         if not isinstance(val["host_id"], str):
@@ -1126,21 +1203,21 @@ def _to_resource_claim(val: Any) -> ResourceClaim:
         kind = val["kind"]
         if kind not in ("repository", "workspace", "external"):
             raise DomainError("invalid", f"Invalid ResourceClaim kind: {kind!r}")
-        device = val.get("device")
+        device = val["device"]
         if device is not None and type(device) is not int:
             raise DomainError("invalid", "ResourceClaim device must be an integer or null")
-        inode = val.get("inode")
+        inode = val["inode"]
         if inode is not None and type(inode) is not int:
             raise DomainError("invalid", "ResourceClaim inode must be an integer or null")
-        canon = val.get("canonical_path")
+        canon = val["canonical_path"]
         if canon is not None and not isinstance(canon, str):
             raise DomainError("invalid", "ResourceClaim canonical_path must be a string or null")
         if type(val["case_insensitive"]) is not bool:
             raise DomainError("invalid", "ResourceClaim case_insensitive must be a boolean")
-        repo_id = val.get("repository_id")
+        repo_id = val["repository_id"]
         if repo_id is not None and not isinstance(repo_id, str):
             raise DomainError("invalid", "ResourceClaim repository_id must be a string or null")
-        ext_id = val.get("external_identity")
+        ext_id = val["external_identity"]
         if ext_id is not None and not isinstance(ext_id, str):
             raise DomainError("invalid", "ResourceClaim external_identity must be a string or null")
         return ResourceClaim(
@@ -1183,24 +1260,24 @@ def _to_execution_context(val: Any) -> ExecutionContext:
         unknown = set(val.keys()) - {"kind", "repository_id", "workspace_id", "repository_exclusive", "external_ids", "writes", "checked_base"}
         if unknown:
             raise DomainError("invalid", f"ExecutionContext contains unknown field(s): {sorted(unknown)}")
-        missing = {"kind", "repository_exclusive", "writes"} - set(val.keys())
+        missing = {"kind", "repository_id", "workspace_id", "repository_exclusive", "external_ids", "writes", "checked_base"} - set(val.keys())
         if missing:
             raise DomainError("invalid", f"ExecutionContext missing required field(s): {sorted(missing)}")
         kind = val["kind"]
         if kind not in ("repository", "non-repository", "external-only", "read-only"):
             raise DomainError("invalid", f"Invalid ExecutionContext kind: {kind!r}")
-        repo_id = val.get("repository_id")
+        repo_id = val["repository_id"]
         if repo_id is not None and not isinstance(repo_id, str):
             raise DomainError("invalid", "ExecutionContext repository_id must be a string or null")
-        ws_id = val.get("workspace_id")
+        ws_id = val["workspace_id"]
         if ws_id is not None and not isinstance(ws_id, str):
             raise DomainError("invalid", "ExecutionContext workspace_id must be a string or null")
         if type(val["repository_exclusive"]) is not bool or type(val["writes"]) is not bool:
             raise DomainError("invalid", "ExecutionContext repository_exclusive and writes must be booleans")
-        ext_ids = val.get("external_ids", ())
+        ext_ids = val["external_ids"]
         if not isinstance(ext_ids, (tuple, list)) or not all(isinstance(e, str) for e in ext_ids):
             raise DomainError("invalid", "ExecutionContext external_ids must be a sequence of strings")
-        checked_base = val.get("checked_base")
+        checked_base = val["checked_base"]
         if checked_base is not None and not isinstance(checked_base, str):
             raise DomainError("invalid", "ExecutionContext checked_base must be a string or null")
         return ExecutionContext(
@@ -1239,18 +1316,21 @@ def _to_execution_context_claims(val: Any) -> ExecutionContextClaims:
         unknown = set(val.keys()) - {"kind", "repository_claim", "workspace_claim", "repository_exclusive", "external_claims", "writes", "checked_base"}
         if unknown:
             raise DomainError("invalid", f"ExecutionContextClaims contains unknown field(s): {sorted(unknown)}")
-        missing = {"kind", "repository_exclusive", "writes"} - set(val.keys())
+        missing = {"kind", "repository_claim", "workspace_claim", "repository_exclusive", "external_claims", "writes", "checked_base"} - set(val.keys())
         if missing:
             raise DomainError("invalid", f"ExecutionContextClaims missing required field(s): {sorted(missing)}")
         kind = val["kind"]
         if kind not in ("repository", "non-repository", "external-only", "read-only"):
             raise DomainError("invalid", f"Invalid ExecutionContextClaims kind: {kind!r}")
-        rep_c = _to_resource_claim(val["repository_claim"]) if val.get("repository_claim") is not None else None
-        ws_c = _to_resource_claim(val["workspace_claim"]) if val.get("workspace_claim") is not None else None
+        rep_c = _to_resource_claim(val["repository_claim"]) if val["repository_claim"] is not None else None
+        ws_c = _to_resource_claim(val["workspace_claim"]) if val["workspace_claim"] is not None else None
         if type(val["repository_exclusive"]) is not bool or type(val["writes"]) is not bool:
             raise DomainError("invalid", "ExecutionContextClaims repository_exclusive and writes must be booleans")
-        ext_c = tuple(_to_resource_claim(c) for c in val.get("external_claims", ()))
-        checked_base = val.get("checked_base")
+        ext_claims_raw = val["external_claims"]
+        if not isinstance(ext_claims_raw, (tuple, list)):
+            raise DomainError("invalid", "ExecutionContextClaims external_claims must be a sequence")
+        ext_c = tuple(_to_resource_claim(c) for c in ext_claims_raw)
+        checked_base = val["checked_base"]
         if checked_base is not None and not isinstance(checked_base, str):
             raise DomainError("invalid", "ExecutionContextClaims checked_base must be a string or null")
         return ExecutionContextClaims(
@@ -1291,22 +1371,22 @@ def _to_evidence(val: Any) -> Evidence:
         unknown = set(val.keys()) - {"summary", "artifact", "workspace_id", "check", "result", "limitations", "blockers"}
         if unknown:
             raise DomainError("invalid", f"Evidence contains unknown field(s): {sorted(unknown)}")
-        missing = {"summary", "check", "result"} - set(val.keys())
+        missing = {"summary", "artifact", "workspace_id", "check", "result", "limitations", "blockers"} - set(val.keys())
         if missing:
             raise DomainError("invalid", f"Evidence missing required field(s): {sorted(missing)}")
         if not isinstance(val["summary"], str) or not isinstance(val["check"], str):
             raise DomainError("invalid", "Evidence summary and check must be strings")
-        art = _to_artifact_ref(val["artifact"]) if val.get("artifact") is not None else None
-        ws_id = val.get("workspace_id")
+        art = _to_artifact_ref(val["artifact"]) if val["artifact"] is not None else None
+        ws_id = val["workspace_id"]
         if ws_id is not None and not isinstance(ws_id, str):
             raise DomainError("invalid", "Evidence workspace_id must be a string or null")
         result = val["result"]
         if result not in ("passed", "failed", "blocked", "observation"):
             raise DomainError("invalid", f"Invalid Evidence result: {result!r}")
-        lims = val.get("limitations", ())
+        lims = val["limitations"]
         if not isinstance(lims, (tuple, list)) or not all(isinstance(l, str) for l in lims):
             raise DomainError("invalid", "Evidence limitations must be a sequence of strings")
-        blks = val.get("blockers", ())
+        blks = val["blockers"]
         if not isinstance(blks, (tuple, list)) or not all(isinstance(b, str) for b in blks):
             raise DomainError("invalid", "Evidence blockers must be a sequence of strings")
         return Evidence(
@@ -1348,7 +1428,15 @@ def _to_plan_draft(val: Any) -> PlanDraft:
             raise DomainError("invalid", "PlanDraft stop_reason must be a string or null")
         if val.block_reason is not None and not isinstance(val.block_reason, str):
             raise DomainError("invalid", "PlanDraft block_reason must be a string or null")
-        wf = FrozenDict(val.workflow) if val.workflow is not None else None
+        if val.workflow is not None:
+            if not isinstance(val.workflow, Mapping):
+                raise DomainError("invalid", "PlanDraft workflow must be a mapping or null")
+            for k, v in val.workflow.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    raise DomainError("invalid", "PlanDraft workflow keys and values must be strings")
+            wf = FrozenDict(val.workflow)
+        else:
+            wf = None
         return PlanDraft(
             objective=val.objective,
             acceptance_criteria=tuple(val.acceptance_criteria),
@@ -1373,21 +1461,25 @@ def _to_plan_draft(val: Any) -> PlanDraft:
         }
         if unknown:
             raise DomainError("invalid", f"PlanDraft contains unknown field(s): {sorted(unknown)}")
-        missing = {"objective", "next_check", "authorization", "steps"} - set(val.keys())
+        missing = {
+            "objective", "acceptance_criteria", "constraints", "facts", "assumptions",
+            "next_check", "authorization", "steps", "documents", "workspace_refs",
+            "workflow", "stop_reason", "block_reason"
+        } - set(val.keys())
         if missing:
             raise DomainError("invalid", f"PlanDraft missing required field(s): {sorted(missing)}")
         if not isinstance(val["objective"], str) or not isinstance(val["next_check"], str):
             raise DomainError("invalid", "PlanDraft objective and next_check must be strings")
-        ac = val.get("acceptance_criteria", ())
+        ac = val["acceptance_criteria"]
         if not isinstance(ac, (tuple, list)) or not all(isinstance(a, str) for a in ac):
             raise DomainError("invalid", "PlanDraft acceptance_criteria must be a sequence of strings")
-        constraints = val.get("constraints", ())
+        constraints = val["constraints"]
         if not isinstance(constraints, (tuple, list)) or not all(isinstance(c, str) for c in constraints):
             raise DomainError("invalid", "PlanDraft constraints must be a sequence of strings")
-        facts = val.get("facts", ())
+        facts = val["facts"]
         if not isinstance(facts, (tuple, list)) or not all(isinstance(f, str) for f in facts):
             raise DomainError("invalid", "PlanDraft facts must be a sequence of strings")
-        assumptions = val.get("assumptions", ())
+        assumptions = val["assumptions"]
         if not isinstance(assumptions, (tuple, list)) or not all(isinstance(a, str) for a in assumptions):
             raise DomainError("invalid", "PlanDraft assumptions must be a sequence of strings")
         auth = _to_authorization(val["authorization"])
@@ -1395,22 +1487,30 @@ def _to_plan_draft(val: Any) -> PlanDraft:
         if not isinstance(steps_raw, (tuple, list)):
             raise DomainError("invalid", "PlanDraft steps must be a sequence")
         steps = tuple(_to_step_definition(s) for s in steps_raw)
-        docs_raw = val.get("documents", ())
+        docs_raw = val["documents"]
         if not isinstance(docs_raw, (tuple, list)):
             raise DomainError("invalid", "PlanDraft documents must be a sequence")
         docs = tuple(_to_document_ref(d) for d in docs_raw)
-        ws_refs = val.get("workspace_refs", ())
+        ws_refs = val["workspace_refs"]
         if not isinstance(ws_refs, (tuple, list)) or not all(isinstance(w, str) for w in ws_refs):
             raise DomainError("invalid", "PlanDraft workspace_refs must be a sequence of strings")
         horizon = val.get("horizon", 10)
         if type(horizon) is not int or horizon < 0:
             raise DomainError("invalid", "PlanDraft horizon must be a non-negative integer")
-        wf_raw = val.get("workflow")
-        wf = FrozenDict(wf_raw) if wf_raw is not None else None
-        stop_r = val.get("stop_reason")
+        wf_raw = val["workflow"]
+        if wf_raw is not None:
+            if not isinstance(wf_raw, Mapping):
+                raise DomainError("invalid", "PlanDraft workflow must be a mapping or null")
+            for k, v in wf_raw.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    raise DomainError("invalid", "PlanDraft workflow keys and values must be strings")
+            wf = FrozenDict(wf_raw)
+        else:
+            wf = None
+        stop_r = val["stop_reason"]
         if stop_r is not None and not isinstance(stop_r, str):
             raise DomainError("invalid", "PlanDraft stop_reason must be a string or null")
-        block_r = val.get("block_reason")
+        block_r = val["block_reason"]
         if block_r is not None and not isinstance(block_r, str):
             raise DomainError("invalid", "PlanDraft block_reason must be a string or null")
         return PlanDraft(
@@ -1461,7 +1561,7 @@ def _to_reassessment(val: Any) -> Reassessment:
         unknown = set(val.keys()) - {"summary", "facts", "assumptions", "disposition", "reason", "affected_steps", "unbounded", "proposed_draft"}
         if unknown:
             raise DomainError("invalid", f"Reassessment contains unknown field(s): {sorted(unknown)}")
-        missing = {"summary", "disposition", "reason", "unbounded"} - set(val.keys())
+        missing = {"summary", "facts", "assumptions", "disposition", "reason", "affected_steps", "unbounded", "proposed_draft"} - set(val.keys())
         if missing:
             raise DomainError("invalid", f"Reassessment missing required field(s): {sorted(missing)}")
         if not isinstance(val["summary"], str) or not isinstance(val["reason"], str):
@@ -1469,18 +1569,18 @@ def _to_reassessment(val: Any) -> Reassessment:
         disp = val["disposition"]
         if disp not in ("unchanged", "material"):
             raise DomainError("invalid", f"Invalid Reassessment disposition: {disp!r}")
-        facts = val.get("facts", ())
+        facts = val["facts"]
         if not isinstance(facts, (tuple, list)) or not all(isinstance(f, str) for f in facts):
             raise DomainError("invalid", "Reassessment facts must be a sequence of strings")
-        assumptions = val.get("assumptions", ())
+        assumptions = val["assumptions"]
         if not isinstance(assumptions, (tuple, list)) or not all(isinstance(a, str) for a in assumptions):
             raise DomainError("invalid", "Reassessment assumptions must be a sequence of strings")
-        aff = val.get("affected_steps", ())
+        aff = val["affected_steps"]
         if not isinstance(aff, (tuple, list)) or not all(isinstance(s, str) for s in aff):
             raise DomainError("invalid", "Reassessment affected_steps must be a sequence of strings")
         if type(val["unbounded"]) is not bool:
             raise DomainError("invalid", "Reassessment unbounded must be a boolean")
-        pd = _to_plan_draft(val["proposed_draft"]) if val.get("proposed_draft") is not None else None
+        pd = _to_plan_draft(val["proposed_draft"]) if val["proposed_draft"] is not None else None
         return Reassessment(
             summary=val["summary"],
             facts=tuple(facts),
@@ -1520,7 +1620,7 @@ def _to_checkpoint(val: Any) -> Checkpoint:
         unknown = set(val.keys()) - {"outcome", "check", "evidence", "reassessment", "origin_worker", "relay", "artifact"}
         if unknown:
             raise DomainError("invalid", f"Checkpoint contains unknown field(s): {sorted(unknown)}")
-        missing = {"outcome", "check", "evidence", "reassessment", "origin_worker"} - set(val.keys())
+        missing = {"outcome", "check", "evidence", "reassessment", "origin_worker", "relay", "artifact"} - set(val.keys())
         if missing:
             raise DomainError("invalid", f"Checkpoint missing required field(s): {sorted(missing)}")
         outcome = val["outcome"]
@@ -1533,10 +1633,10 @@ def _to_checkpoint(val: Any) -> Checkpoint:
             raise DomainError("invalid", "Checkpoint evidence must be a sequence")
         evs = tuple(_to_evidence(e) for e in ev_raw)
         reassess = _to_reassessment(val["reassessment"])
-        relay = val.get("relay")
+        relay = val["relay"]
         if relay is not None and not isinstance(relay, str):
             raise DomainError("invalid", "Checkpoint relay must be a string or null")
-        art = _to_artifact_ref(val["artifact"]) if val.get("artifact") is not None else None
+        art = _to_artifact_ref(val["artifact"]) if val["artifact"] is not None else None
         return Checkpoint(
             outcome=outcome,
             check=val["check"],
@@ -1570,7 +1670,7 @@ def _to_availability(val: Any) -> Availability:
         unknown = set(val.keys()) - {"prerequisite", "result_version", "method", "checked_base", "artifact_digest", "evidence"}
         if unknown:
             raise DomainError("invalid", f"Availability contains unknown field(s): {sorted(unknown)}")
-        missing = {"prerequisite", "result_version", "method", "checked_base", "evidence"} - set(val.keys())
+        missing = {"prerequisite", "result_version", "method", "checked_base", "artifact_digest", "evidence"} - set(val.keys())
         if missing:
             raise DomainError("invalid", f"Availability missing required field(s): {sorted(missing)}")
         if not isinstance(val["prerequisite"], str) or not isinstance(val["result_version"], str) or not isinstance(val["checked_base"], str):
@@ -1578,7 +1678,7 @@ def _to_availability(val: Any) -> Availability:
         method = val["method"]
         if method not in ("ancestor", "merge", "cherry-pick", "equivalent", "observation"):
             raise DomainError("invalid", f"Invalid Availability method: {method!r}")
-        ad = val.get("artifact_digest")
+        ad = val["artifact_digest"]
         if ad is not None and not isinstance(ad, str):
             raise DomainError("invalid", "Availability artifact_digest must be a string or null")
         ev = _to_evidence(val["evidence"])
@@ -1619,7 +1719,7 @@ def _to_review(val: Any) -> Review:
         unknown = set(val.keys()) - {"reviewer", "artifact", "verdict", "findings", "evidence", "verification_use_id"}
         if unknown:
             raise DomainError("invalid", f"Review contains unknown field(s): {sorted(unknown)}")
-        missing = {"reviewer", "artifact", "verdict", "evidence"} - set(val.keys())
+        missing = {"reviewer", "artifact", "verdict", "findings", "evidence", "verification_use_id"} - set(val.keys())
         if missing:
             raise DomainError("invalid", f"Review missing required field(s): {sorted(missing)}")
         if not isinstance(val["reviewer"], str):
@@ -1628,14 +1728,14 @@ def _to_review(val: Any) -> Review:
         verdict = val["verdict"]
         if verdict not in ("passed", "failed"):
             raise DomainError("invalid", f"Invalid Review verdict: {verdict!r}")
-        findings = val.get("findings", ())
+        findings = val["findings"]
         if not isinstance(findings, (tuple, list)) or not all(isinstance(f, str) for f in findings):
             raise DomainError("invalid", "Review findings must be a sequence of strings")
         ev_raw = val["evidence"]
         if not isinstance(ev_raw, (tuple, list)):
             raise DomainError("invalid", "Review evidence must be a sequence")
         evs = tuple(_to_evidence(e) for e in ev_raw)
-        v_use_id = val.get("verification_use_id")
+        v_use_id = val["verification_use_id"]
         if v_use_id is not None and not isinstance(v_use_id, str):
             raise DomainError("invalid", "Review verification_use_id must be a string or null")
         return Review(
@@ -1671,7 +1771,7 @@ def _to_host_work(val: Any) -> HostWork:
         unknown = set(val.keys()) - {"work_id", "actor", "state", "resource_ids", "resource_claims", "evidence"}
         if unknown:
             raise DomainError("invalid", f"HostWork contains unknown field(s): {sorted(unknown)}")
-        missing = {"work_id", "actor", "state"} - set(val.keys())
+        missing = {"work_id", "actor", "state", "resource_ids", "resource_claims", "evidence"} - set(val.keys())
         if missing:
             raise DomainError("invalid", f"HostWork missing required field(s): {sorted(missing)}")
         if not isinstance(val["work_id"], str) or not isinstance(val["actor"], str):
@@ -1679,14 +1779,14 @@ def _to_host_work(val: Any) -> HostWork:
         state = val["state"]
         if state not in ("running", "stopped", "unknown"):
             raise DomainError("invalid", f"Invalid HostWork state: {state!r}")
-        res_ids = val.get("resource_ids", ())
+        res_ids = val["resource_ids"]
         if not isinstance(res_ids, (tuple, list)) or not all(isinstance(r, str) for r in res_ids):
             raise DomainError("invalid", "HostWork resource_ids must be a sequence of strings")
-        claims_raw = val.get("resource_claims", ())
+        claims_raw = val["resource_claims"]
         if not isinstance(claims_raw, (tuple, list)):
             raise DomainError("invalid", "HostWork resource_claims must be a sequence")
         claims = tuple(_to_resource_claim(c) for c in claims_raw)
-        ev_raw = val.get("evidence", ())
+        ev_raw = val["evidence"]
         if not isinstance(ev_raw, (tuple, list)):
             raise DomainError("invalid", "HostWork evidence must be a sequence")
         evs = tuple(_to_evidence(e) for e in ev_raw)
@@ -1724,13 +1824,13 @@ def _to_resource_resolution(val: Any) -> ResourceResolution:
         unknown = set(val.keys()) - {"use_id", "absent_work_id", "resource_ids", "resolution", "reason"}
         if unknown:
             raise DomainError("invalid", f"ResourceResolution contains unknown field(s): {sorted(unknown)}")
-        missing = {"resource_ids", "resolution", "reason"} - set(val.keys())
+        missing = {"use_id", "absent_work_id", "resource_ids", "resolution", "reason"} - set(val.keys())
         if missing:
             raise DomainError("invalid", f"ResourceResolution missing required field(s): {sorted(missing)}")
-        use_id = val.get("use_id")
+        use_id = val["use_id"]
         if use_id is not None and not isinstance(use_id, str):
             raise DomainError("invalid", "ResourceResolution use_id must be a string or null")
-        absent_work_id = val.get("absent_work_id")
+        absent_work_id = val["absent_work_id"]
         if absent_work_id is not None and not isinstance(absent_work_id, str):
             raise DomainError("invalid", "ResourceResolution absent_work_id must be a string or null")
         res_ids = val["resource_ids"]
@@ -1751,7 +1851,33 @@ def _to_resource_resolution(val: Any) -> ResourceResolution:
     raise DomainError("invalid", f"Expected ResourceResolution or mapping, got {type(val).__name__}")
 
 
+def _is_execution_context_claims(val: Any) -> bool:
+    if isinstance(val, ExecutionContextClaims):
+        return True
+    if isinstance(val, ExecutionContext):
+        return False
+    if isinstance(val, Mapping):
+        has_claim_fields = any(k in val for k in ("repository_claim", "workspace_claim", "external_claims"))
+        has_id_fields = any(k in val for k in ("repository_id", "workspace_id", "external_ids"))
+        if has_claim_fields and not has_id_fields:
+            return True
+        if has_id_fields and not has_claim_fields:
+            return False
+        return has_claim_fields
+    return False
+
+
 def parse_command(raw: Mapping[str, JSONValue]) -> Command:
+    """Validate and parse a raw dictionary into a typed, immutable CommandEnvelope."""
+    try:
+        return _parse_command_impl(raw)
+    except DomainError:
+        raise
+    except (RecursionError, TypeError) as err:
+        raise DomainError("invalid", f"Malformed command input: {err}") from err
+
+
+def _parse_command_impl(raw: Mapping[str, JSONValue]) -> Command:
     """Validate and parse a raw dictionary into a typed, immutable CommandEnvelope."""
     if not isinstance(raw, Mapping):
         raise DomainError("invalid", "Command must be a JSON mapping")
@@ -2073,7 +2199,7 @@ def parse_command(raw: Mapping[str, JSONValue]) -> Command:
         else:
             if att_ctx is None:
                 att_ctx_val = None
-            elif isinstance(att_ctx, (ExecutionContextClaims, Mapping)) and "repository_claim" in getattr(att_ctx, "__dict__", att_ctx):
+            elif _is_execution_context_claims(att_ctx):
                 att_ctx_val = _to_execution_context_claims(att_ctx)
             else:
                 att_ctx_val = _to_execution_context(att_ctx)
@@ -2169,6 +2295,7 @@ def parse_command(raw: Mapping[str, JSONValue]) -> Command:
         orig_snap = payload.get("original_snapshot")
         if not isinstance(orig_snap, Mapping):
             raise DomainError("invalid", "import_plan requires mapping original_snapshot")
+        orig_snap_val = _validate_and_freeze_json_tree(orig_snap)
         prov = _to_document_ref(payload.get("provenance"))
         ws_stopped = payload.get("writers_stopped")
         if not isinstance(ws_stopped, str) or not ws_stopped.strip():
@@ -2180,7 +2307,7 @@ def parse_command(raw: Mapping[str, JSONValue]) -> Command:
         for k, v in known_ctx_raw.items():
             if not isinstance(k, str):
                 raise DomainError("invalid", "known_contexts keys must be strings")
-            if isinstance(v, (ExecutionContextClaims, Mapping)) and "repository_claim" in getattr(v, "__dict__", v):
+            if _is_execution_context_claims(v):
                 known_ctx[k] = _to_execution_context_claims(v)
             else:
                 known_ctx[k] = _to_execution_context(v)
@@ -2189,7 +2316,7 @@ def parse_command(raw: Mapping[str, JSONValue]) -> Command:
             "source_directory_id": s_dir_id,
             "source_directory_claim": claim_val,
             "original_task_id": orig_task,
-            "original_snapshot": dict(orig_snap),
+            "original_snapshot": orig_snap_val,
             "provenance": prov,
             "writers_stopped": ws_stopped,
             "known_contexts": known_ctx,

@@ -841,15 +841,25 @@ class TestServiceCore(unittest.TestCase):
         from adaptive_planning.types import Metadata, MutationReceipt, PrivateGrant
 
         clock = FakeClock()
-        fixture = ServiceFixture(service=None, store=None, directory=Path("/tmp"), clock=clock, epoch="epoch-active")
+        plan_id = "plan-seeded"
+        meta_committed = Metadata("epoch-1", plan_id, "gen-1", 1, 1, "url")
+        meta_current = Metadata("epoch-active", plan_id, "gen-1", 2, 1, "url")
+
+        class _ProtocolStubService:
+            def read_service_info(self):
+                from unittest.mock import MagicMock
+                return MagicMock(epoch="epoch-active")
+
+            def read_plan(self, pid):
+                from unittest.mock import MagicMock
+                return MagicMock(metadata=meta_current)
+
+        fixture = ServiceFixture(service=_ProtocolStubService(), store=None, directory=Path("/tmp"), clock=clock, epoch="epoch-active")
 
         # Seed cached grant
-        plan_id = "plan-seeded"
         fixture._cached_grants[plan_id] = PrivateGrant(orchestrator_token="cached-orch-token", attempt_token=None)
 
         # Receipt with private=None falls back to cached grant
-        meta_committed = Metadata("epoch-1", plan_id, "gen-1", 1, 1, "url")
-        meta_current = Metadata("epoch-active", plan_id, "gen-1", 2, 1, "url")
         receipt_no_private = MutationReceipt(
             committed={}, committed_metadata=meta_committed, current_metadata=meta_current, replayed=False, private=None
         )
@@ -926,6 +936,7 @@ class TestServiceCore(unittest.TestCase):
             {"checkpoint": cp},
             receipt=receipt,
             attempt=attempt,
+            refresh_metadata=False,
         )
         self.assertEqual(fix_cmd.orchestrator_token, "receipt-orch")
         self.assertEqual(fix_cmd.attempt_token, "receipt-att")
@@ -1049,6 +1060,7 @@ class TestServiceCore(unittest.TestCase):
                 "since_revision": 0,
                 "note": "note",
                 "baseline": [],
+                "claimed": None,
             },
             "steps": [
                 {
@@ -1056,13 +1068,18 @@ class TestServiceCore(unittest.TestCase):
                     "title": "t1",
                     "dependencies": [],
                     "completion_check": "chk",
+                    "document": None,
                     "definition_version": "v1",
                     "review_required": False,
                     "final_gate": False,
                 }
             ],
-            "documents": [{"path": "p", "version": "v1"}],
+            "documents": [{"path": "p", "branch": None, "commit": None, "version": "v1", "task_id": None}],
             "workspace_refs": ["w1"],
+            "workflow": None,
+            "horizon": 10,
+            "stop_reason": None,
+            "block_reason": None,
         }
 
         # 1. create_plan (wire-format raw JSON draft conversion to PlanDraft)
@@ -1099,7 +1116,16 @@ class TestServiceCore(unittest.TestCase):
             parse_command({**base_boot, "kind": "takeover", "payload": {"expected_ownership_version": -1, "reason": "takeover"}})
 
         # 4. register_resource (wire-format raw JSON claim conversion to ResourceClaim)
-        raw_claim = {"host_id": "h", "kind": "workspace", "case_insensitive": False, "canonical_path": "/p"}
+        raw_claim = {
+            "host_id": "h",
+            "kind": "workspace",
+            "device": None,
+            "inode": None,
+            "canonical_path": "/p",
+            "case_insensitive": False,
+            "repository_id": None,
+            "external_identity": None,
+        }
         rr_pos = parse_command({**base_orch, "kind": "register_resource", "payload": {"claim": raw_claim}})
         self.assertEqual(rr_pos.kind, "register_resource")
         self.assertIsInstance(rr_pos.payload["claim"], ResourceClaim)
@@ -1114,7 +1140,15 @@ class TestServiceCore(unittest.TestCase):
             parse_command({**base_orch, "kind": "reconcile_resources", "payload": {"resource_ids": "not-a-tuple", "canonical_claim": raw_claim, "reason": "rec"}})
 
         # 6. invalidate_result (wire-format raw JSON evidence conversion to Evidence)
-        raw_ev = {"summary": "ev", "check": "chk", "result": "failed"}
+        raw_ev = {
+            "summary": "ev",
+            "artifact": None,
+            "workspace_id": None,
+            "check": "chk",
+            "result": "failed",
+            "limitations": [],
+            "blockers": [],
+        }
         ir_pos = parse_command({**base_orch, "kind": "invalidate_result", "payload": {"step_id": "s1", "result_version": "v1", "reason": "inv", "evidence": [raw_ev]}})
         self.assertEqual(ir_pos.kind, "invalidate_result")
         self.assertIsInstance(ir_pos.payload["evidence"][0], Evidence)
@@ -1128,7 +1162,15 @@ class TestServiceCore(unittest.TestCase):
             parse_command({**base_orch, "kind": "resolve_invalidation", "payload": {"invalidation_id": "i1", "affected_step_id": "s1", "disposition": "invalid-disp", "corrective_step_id": None, "corrected_result_version": None, "evidence": (), "reason": "ok"}})
 
         # 8. assign_step (wire-format raw JSON context conversion to ExecutionContext)
-        raw_ctx = {"kind": "repository", "repository_exclusive": True, "writes": True}
+        raw_ctx = {
+            "kind": "repository",
+            "repository_id": None,
+            "workspace_id": None,
+            "repository_exclusive": True,
+            "external_ids": [],
+            "writes": True,
+            "checked_base": None,
+        }
         as_pos = parse_command({**base_orch, "kind": "assign_step", "payload": {"step_id": "s1", "assignee": "w1", "context": raw_ctx}})
         self.assertEqual(as_pos.kind, "assign_step")
         self.assertIsInstance(as_pos.payload["context"], ExecutionContext)
@@ -1136,13 +1178,20 @@ class TestServiceCore(unittest.TestCase):
             parse_command({**base_orch, "kind": "assign_step", "payload": {"step_id": "s1", "assignee": "w1", "context": {"kind": "bad-kind", "repository_exclusive": True, "writes": True}}})
 
         # 9. bind_availability (wire-format raw JSON availability conversion)
-        raw_avail = {"prerequisite": "s0", "result_version": "v1", "method": "ancestor", "checked_base": "base", "evidence": raw_ev}
+        raw_avail = {
+            "prerequisite": "s0",
+            "result_version": "v1",
+            "method": "ancestor",
+            "checked_base": "base",
+            "artifact_digest": None,
+            "evidence": raw_ev,
+        }
         ba_pos = parse_command({**base_orch, "kind": "bind_availability", "payload": {"bindings": [raw_avail], "checked_base": "base"}})
         self.assertEqual(ba_pos.kind, "bind_availability")
         self.assertIsInstance(ba_pos.payload["bindings"][0], Availability)
         self.assertIsInstance(ba_pos.payload["bindings"][0].evidence, Evidence)
         with self.assertRaises(DomainError):
-            parse_command({**base_orch, "kind": "bind_availability", "payload": {"bindings": [{"prerequisite": "s0", "result_version": "v1", "method": "bad-method", "checked_base": "base", "evidence": raw_ev}], "checked_base": "base"}})
+            parse_command({**base_orch, "kind": "bind_availability", "payload": {"bindings": [{"prerequisite": "s0", "result_version": "v1", "method": "bad-method", "checked_base": "base", "artifact_digest": None, "evidence": raw_ev}], "checked_base": "base"}})
 
         # 10. start_step
         ss_pos = parse_command({**base_worker, "kind": "start_step", "payload": {"origin_worker": "worker-a", "relay": None, "observed_activity": "act"}})
@@ -1160,14 +1209,20 @@ class TestServiceCore(unittest.TestCase):
         raw_checkpoint = {
             "outcome": "passed",
             "check": "chk",
-            "origin_worker": "worker-a",
             "evidence": [raw_ev],
             "reassessment": {
                 "summary": "s",
+                "facts": [],
+                "assumptions": [],
                 "disposition": "unchanged",
                 "reason": "r",
+                "affected_steps": [],
                 "unbounded": False,
+                "proposed_draft": None,
             },
+            "origin_worker": "worker-a",
+            "relay": None,
+            "artifact": None,
         }
         rc_pos = parse_command({**base_worker, "kind": "record_checkpoint", "payload": {"checkpoint": raw_checkpoint}})
         self.assertEqual(rc_pos.kind, "record_checkpoint")
@@ -1202,10 +1257,17 @@ class TestServiceCore(unittest.TestCase):
         # 16. record_review (wire-format raw JSON review conversion to Review)
         raw_review = {
             "reviewer": "reviewer-1",
-            "artifact": {"kind": "code", "identity": "art-1", "version": "v1", "summary": "summary"},
+            "artifact": {
+                "kind": "code",
+                "identity": "art-1",
+                "version": "v1",
+                "digest": None,
+                "summary": "summary",
+            },
             "verdict": "passed",
             "findings": ["finding 1"],
             "evidence": [raw_ev],
+            "verification_use_id": None,
         }
         rv_pos = parse_command({**base_orch, "kind": "record_review", "payload": {"step_id": "s1", "review": raw_review}})
         self.assertEqual(rv_pos.kind, "record_review")
@@ -1219,7 +1281,13 @@ class TestServiceCore(unittest.TestCase):
             parse_command({**base_orch, "kind": "record_review", "payload": {"step_id": "s1", "review": bad_rev_verdict}})
 
         # 17. accept_step
-        raw_art = {"kind": "code", "identity": "art-1", "version": "v1", "summary": "summary"}
+        raw_art = {
+            "kind": "code",
+            "identity": "art-1",
+            "version": "v1",
+            "digest": None,
+            "summary": "summary",
+        }
         ac_pos = parse_command({**base_orch, "kind": "accept_step", "payload": {"step_id": "s1", "artifact": raw_art, "stopped_resource_ids": (), "stopped_reason": None}})
         self.assertEqual(ac_pos.kind, "accept_step")
         self.assertIsInstance(ac_pos.payload["artifact"], ArtifactRef)
@@ -1254,13 +1322,20 @@ class TestServiceCore(unittest.TestCase):
             parse_command({**base_orch, "kind": "append_late_evidence", "payload": {"origin_attempt_id": 123, "evidence": (), "stopped_resource_ids": (), "reason": "ok"}})
 
         # 22. import_plan (wire-format raw JSON provenance and known_contexts, omitting source_directory_claim)
-        raw_prov = {"path": "path", "version": "v1"}
+        raw_prov = {
+            "path": "path",
+            "branch": None,
+            "commit": None,
+            "version": "v1",
+            "task_id": None,
+        }
         ip_pos = parse_command({
             **base_boot,
             "kind": "import_plan",
             "payload": {
                 "host_id": "h",
                 "source_directory_id": "d1",
+                "source_directory_claim": None,
                 "original_task_id": "t1",
                 "original_snapshot": {"schemaVersion": 2},
                 "provenance": raw_prov,
@@ -1284,6 +1359,8 @@ class TestServiceCore(unittest.TestCase):
             "evidence": [raw_ev],
         }
         raw_res = {
+            "use_id": None,
+            "absent_work_id": None,
             "resource_ids": ["r1"],
             "resolution": "stopped",
             "reason": "done",
@@ -1313,6 +1390,7 @@ class TestServiceCore(unittest.TestCase):
                 "payload": {
                     "host_id": "h",
                     "source_directory_id": "d1",
+                    "source_directory_claim": None,
                     "original_task_id": "t1",
                     "original_snapshot": {"schemaVersion": 2, "metric": float("nan")},
                     "provenance": raw_prov,
@@ -1329,6 +1407,7 @@ class TestServiceCore(unittest.TestCase):
                 "payload": {
                     "host_id": "h",
                     "source_directory_id": "d1",
+                    "source_directory_claim": None,
                     "original_task_id": "t1",
                     "original_snapshot": {"schemaVersion": 2, "metric": float("inf")},
                     "provenance": raw_prov,
@@ -1345,6 +1424,7 @@ class TestServiceCore(unittest.TestCase):
                 "payload": {
                     "host_id": "h",
                     "source_directory_id": "d1",
+                    "source_directory_claim": None,
                     "original_task_id": "t1",
                     "original_snapshot": {"schemaVersion": 2, "metric": float("-inf")},
                     "provenance": raw_prov,
@@ -1501,6 +1581,330 @@ class TestServiceCore(unittest.TestCase):
         self.assertEqual(cmd_frozen.expected_revision, 1)
         self.assertEqual(cmd_frozen.attempt_version, 1)
         self.assertEqual(cmd_frozen.ownership_version, 1)
+
+    def test_make_service_lazy_import_constructor(self):
+        """make_service uses exact Store and PlanningService interfaces and port 8790."""
+        from tests.service_fixtures import make_service, FakeClock
+        import types
+
+        calls = {}
+
+        class DummyStore:
+            def __init__(self, db_path, clock, host_id=None):
+                calls["store_init"] = {"path": db_path, "clock": clock, "host_id": host_id}
+
+            def installation_epoch(self):
+                calls["installation_epoch"] = True
+                return "epoch-synthetic-123"
+
+        class DummyService:
+            def __init__(self, store, base_url=None, clock=None):
+                calls["service_init"] = {"store": store, "base_url": base_url, "clock": clock}
+
+        app_mod = types.ModuleType("adaptive_planning.app")
+        app_mod.PlanningService = DummyService
+        store_mod = types.ModuleType("adaptive_planning.store")
+        store_mod.Store = DummyStore
+
+        orig_app = sys.modules.get("adaptive_planning.app")
+        orig_store = sys.modules.get("adaptive_planning.store")
+        sys.modules["adaptive_planning.app"] = app_mod
+        sys.modules["adaptive_planning.store"] = store_mod
+        try:
+            clock = FakeClock()
+            test_dir = Path("/tmp/synthetic_test_dir")
+            fixture = make_service(test_dir, clock=clock)
+            self.assertEqual(calls["store_init"]["path"], test_dir / "planning.sqlite")
+            self.assertEqual(calls["store_init"]["clock"], clock)
+            self.assertEqual(calls["store_init"]["host_id"], "synthetic-host")
+            self.assertEqual(calls["service_init"]["base_url"], "http://127.0.0.1:8790")
+            self.assertEqual(calls["service_init"]["clock"], clock)
+            self.assertTrue(calls.get("installation_epoch"))
+            self.assertEqual(fixture.epoch, "epoch-synthetic-123")
+        finally:
+            if orig_app is not None:
+                sys.modules["adaptive_planning.app"] = orig_app
+            else:
+                sys.modules.pop("adaptive_planning.app", None)
+            if orig_store is not None:
+                sys.modules["adaptive_planning.store"] = orig_store
+            else:
+                sys.modules.pop("adaptive_planning.store", None)
+
+    def test_service_fixture_refresh_metadata_error_propagation_and_pagination(self):
+        """refresh_metadata=True propagates read errors directly and paginates coordination."""
+        from unittest.mock import MagicMock
+        from tests.service_fixtures import ServiceFixture, FakeClock
+
+        clock = FakeClock()
+        mock_service = MagicMock()
+        fixture = ServiceFixture(service=mock_service, store=None, directory=Path("/tmp"), clock=clock, epoch="epoch-active")
+
+        plan_meta = Metadata("epoch-curr", "plan-1", "gen-curr", 2, 1, "url")
+        receipt = MutationReceipt(
+            committed={}, committed_metadata=plan_meta, current_metadata=plan_meta,
+            replayed=False, private=PrivateGrant("orch-tok", None)
+        )
+        attempt_receipt = MutationReceipt(
+            committed={"attempt_id": "att-1", "version": 1, "definition_version": "v1"},
+            committed_metadata=plan_meta, current_metadata=plan_meta,
+            replayed=False, private=PrivateGrant(None, "att-tok")
+        )
+
+        # 1. read_service_info failure propagates directly
+        mock_service.read_service_info.side_effect = DomainError("stale_epoch", "stale epoch in service")
+        with self.assertRaises(DomainError) as ctx_err:
+            fixture.command("create_plan", {"creation_id": "c1", "draft": draft(), "new_plan_intent": None}, refresh_metadata=True)
+        self.assertEqual(ctx_err.exception.code, "stale_epoch")
+
+        # 2. read_plan failure propagates directly
+        mock_service.read_service_info.side_effect = None
+        mock_service.read_service_info.return_value = MagicMock(epoch="epoch-curr")
+        mock_service.read_plan.side_effect = DomainError("not_found", "plan not found")
+        with self.assertRaises(DomainError) as ctx_err2:
+            fixture.command("revise_plan", {"draft": draft(), "reason": "r", "authorization_change": None}, receipt=receipt, refresh_metadata=True)
+        self.assertEqual(ctx_err2.exception.code, "not_found")
+
+        # 3. read_coordination failure propagates directly
+        mock_service.read_plan.side_effect = None
+        mock_service.read_plan.return_value = MagicMock(metadata=plan_meta)
+        mock_service.read_coordination.side_effect = DomainError("conflict", "coordination conflict")
+        with self.assertRaises(DomainError) as ctx_err3:
+            fixture.command("report_activity", {"origin_worker": "worker-a", "relay": None, "observed_activity": "w"}, receipt=receipt, attempt=attempt_receipt, refresh_metadata=True)
+        self.assertEqual(ctx_err3.exception.code, "conflict")
+
+        # 4. Multi-page pagination finds attempt on later page
+        mock_service.read_coordination.side_effect = None
+        page1_item = CoordinationItem(kind="attempt", value=AttemptView("att-other", "s0", "w0", "active", "assigned", 1, "v1", "ts", context(None, writes=False), False, None))
+        page2_item = CoordinationItem(kind="attempt", value=AttemptView("att-1", "s1", "worker-a", "active", "assigned", 9, "v1", "ts", context(None, writes=False), False, None))
+        page1 = CoordinationPage("plan-1", 2, 1, (page1_item,), "cursor-p2", {"attempts": 2})
+        page2 = CoordinationPage("plan-1", 2, 2, (page2_item,), None, {"attempts": 2})
+
+        def fake_read_coordination(plan_id, after=None):
+            if after is None:
+                return page1
+            elif after == "cursor-p2":
+                return page2
+            raise ValueError(f"Unknown cursor {after}")
+
+        mock_service.read_coordination.side_effect = fake_read_coordination
+        cmd_paged = fixture.command(
+            "report_activity",
+            {"origin_worker": "worker-a", "relay": None, "observed_activity": "w"},
+            receipt=receipt,
+            attempt=attempt_receipt,
+            refresh_metadata=True,
+        )
+        self.assertEqual(cmd_paged.attempt_version, 9)
+
+        # 5. Missing attempt across pages raises ValueError
+        page2_without_target = CoordinationPage("plan-1", 2, 2, (), None, {"attempts": 1})
+        mock_service.read_coordination.side_effect = lambda plan_id, after=None: page1 if after is None else page2_without_target
+        with self.assertRaises(ValueError):
+            fixture.command(
+                "report_activity",
+                {"origin_worker": "worker-a", "relay": None, "observed_activity": "w"},
+                receipt=receipt,
+                attempt=attempt_receipt,
+                refresh_metadata=True,
+            )
+
+        # 6. Malformed DTO missing required attribute raises AttributeError (no silent fallback)
+        malformed_plan_view = MagicMock(spec=[])  # no metadata attribute
+        mock_service.read_plan.return_value = malformed_plan_view
+        with self.assertRaises(AttributeError):
+            fixture.command(
+                "revise_plan",
+                {"draft": draft(), "reason": "r", "authorization_change": None},
+                receipt=receipt,
+                refresh_metadata=True,
+            )
+
+    def test_import_plan_source_directory_fields_and_exclusivity(self):
+        """import_plan requires both source_directory_id and source_directory_claim with exactly one non-null."""
+        base_cmd = {
+            "kind": "import_plan",
+            "epoch": "epoch-1",
+            "key": "k-ip",
+            "actor": "orch",
+            "payload": {
+                "host_id": "host-1",
+                "original_task_id": "task-1",
+                "original_snapshot": {"schemaVersion": 2},
+                "provenance": {"path": "p", "branch": None, "commit": None, "version": "v1", "task_id": None},
+                "writers_stopped": "stopped",
+                "known_contexts": {},
+            },
+        }
+
+        # Omitted source_directory_id
+        cmd_omitted_id = copy.deepcopy(base_cmd)
+        cmd_omitted_id["payload"]["source_directory_claim"] = None
+        with self.assertRaises(DomainError) as ctx1:
+            parse_command(cmd_omitted_id)
+        self.assertEqual(ctx1.exception.code, "invalid")
+
+        # Omitted source_directory_claim
+        cmd_omitted_claim = copy.deepcopy(base_cmd)
+        cmd_omitted_claim["payload"]["source_directory_id"] = "res-1"
+        with self.assertRaises(DomainError) as ctx2:
+            parse_command(cmd_omitted_claim)
+        self.assertEqual(ctx2.exception.code, "invalid")
+
+        # Both non-null
+        cmd_both = copy.deepcopy(base_cmd)
+        cmd_both["payload"]["source_directory_id"] = "res-1"
+        cmd_both["payload"]["source_directory_claim"] = {
+            "host_id": "h", "kind": "workspace", "device": None, "inode": None,
+            "canonical_path": "/p", "case_insensitive": False, "repository_id": None, "external_identity": None
+        }
+        with self.assertRaises(DomainError) as ctx3:
+            parse_command(cmd_both)
+        self.assertEqual(ctx3.exception.code, "invalid")
+
+        # Both null
+        cmd_neither = copy.deepcopy(base_cmd)
+        cmd_neither["payload"]["source_directory_id"] = None
+        cmd_neither["payload"]["source_directory_claim"] = None
+        with self.assertRaises(DomainError) as ctx4:
+            parse_command(cmd_neither)
+        self.assertEqual(ctx4.exception.code, "invalid")
+
+        # Exactly one non-null (id)
+        cmd_ok_id = copy.deepcopy(base_cmd)
+        cmd_ok_id["payload"]["source_directory_id"] = "res-1"
+        cmd_ok_id["payload"]["source_directory_claim"] = None
+        parsed_id = parse_command(cmd_ok_id)
+        self.assertEqual(parsed_id.payload["source_directory_id"], "res-1")
+        self.assertIsNone(parsed_id.payload["source_directory_claim"])
+
+        # Exactly one non-null (claim)
+        cmd_ok_claim = copy.deepcopy(base_cmd)
+        cmd_ok_claim["payload"]["source_directory_id"] = None
+        cmd_ok_claim["payload"]["source_directory_claim"] = {
+            "host_id": "h", "kind": "workspace", "device": None, "inode": None,
+            "canonical_path": "/p", "case_insensitive": False, "repository_id": None, "external_identity": None
+        }
+        parsed_claim = parse_command(cmd_ok_claim)
+        self.assertIsNone(parsed_claim.payload["source_directory_id"])
+        self.assertIsInstance(parsed_claim.payload["source_directory_claim"], ResourceClaim)
+
+    def test_raw_wire_dto_normative_fields_and_claims_discrimination(self):
+        """Raw wire DTO mappings require normative fields and ExecutionContextClaims is discriminated robustly."""
+        from adaptive_planning.types import _to_authorization, _to_evidence
+
+        # ExecutionContextClaims discrimination without repository_claim
+        claims_mapping = {
+            "kind": "non-repository",
+            "repository_claim": None,
+            "workspace_claim": {
+                "host_id": "h", "kind": "workspace", "device": None, "inode": None,
+                "canonical_path": "/p", "case_insensitive": False, "repository_id": None, "external_identity": None
+            },
+            "repository_exclusive": False,
+            "external_claims": (),
+            "writes": True,
+            "checked_base": None,
+        }
+        cmd_claims = parse_command({
+            "kind": "resolve_attempt",
+            "epoch": "epoch-1",
+            "key": "k-claim",
+            "actor": "orch",
+            "orchestrator_token": "orch-tok",
+            "payload": {
+                "resolution": "attach-context",
+                "reason": "attach claims",
+                "next_step_state": "pending",
+                "stopped_resource_ids": (),
+                "replacement_assignee": None,
+                "replacement_context": None,
+                "attached_context": claims_mapping,
+            },
+        })
+        self.assertIsInstance(cmd_claims.payload["attached_context"], ExecutionContextClaims)
+
+        # Omitted required field in raw wire mapping: Authorization without claimed
+        bad_auth_mapping = {
+            "mode": "plan-only",
+            "interval": "1h",
+            "since_revision": 0,
+            "note": "note",
+            "baseline": (),
+            # "claimed" omitted!
+        }
+        with self.assertRaises(DomainError) as ctx_a:
+            _to_authorization(bad_auth_mapping)
+        self.assertEqual(ctx_a.exception.code, "invalid")
+
+        # Omitted required field in raw wire mapping: Evidence without limitations
+        bad_ev_mapping = {
+            "summary": "s", "check": "c", "result": "passed",
+            "artifact": None, "workspace_id": None,
+            # "limitations" and "blockers" omitted!
+        }
+        with self.assertRaises(DomainError) as ctx_e:
+            _to_evidence(bad_ev_mapping)
+        self.assertEqual(ctx_e.exception.code, "invalid")
+
+    def test_strict_json_trees_leaves_workflow_and_recursion(self):
+        """JSON subtrees reject non-JSON leaves and cycles; workflow enforces mapping[str, str]; RecursionError converts to DomainError."""
+        from adaptive_planning.types import _to_plan_draft
+
+        # 1. Non-JSON leaves in original_snapshot
+        bad_snap_set = {"schemaVersion": 2, "tags": {"a", "b"}}
+        with self.assertRaises(DomainError) as ctx_set:
+            parse_command({
+                "kind": "import_plan", "epoch": "epoch-1", "key": "k-set", "actor": "orch",
+                "payload": {
+                    "host_id": "h", "source_directory_id": "d1", "source_directory_claim": None,
+                    "original_task_id": "t1", "original_snapshot": bad_snap_set,
+                    "provenance": {"path": "p", "branch": None, "commit": None, "version": "v1", "task_id": None},
+                    "writers_stopped": "yes", "known_contexts": {},
+                }
+            })
+        self.assertEqual(ctx_set.exception.code, "invalid")
+
+        bad_snap_bytes = {"schemaVersion": 2, "blob": b"binary"}
+        with self.assertRaises(DomainError) as ctx_bytes:
+            parse_command({
+                "kind": "import_plan", "epoch": "epoch-1", "key": "k-b", "actor": "orch",
+                "payload": {
+                    "host_id": "h", "source_directory_id": "d1", "source_directory_claim": None,
+                    "original_task_id": "t1", "original_snapshot": bad_snap_bytes,
+                    "provenance": {"path": "p", "branch": None, "commit": None, "version": "v1", "task_id": None},
+                    "writers_stopped": "yes", "known_contexts": {},
+                }
+            })
+        self.assertEqual(ctx_bytes.exception.code, "invalid")
+
+        # 2. Cyclic reference in original_snapshot
+        cyclic_snap = {"schemaVersion": 2}
+        cyclic_snap["cycle"] = cyclic_snap
+        with self.assertRaises(DomainError) as ctx_cycle:
+            parse_command({
+                "kind": "import_plan", "epoch": "epoch-1", "key": "k-cyc", "actor": "orch",
+                "payload": {
+                    "host_id": "h", "source_directory_id": "d1", "source_directory_claim": None,
+                    "original_task_id": "t1", "original_snapshot": cyclic_snap,
+                    "provenance": {"path": "p", "branch": None, "commit": None, "version": "v1", "task_id": None},
+                    "writers_stopped": "yes", "known_contexts": {},
+                }
+            })
+        self.assertEqual(ctx_cycle.exception.code, "invalid")
+
+        # 3. Non-JSON leaves in MutationReceipt committed
+        with self.assertRaises(DomainError) as ctx_rcpt:
+            meta = Metadata("epoch-1", "p-1", "g-1", 1, 1, "url")
+            MutationReceipt(committed={"bad": {1, 2}}, committed_metadata=meta, current_metadata=meta, replayed=False, private=None)
+        self.assertEqual(ctx_rcpt.exception.code, "invalid")
+
+        # 4. PlanDraft.workflow rejects non-string values
+        with self.assertRaises(DomainError) as ctx_wf:
+            d = draft()
+            object.__setattr__(d, "workflow", {"step": 123})
+            _to_plan_draft(d)
+        self.assertEqual(ctx_wf.exception.code, "invalid")
 
 
 if __name__ == "__main__":

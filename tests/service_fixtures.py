@@ -322,18 +322,11 @@ class ServiceFixture:
             plan_id = receipt.committed_metadata.plan_id
             if receipt.private and plan_id:
                 self._cached_grants[plan_id] = receipt.private
-            if refresh_metadata:
-                cmd_epoch = self.epoch
-                generation = receipt.current_metadata.generation
-                if exp_rev is None:
-                    exp_rev = receipt.current_metadata.revision
-                ownership_version = receipt.committed_metadata.ownership_version
-            else:
-                cmd_epoch = receipt.committed_metadata.epoch
-                generation = receipt.committed_metadata.generation
-                if exp_rev is None:
-                    exp_rev = receipt.committed_metadata.revision
-                ownership_version = receipt.committed_metadata.ownership_version
+            cmd_epoch = receipt.committed_metadata.epoch
+            generation = receipt.committed_metadata.generation
+            if exp_rev is None:
+                exp_rev = receipt.committed_metadata.revision
+            ownership_version = receipt.committed_metadata.ownership_version
 
         if attempt is not None:
             attempt_id = attempt.committed.get("attempt_id")
@@ -342,39 +335,47 @@ class ServiceFixture:
             if attempt.private and attempt_id:
                 self._cached_attempt_grants[attempt_id] = attempt.private
 
-        # Dynamic metadata refresh from live service if available
-        if refresh_metadata and self.service is not None:
-            if hasattr(self.service, "read_service_info"):
-                try:
-                    info = self.service.read_service_info()
-                    if hasattr(info, "epoch"):
-                        cmd_epoch = info.epoch
-                        self.epoch = info.epoch
-                except Exception:
-                    pass
-            if plan_id and hasattr(self.service, "read_plan"):
-                try:
-                    plan_view = self.service.read_plan(plan_id)
-                    if hasattr(plan_view, "metadata"):
-                        pm = plan_view.metadata
-                        generation = getattr(pm, "generation", generation)
-                        if expected_revision is None and hasattr(pm, "revision"):
-                            exp_rev = pm.revision
-                        # Ownership version is strictly preserved from the caller's receipt/grant
-                        # to prevent silently acquiring new orchestrator capability after takeover.
-                except Exception:
-                    pass
-            if plan_id and attempt_id and hasattr(self.service, "read_coordination"):
-                try:
-                    coord_page = self.service.read_coordination(plan_id)
-                    for item in getattr(coord_page, "items", ()):
-                        if getattr(item, "kind", None) == "attempt":
-                            val = getattr(item, "value", None)
-                            if getattr(val, "attempt_id", None) == attempt_id:
-                                attempt_version = getattr(val, "version", attempt_version)
-                                break
-                except Exception:
-                    pass
+        # Dynamic metadata refresh from live service if requested
+        if refresh_metadata:
+            # Invokes normative service.read_service_info directly and propagates errors/missing protocol
+            info = self.service.read_service_info()
+            cmd_epoch = info.epoch
+            self.epoch = info.epoch
+
+            # Bootstrap commands read only installation info
+            if kind not in BOOTSTRAP_KINDS and plan_id is not None:
+                plan_view = self.service.read_plan(plan_id)
+                pm = plan_view.metadata
+                generation = pm.generation
+                if expected_revision is None:
+                    exp_rev = pm.revision
+                # Ownership version is strictly preserved from the caller's receipt/grant
+
+                # When own attempt scoped, invoke read_coordination directly and paginate
+                if attempt_id is not None:
+                    found_attempt = False
+                    cursor: str | None = None
+                    while True:
+                        coord_page = (
+                            self.service.read_coordination(plan_id, after=cursor)
+                            if cursor is not None
+                            else self.service.read_coordination(plan_id)
+                        )
+                        for item in coord_page.items:
+                            if item.kind == "attempt":
+                                val = item.value
+                                if val.attempt_id == attempt_id:
+                                    attempt_version = val.version
+                                    found_attempt = True
+                                    break
+                        if found_attempt:
+                            break
+                        next_c = coord_page.next_cursor
+                        if not next_c:
+                            break
+                        cursor = next_c
+                    if not found_attempt:
+                        raise ValueError(f"Attempt '{attempt_id}' not found in coordination for plan '{plan_id}'")
 
         # Determine tokens based on normative matrix
         orchestrator_token: str | None = None
@@ -530,7 +531,7 @@ def make_service(directory: Path, clock: FakeClock | None = None) -> ServiceFixt
     from adaptive_planning.app import PlanningService
     from adaptive_planning.store import Store
 
-    store = Store(directory / "planning.sqlite", clock)
-    service = PlanningService(store, base_url="http://127.0.0.1:8000", clock=clock)
+    store = Store(directory / "planning.sqlite", clock, host_id="synthetic-host")
+    service = PlanningService(store, base_url="http://127.0.0.1:8790", clock=clock)
     epoch = store.installation_epoch()
     return ServiceFixture(service=service, store=store, directory=directory, clock=clock, epoch=epoch)
