@@ -7,10 +7,9 @@ from datetime import datetime
 from typing import Callable
 
 from adaptive_planning import plans
-from adaptive_planning.ownership import authenticate_orchestrator
+from adaptive_planning.ownership import command_relay, require_kind_capabilities, require_orchestrator
 from adaptive_planning.store import Store
 from adaptive_planning.types import (
-    BOOTSTRAP_KINDS,
     Command,
     CoordinationPage,
     DomainError,
@@ -22,10 +21,11 @@ from adaptive_planning.types import (
     ReadyStep,
 )
 
-# Only planning mutations are enabled; every other kind is rejected before any state is touched.
+# Only planning and ownership mutations are enabled; every other kind is rejected before any state is touched.
 HANDLERS: dict[str, Callable[[sqlite3.Connection, Command], MutationReceipt]] = {
     "create_plan": plans.create_plan,
     "revise_plan": plans.revise_plan,
+    "takeover": plans.takeover,
 }
 
 
@@ -51,24 +51,19 @@ class PlanningService:
         epoch = db.execute("SELECT epoch FROM installation WHERE id = 1").fetchone()[0]
         if command.epoch != epoch:
             raise DomainError("stale_epoch", "The installation epoch has changed; re-read service info")
-        handler = HANDLERS.get(command.kind)
-        if handler is None:
+        if command.kind not in HANDLERS:
             raise DomainError("unsupported", f"Command kind {command.kind!r} is not enabled")
-        if command.kind not in BOOTSTRAP_KINDS:
-            authenticate_orchestrator(db, command, self._clock())
-        digest = plans.command_digest(command)
-
-        stored = db.execute(
-            "SELECT command_digest, response_payload, plan_id FROM requests WHERE epoch = ? AND key = ?",
-            (epoch, command.key)).fetchone()
-        if stored is not None:
-            if stored[0] != digest:
-                raise DomainError("conflict", f"Request key {command.key!r} was already used for a different command")
-            committed, committed_metadata, private = plans.decode_response(stored[1])
-            return MutationReceipt(committed, committed_metadata, plans._metadata(db, stored[2]), True, private)
-
+        require_kind_capabilities(
+            command.kind, command_relay(command), command.orchestrator_token, command.attempt_token)
+        # The matrix leaves the orchestrator token only on orchestrator and relayed commands. Authentication
+        # of the current owner, epoch and generation precedes exact replay, which precedes new-command checks.
         try:
-            receipt = handler(db, command)
+            if command.orchestrator_token is not None:
+                require_orchestrator(db, command)
+            replayed = plans.replay_request(db, command)
+            if replayed is not None:
+                return replayed
+            receipt = HANDLERS[command.kind](db, command)
         except DomainError as error:
             if error.current_metadata is None and error.code in ("stale", "conflict") and command.plan_id:
                 try:
@@ -79,8 +74,8 @@ class PlanningService:
         db.execute(
             "INSERT INTO requests (request_id, epoch, key, command_digest, plan_id, response_payload, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), epoch, command.key, digest, receipt.committed_metadata.plan_id,
-             plans.encode_response(receipt), self._clock().isoformat()))
+            (str(uuid.uuid4()), epoch, command.key, plans.command_digest(command),
+             receipt.committed_metadata.plan_id, plans.encode_response(receipt), self._clock().isoformat()))
         return receipt
 
     # ------------------------------------------------------------------ reads

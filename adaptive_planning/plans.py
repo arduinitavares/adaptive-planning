@@ -28,7 +28,7 @@ from adaptive_planning.core import (
     validate_published_snapshot,
     validate_service_graph,
 )
-from adaptive_planning.ownership import current_ownership, issue_orchestrator
+from adaptive_planning.ownership import current_ownership, current_private, fence_orchestrators, issue_orchestrator
 from adaptive_planning.types import (
     AttemptView,
     Authorization,
@@ -696,7 +696,7 @@ def _timestamp(previous: str | None = None) -> str:
 
 
 def _insert_event(
-    connection: sqlite3.Connection, plan_id: PlanId, revision: int, kind: str, actor: str, ts: str,
+    connection: sqlite3.Connection, plan_id: PlanId, revision: int | None, kind: str, actor: str, ts: str,
     payload: dict[str, Any],
 ) -> None:
     connection.execute(
@@ -772,7 +772,7 @@ def _creation_replay(
     if row is None:
         return MutationReceipt({"plan_id": plan_id, "creation_id": creation_id}, current, current, True, None)
     committed, committed_metadata, private = decode_response(row[0])
-    return MutationReceipt(committed, committed_metadata, current, True, private)
+    return MutationReceipt(committed, committed_metadata, current, True, current_private(connection, plan_id, private))
 
 
 def _duplicate_candidates(connection: sqlite3.Connection, draft: PlanDraft) -> list[str]:
@@ -979,3 +979,58 @@ def revise_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
     committed = {"plan_id": plan.plan_id, "revision": revision,
                  "authorization_renewed": change is not None, "retired_steps": retired_ids}
     return MutationReceipt(committed, view.metadata, view.metadata, False, None)
+
+
+# --------------------------------------------------------------------------------------
+# Exact request replay and takeover
+# --------------------------------------------------------------------------------------
+def replay_request(connection: sqlite3.Connection, command: Command) -> MutationReceipt | None:
+    """Return the original receipt for an exact retry of a committed command, or None for a new command.
+
+    Callers authenticate first. Recorded versions are pre-commit values, so no new-command check applies;
+    only the same key, kind and canonical command match. Private grant material is returned only while its
+    capability is still current; otherwise the original public receipt is returned with `private=None`.
+    """
+    stored = connection.execute(
+        "SELECT command_digest, response_payload, plan_id FROM requests WHERE epoch = ? AND key = ?",
+        (_installation_epoch(connection), command.key)).fetchone()
+    if stored is None:
+        return None
+    if stored[0] != command_digest(command):
+        raise DomainError("conflict", f"Request key {command.key!r} was already used for a different command")
+    committed, committed_metadata, private = decode_response(stored[1])
+    return MutationReceipt(committed, committed_metadata, _metadata(connection, stored[2]), True,
+                           current_private(connection, stored[2], private))
+
+
+def takeover(connection: sqlite3.Connection, command: Command) -> MutationReceipt:
+    """Explicitly transfer plan ownership, fencing the previous orchestrator and issuing a fresh grant.
+
+    Only the orchestrator capability changes; attempts, resources, reservations, holds, authorization and
+    worker capabilities are preserved. The event carries no plan revision because ownership is not a plan
+    revision and must not alter the renderer-compatible history or publication.
+    """
+    expected: int = command.payload["expected_ownership_version"]
+    reason: str = command.payload["reason"].strip()
+    if command.plan_id is None:
+        raise DomainError("invalid", "plan_id is required")
+    if command.generation is None:
+        raise DomainError("invalid", "generation is required")
+    if len(reason) > MAX_TEXT_LEN:
+        raise DomainError("invalid", "reason exceeds maximum length")
+    plan = _load_plan(connection, command.plan_id)
+    if command.generation != plan.generation:
+        raise DomainError("stale", "The plan generation has changed; re-read the plan")
+    claimed = connection.execute(
+        "UPDATE plans SET ownership_version = ownership_version + 1 WHERE plan_id = ? AND ownership_version = ?",
+        (plan.plan_id, expected))
+    if claimed.rowcount != 1:
+        raise DomainError("conflict", f"Plan ownership is at version {plan.ownership_version}, not {expected}")
+    fence_orchestrators(connection, plan.plan_id)
+    grant = issue_orchestrator(connection, plan.plan_id, command.actor)
+    _insert_event(connection, plan.plan_id, None, "takeover", command.actor, _timestamp(), {
+        "summary": f"Ownership taken over by {command.actor}", "reason": reason,
+        "previous_ownership_version": expected, "ownership_version": expected + 1})
+    metadata = _metadata(connection, plan.plan_id)
+    committed = {"plan_id": plan.plan_id, "ownership_version": metadata.ownership_version}
+    return MutationReceipt(committed, metadata, metadata, False, grant)
