@@ -172,10 +172,6 @@ class Store:
                 conn.close()
             except Exception:
                 pass
-            try:
-                self._enforce_file_permissions()
-            except Exception:
-                pass
 
     def installation_epoch(self) -> Epoch:
         """Return the immutable installation epoch."""
@@ -270,10 +266,6 @@ class Store:
                     conn.close()
                 except Exception:
                     pass
-            try:
-                self._enforce_file_permissions()
-            except Exception:
-                pass
 
         # Post-commit sequence-only notification; post-commit cleanup/notification failures cannot replace result
         try:

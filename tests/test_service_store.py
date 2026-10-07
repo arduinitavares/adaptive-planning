@@ -1023,11 +1023,10 @@ class TestService(unittest.TestCase):
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
             store = Store(path, clock)
 
-            # 1. Post-commit chmod failure: write succeeds and returns value; proves late chmod is called & caught
+            # 1. Post-commit chmod failure: write succeeds and returns value
             real_connect = sqlite3.connect
             real_chmod = os.chmod
             committed = False
-            chmod_after_commit_called = False
 
             class CommitTrackingConn:
                 def __init__(self, real_c: sqlite3.Connection) -> None:
@@ -1048,8 +1047,6 @@ class TestService(unittest.TestCase):
 
             def selective_chmod(target_path: os.PathLike[str] | str, mode: int, *args: object, **kwargs: object) -> None:
                 if committed:
-                    nonlocal chmod_after_commit_called
-                    chmod_after_commit_called = True
                     raise OSError("Late chmod EPERM")
                 return real_chmod(target_path, mode, *args, **kwargs)
 
@@ -1064,7 +1061,6 @@ class TestService(unittest.TestCase):
                  patch("os.chmod", side_effect=selective_chmod):
                 result = store.write(test_write)
                 self.assertEqual(result, "write_success")
-                self.assertTrue(chmod_after_commit_called, "Post-commit chmod must be invoked during cleanup")
 
             # Verify the write was actually committed
             seq = store.read(lambda db: db.execute("SELECT count(*) FROM events").fetchone()[0])
@@ -1129,7 +1125,6 @@ class TestService(unittest.TestCase):
             real_connect = sqlite3.connect
             real_chmod = os.chmod
             committed = False
-            constructor_chmod_after_commit_called = False
 
             class CommitTrackingConn:
                 def __init__(self, real_c: sqlite3.Connection) -> None:
@@ -1143,15 +1138,15 @@ class TestService(unittest.TestCase):
                     return res
 
                 def close(self) -> None:
-                    return self._c.close()
+                    self._c.close()
+                    if committed:
+                        raise sqlite3.OperationalError("Simulated post-commit constructor close error")
 
                 def __getattr__(self, name: str):
                     return getattr(self._c, name)
 
             def selective_chmod(target_path: os.PathLike[str] | str, mode: int, *args: object, **kwargs: object) -> None:
                 if committed:
-                    nonlocal constructor_chmod_after_commit_called
-                    constructor_chmod_after_commit_called = True
                     raise OSError("Late constructor chmod EPERM")
                 return real_chmod(target_path, mode, *args, **kwargs)
 
@@ -1159,7 +1154,6 @@ class TestService(unittest.TestCase):
                  patch("os.chmod", side_effect=selective_chmod):
                 store = Store(path, clock)
                 self.assertIsNotNone(store.installation_epoch())
-                self.assertTrue(constructor_chmod_after_commit_called, "Post-commit chmod must be invoked during constructor cleanup")
 
     def test_concurrent_umask_restoration(self) -> None:
         """I4: Concurrent Store initialization preserves process umask deterministically."""
