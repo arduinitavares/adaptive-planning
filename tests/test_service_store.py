@@ -812,6 +812,21 @@ class TestService(unittest.TestCase):
                     )
                 )
 
+            # 3. Parent updates: attempt.step_id and result_version.step_id cannot be updated while referenced
+            with self.assertRaises(sqlite3.IntegrityError):
+                store.write(
+                    lambda db: db.execute(
+                        "UPDATE attempts SET step_id = 's2' WHERE plan_id = 'p1' AND attempt_id = 'a1'"
+                    )
+                )
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                store.write(
+                    lambda db: db.execute(
+                        "UPDATE result_versions SET step_id = 's2' WHERE plan_id = 'p1' AND result_version = 'rv1'"
+                    )
+                )
+
     def test_parent_delete_cannot_remove_unresolved_uses(self) -> None:
         """I2: Deleting parents of resource_uses or absent_host_work fails via RESTRICT and rolls back."""
         with TemporaryDirectory() as directory:
@@ -867,6 +882,16 @@ class TestService(unittest.TestCase):
                     "VALUES (?, ?, ?, ?, ?, 'released', ?)",
                     ("u-released", "res-normal", "p1", "a-rel", "workspace", now),
                 )
+                # Absent-work-only resource: absent_host_work itself restricts deletion without any resource_uses row
+                db.execute(
+                    "INSERT INTO resources (resource_id, host_id, kind, created_at) VALUES (?, ?, ?, ?)",
+                    ("res-absent-only", "h1", "workspace", now),
+                )
+                db.execute(
+                    "INSERT INTO absent_host_work (absent_work_id, host_id, resource_id, scope, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    ("ab-standalone", "h1", "res-absent-only", "workspace", now),
+                )
                 db.execute(
                     "INSERT INTO events (kind, actor, published_at, payload) VALUES (?, ?, ?, ?)",
                     ("create_plan", "tester", now, "{}"),
@@ -897,6 +922,10 @@ class TestService(unittest.TestCase):
             # 6. Attempt to delete ab-orphan (referenced by u-orphan)
             with self.assertRaises(sqlite3.IntegrityError):
                 store.write(lambda db: db.execute("DELETE FROM absent_host_work WHERE absent_work_id = 'ab-orphan'"))
+
+            # 7. Attempt to delete res-absent-only (referenced by absent_host_work alone via ON DELETE RESTRICT)
+            with self.assertRaises(sqlite3.IntegrityError):
+                store.write(lambda db: db.execute("DELETE FROM resources WHERE resource_id = 'res-absent-only'"))
 
             # Assert all uses (including released) and events remain intact
             uses = store.read(lambda db: [r[0] for r in db.execute("SELECT use_id FROM resource_uses ORDER BY use_id").fetchall()])
@@ -1017,16 +1046,17 @@ class TestService(unittest.TestCase):
                 )
 
     def test_post_commit_cleanup_failure_does_not_mask_success(self) -> None:
-        """I4: Post-commit chmod failure does not replace successful write result; pre-commit failure rolls back."""
+        """I4: Post-commit cleanup and listener failure does not replace successful write result; pre-commit failure rolls back."""
         with TemporaryDirectory() as directory:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
             store = Store(path, clock)
 
-            # 1. Post-commit chmod failure: write succeeds and returns value
+            # 1. Post-commit chmod absent: write succeeds without attempting post-commit chmod (which would raise EPERM)
             real_connect = sqlite3.connect
             real_chmod = os.chmod
             committed = False
+            late_chmod_called = False
 
             class CommitTrackingConn:
                 def __init__(self, real_c: sqlite3.Connection) -> None:
@@ -1047,6 +1077,8 @@ class TestService(unittest.TestCase):
 
             def selective_chmod(target_path: os.PathLike[str] | str, mode: int, *args: object, **kwargs: object) -> None:
                 if committed:
+                    nonlocal late_chmod_called
+                    late_chmod_called = True
                     raise OSError("Late chmod EPERM")
                 return real_chmod(target_path, mode, *args, **kwargs)
 
@@ -1061,6 +1093,7 @@ class TestService(unittest.TestCase):
                  patch("os.chmod", side_effect=selective_chmod):
                 result = store.write(test_write)
                 self.assertEqual(result, "write_success")
+                self.assertFalse(late_chmod_called, "Post-commit chmod must not be invoked (eliminated per ruling)")
 
             # Verify the write was actually committed
             seq = store.read(lambda db: db.execute("SELECT count(*) FROM events").fetchone()[0])
@@ -1090,6 +1123,34 @@ class TestService(unittest.TestCase):
             seq2 = store.read(lambda db: db.execute("SELECT count(*) FROM events").fetchone()[0])
             self.assertEqual(seq2, 2)
 
+            # 2b. Post-commit listener failure: failing listener does not mask successful result and sibling listeners run
+            healthy_listener_called: list[int] = []
+
+            def failing_listener(s: int) -> None:
+                raise RuntimeError("Simulated post-commit listener failure")
+
+            def healthy_listener(s: int) -> None:
+                healthy_listener_called.append(s)
+
+            store.add_listener(failing_listener)
+            store.add_listener(healthy_listener)
+
+            res3 = store.write(
+                lambda db: db.execute(
+                    "INSERT INTO events (kind, actor, published_at, payload) VALUES (?, ?, ?, ?)",
+                    ("revise_plan", "tester", clock().isoformat(), "{}"),
+                )
+            )
+            self.assertIsNotNone(res3)
+            self.assertEqual(healthy_listener_called, [3])
+
+            seq3 = store.read(lambda db: db.execute("SELECT count(*) FROM events").fetchone()[0])
+            self.assertEqual(seq3, 3)
+
+            # Cleanup listeners
+            store.remove_listener(failing_listener)
+            store.remove_listener(healthy_listener)
+
             # 3. Before-commit chmod failure: mutating operation runs, but pre-commit chmod fails; transaction rolls back
             mutating_called = False
 
@@ -1114,7 +1175,7 @@ class TestService(unittest.TestCase):
 
             # Verify the attempted third event was rolled back
             seq_after = store.read(lambda db: db.execute("SELECT count(*) FROM events").fetchone()[0])
-            self.assertEqual(seq_after, 2)
+            self.assertEqual(seq_after, 3)
 
     def test_constructor_post_commit_cleanup_failure_does_not_fail(self) -> None:
         """I4: Constructor cleanup failure after installation commit does not report initialized store as failed."""
@@ -1125,6 +1186,7 @@ class TestService(unittest.TestCase):
             real_connect = sqlite3.connect
             real_chmod = os.chmod
             committed = False
+            constructor_late_chmod_called = False
 
             class CommitTrackingConn:
                 def __init__(self, real_c: sqlite3.Connection) -> None:
@@ -1147,6 +1209,8 @@ class TestService(unittest.TestCase):
 
             def selective_chmod(target_path: os.PathLike[str] | str, mode: int, *args: object, **kwargs: object) -> None:
                 if committed:
+                    nonlocal constructor_late_chmod_called
+                    constructor_late_chmod_called = True
                     raise OSError("Late constructor chmod EPERM")
                 return real_chmod(target_path, mode, *args, **kwargs)
 
@@ -1154,6 +1218,7 @@ class TestService(unittest.TestCase):
                  patch("os.chmod", side_effect=selective_chmod):
                 store = Store(path, clock)
                 self.assertIsNotNone(store.installation_epoch())
+                self.assertFalse(constructor_late_chmod_called, "Constructor post-commit chmod must not be invoked")
 
     def test_concurrent_umask_restoration(self) -> None:
         """I4: Concurrent Store initialization preserves process umask deterministically."""
