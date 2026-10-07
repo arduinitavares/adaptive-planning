@@ -314,21 +314,19 @@ def _next_step_id(plan: _Plan) -> str | None:
 # Legacy snapshot projection
 # --------------------------------------------------------------------------------------
 def _history(connection: sqlite3.Connection, plan: _Plan) -> list[dict[str, Any]]:
-    first = max(1, plan.revision - 99)
-    by_revision: dict[int, dict[str, Any]] = {}
-    for revision, published_at, kind, payload in connection.execute(
-            "SELECT plan_revision, published_at, kind, payload FROM events "
-            "WHERE plan_id = ? AND plan_revision BETWEEN ? AND ? ORDER BY sequence",
-            (plan.plan_id, first, plan.revision)):
+    rows = connection.execute(
+        "SELECT plan_revision, published_at, kind, payload FROM events "
+        "WHERE plan_id = ? AND plan_revision BETWEEN 1 AND ? ORDER BY sequence DESC LIMIT 100",
+        (plan.plan_id, plan.revision)).fetchall()
+    if not any(revision == plan.revision for revision, *_ in rows):
+        raise DomainError("history_incomplete", f"No event is recorded for revision {plan.revision} of this plan")
+    history = []
+    for revision, published_at, kind, payload in reversed(rows):
         data = json.loads(payload)
-        entry = by_revision.setdefault(revision, {"revision": revision})
-        entry["timestamp"] = published_at
-        entry["summary"] = data.get("summary") or kind
+        entry = {"revision": revision, "timestamp": published_at, "summary": data.get("summary") or kind}
         if data.get("authorization_note"):
             entry["authorizationNote"] = data["authorization_note"]
-    history = [by_revision[revision] for revision in sorted(by_revision)]
-    if plan.revision not in by_revision:
-        raise DomainError("history_incomplete", f"No event is recorded for revision {plan.revision} of this plan")
+        history.append(entry)
     return history
 
 

@@ -1093,6 +1093,65 @@ class TestHistoryProvenance(PlanServiceTestCase):
             (2, "2026-10-06T12:01:00+00:00", "alpha"),
             (3, "2026-10-06T12:02:00+00:00", "beta")])
 
+    def insert_event_rows(self, revision, rows):
+        def run(db):
+            for published_at, summary, note in rows:
+                payload = {"summary": summary}
+                if note is not None:
+                    payload["authorization_note"] = note
+                db.execute(
+                    "INSERT INTO events (plan_id, plan_revision, kind, actor, published_at, payload) "
+                    "VALUES (?, ?, 'revise_plan', 'fixture', ?, ?)",
+                    (self.plan_id, revision, published_at, json.dumps(payload)))
+        self.f.store.write(run)
+
+    def test_same_revision_events_stay_separate_with_row_owned_notes(self):
+        self.f.clock.advance(60)
+        self.f.service.execute(self.revise("alpha"))
+        self.insert_event_rows(2, (
+            ("2026-10-06T12:05:00+00:00", "beta", "note for beta only"),
+            ("2026-10-06T12:06:00+00:00", "gamma", None),
+            ("2026-10-06T12:07:00+00:00", "delta", None)))
+        before = dump(self.f.store)
+        view = self.f.service.read_plan(self.plan_id)
+        history = view.legacy_snapshot["history"]
+        self.assertEqual([(h["revision"], h["timestamp"], h["summary"], h.get("authorizationNote")) for h in history], [
+            (1, "2026-10-06T12:00:00+00:00", "Plan created", draft().authorization.note),
+            (2, "2026-10-06T12:01:00+00:00", "alpha", None),
+            (2, "2026-10-06T12:05:00+00:00", "beta", "note for beta only"),
+            (2, "2026-10-06T12:06:00+00:00", "gamma", None),
+            (2, "2026-10-06T12:07:00+00:00", "delta", None)])
+        self.assertEqual(view.legacy_snapshot["changeSummary"], "delta")
+        self.assertIsNone(view.legacy_publication)
+        self.assertEqual(len(self.events()), 5)
+        self.assertEqual(dump(self.f.store), before)
+
+    def test_history_is_latest_hundred_events_by_sequence_when_revisions_repeat(self):
+        expected = []
+        first_rows = tuple((f"2026-10-06T12:{i // 60:02d}:{i % 60:02d}+00:00", f"early {i}",
+                            "early note" if i % 25 == 0 else None) for i in range(40))
+        self.insert_event_rows(1, first_rows)
+        self.f.clock.advance(3600)
+        self.f.service.execute(self.revise("real revision two"))
+        late_rows = tuple((f"2026-10-06T14:{i // 60:02d}:{i % 60:02d}+00:00", f"late {i}",
+                           "late note" if i % 30 == 0 else None) for i in range(80))
+        self.insert_event_rows(2, late_rows)
+        expected = [(1, ts, summary, note) for ts, summary, note in first_rows]
+        expected.append((2, "2026-10-06T13:00:00+00:00", "real revision two", None))
+        expected.extend((2, ts, summary, note) for ts, summary, note in late_rows)
+        expected = expected[-100:]
+        before = dump(self.f.store)
+        view = self.f.service.read_plan(self.plan_id)
+        history = view.legacy_snapshot["history"]
+        self.assertEqual(len(self.events()), 122)
+        self.assertEqual(len(history), 100)
+        self.assertEqual([(h["revision"], h["timestamp"], h["summary"], h.get("authorizationNote")) for h in history],
+                         expected)
+        self.assertEqual(history[0]["summary"], "early 21")
+        self.assertEqual(history[-1]["summary"], "late 79")
+        self.assertIsNone(view.legacy_publication)
+        self.assertEqual(dump(self.f.store), before)
+
     def test_missing_intermediate_event_is_omitted_never_invented(self):
         for reason in ("first", "second", "third"):
             self.f.clock.advance(60)
