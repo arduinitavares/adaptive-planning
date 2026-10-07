@@ -31,21 +31,43 @@ from adaptive_planning.types import (
     AttemptView,
     Authorization,
     AuthorizationChange,
+    Availability,
+    Checkpoint,
     CommandEnvelope,
+    CoordinationItem,
+    CoordinationPage,
+    CoordinationView,
+    DocumentRef,
     DomainError,
+    Evidence,
     ExecutionContext,
+    ExecutionContextClaims,
+    HostWork,
+    InstallationView,
+    Metadata,
+    MutationReceipt,
     PlanDraft,
     PrivateGrant,
+    Reassessment,
+    ReservationView,
+    ResourceClaim,
+    ResourceResolution,
+    RetirementRequest,
+    Review,
+    ReviewView,
     StepDefinition,
     parse_command,
 )
 from tests.service_fixtures import (
+    FakeClock,
+    ServiceFixture,
     checkpoint,
     context,
     coordination,
     draft,
     legacy_proposal,
     step,
+    workspace,
 )
 
 
@@ -227,12 +249,51 @@ class TestServiceCore(unittest.TestCase):
             validate_plan(p_ev)
         self.assertEqual(len(p_ev["steps"][0]["evidence"]), 51)
 
-        # 3. > 10 MB limit
+        # 3. > 10 MB limit (many fields <= 10000 chars whose total exceeds max_file_bytes)
         p_oversize = legacy_proposal()
-        p_oversize["steps"][0]["details"] = "x" * (10 * 1024 * 1024 + 10)
-        with self.assertRaises(PlanValidationError):
-            validate_plan(p_oversize)
-        self.assertEqual(len(p_oversize["steps"][0]["details"]), 10 * 1024 * 1024 + 10)
+        p_oversize["nextStepId"] = "s0"
+        p_oversize["steps"] = [
+            {
+                "id": f"s{i}",
+                "title": f"Step {i}",
+                "status": "pending",
+                "dependsOn": [],
+                "check": "Valid check string",
+                "evidence": ["e" * 1500 for _ in range(50)],
+            }
+            for i in range(200)
+        ]
+        # Verify individual fields are within limits
+        self.assertEqual(len(p_oversize["steps"]), 200)
+        self.assertEqual(len(p_oversize["steps"][0]["evidence"]), 50)
+        self.assertLessEqual(len(p_oversize["steps"][0]["evidence"][0]), 10000)
+
+        snapshot_oversize = {
+            "schemaVersion": 2,
+            "generation": "11111111-1111-1111-1111-111111111111",
+            "revision": 1,
+            "updatedAt": "2026-10-06T12:00:00Z",
+            "taskId": "task-test-01",
+            "objective": "Verify size limit",
+            "status": "planning",
+            "executionMode": "complete-task",
+            "scope": {"mode": "complete-task", "sinceRevision": 1, "baseline": [], "claimed": None},
+            "nextStepId": "s0",
+            "changeSummary": "Size limit test",
+            "steps": p_oversize["steps"],
+            "history": [{"revision": 1, "timestamp": "2026-10-06T12:00:00Z", "summary": "Initial"}],
+        }
+        with self.assertRaises(PlanValidationError) as ctx:
+            validate_published_snapshot(snapshot_oversize, max_file_bytes=10 * 1024 * 1024)
+        self.assertIn("exceeds maximum allowed size", str(ctx.exception).lower())
+
+        with self.assertRaises(PlanValidationError) as ctx:
+            prepare_publication(
+                p_oversize, None, timestamp="2026-10-06T12:00:00Z", generation="11111111-1111-1111-1111-111111111111",
+                expected_revision=0, expected_generation=None, authorization_note="initial note",
+                max_file_bytes=10 * 1024 * 1024, max_history=10,
+            )
+        self.assertIn("exceeds maximum allowed size", str(ctx.exception).lower())
 
     def test_command_parser_kind_payload_matrix(self):
         """Command parser validates exact kinds, rejects unknown fields and kind/payload mismatches."""
@@ -815,6 +876,389 @@ class TestServiceCore(unittest.TestCase):
         """adaptive_planning.core re-exports parse_command conforming to the interface contract."""
         from adaptive_planning.core import parse_command as core_parse_command
         self.assertTrue(callable(core_parse_command))
+
+    def test_relayed_checkpoint_parser_and_fixture(self):
+        """Relayed record_checkpoint permits orchestrator token; fixture selects both tokens for relayed checkpoint."""
+        cp = checkpoint(relay="relay-worker")
+        cmd_raw = {
+            "kind": "record_checkpoint",
+            "epoch": "epoch-1",
+            "key": "req-cp",
+            "actor": "worker-a",
+            "plan_id": "p-1",
+            "generation": "g-1",
+            "expected_revision": 1,
+            "ownership_version": 1,
+            "orchestrator_token": "orch-tok",
+            "attempt_id": "att-1",
+            "attempt_token": "att-tok",
+            "attempt_version": 1,
+            "definition_version": "v1",
+            "payload": {"checkpoint": cp},
+        }
+        cmd = parse_command(cmd_raw)
+        self.assertEqual(cmd.orchestrator_token, "orch-tok")
+        self.assertEqual(cmd.attempt_token, "att-tok")
+
+        # Negative: worker command with relay=None forbids orchestrator token
+        non_relayed_raw = copy.deepcopy(cmd_raw)
+        non_relayed_raw["payload"] = {"checkpoint": checkpoint(relay=None)}
+        with self.assertRaises(DomainError) as ctx:
+            parse_command(non_relayed_raw)
+        self.assertEqual(ctx.exception.code, "invalid")
+
+        # Fixture token selection for relayed checkpoint
+        clock = FakeClock()
+        fixture = ServiceFixture(service=None, store=None, directory=Path("/tmp"), clock=clock, epoch="epoch-1")
+        meta = Metadata("epoch-1", "p-1", "g-1", 1, 1, "url")
+        receipt = MutationReceipt(
+            committed={}, committed_metadata=meta, current_metadata=meta, replayed=False,
+            private=PrivateGrant(orchestrator_token="receipt-orch", attempt_token=None),
+        )
+        attempt = MutationReceipt(
+            committed={"attempt_id": "att-1", "version": 1, "definition_version": "v1"},
+            committed_metadata=meta, current_metadata=meta, replayed=False,
+            private=PrivateGrant(orchestrator_token=None, attempt_token="receipt-att"),
+        )
+        fix_cmd = fixture.command(
+            "record_checkpoint",
+            {"checkpoint": cp},
+            receipt=receipt,
+            attempt=attempt,
+        )
+        self.assertEqual(fix_cmd.orchestrator_token, "receipt-orch")
+        self.assertEqual(fix_cmd.attempt_token, "receipt-att")
+
+    def test_command_and_nested_payload_immutability(self):
+        """Top-level command payload, nested mappings, receipts, drafts and views reject mutation."""
+        p_draft = draft()
+        cmd = parse_command({
+            "kind": "create_plan",
+            "epoch": "epoch-1",
+            "key": "k-imm",
+            "actor": "orch",
+            "payload": {
+                "creation_id": "c-1",
+                "draft": p_draft,
+                "new_plan_intent": "intent",
+            },
+        })
+        # Top-level payload mutation raises TypeError
+        with self.assertRaises(TypeError):
+            cmd.payload["creation_id"] = "MUTATED"
+        with self.assertRaises(TypeError):
+            cmd.payload["new_field"] = "BAD"
+
+        # Nested mapping mutation raises TypeError
+        import_cmd = parse_command({
+            "kind": "import_plan",
+            "epoch": "epoch-1",
+            "key": "k-imp",
+            "actor": "orch",
+            "payload": {
+                "host_id": "host-1",
+                "source_directory_id": "dir-1",
+                "source_directory_claim": None,
+                "original_task_id": "task-1",
+                "original_snapshot": {"schemaVersion": 2, "objective": "test"},
+                "provenance": DocumentRef("path/doc", None, None, "v1", None),
+                "writers_stopped": "yes",
+                "known_contexts": {"s1": context("ws-1")},
+            },
+        })
+        with self.assertRaises(TypeError):
+            import_cmd.payload["original_snapshot"]["objective"] = "MUTATED"
+
+        # MutationReceipt.committed is frozen
+        meta = Metadata("epoch-1", "p-1", "g-1", 1, 1, "url")
+        receipt = MutationReceipt(
+            committed={"resource_id": "res-1"},
+            committed_metadata=meta,
+            current_metadata=meta,
+            replayed=False,
+            private=None,
+        )
+        with self.assertRaises(TypeError):
+            receipt.committed["resource_id"] = "MUTATED"
+
+        # CoordinationView.result_versions and total_counts are frozen
+        coord_view = coordination()
+        with self.assertRaises(TypeError):
+            coord_view.result_versions["a"] = "v2"
+        with self.assertRaises(TypeError):
+            coord_view.total_counts["attempts"] = 5
+
+    def test_all_23_command_kinds_positive_and_negative_typed_payloads(self):
+        """All 23 command kinds validate typed payload shapes, literals, and reject invalid/non-finite inputs."""
+        base_orch = {
+            "epoch": "epoch-1",
+            "key": "req-pos",
+            "actor": "orch",
+            "orchestrator_token": "orch-tok",
+        }
+        base_worker = {
+            "epoch": "epoch-1",
+            "key": "req-w",
+            "actor": "worker-a",
+            "attempt_token": "att-tok",
+        }
+        base_boot = {
+            "epoch": "epoch-1",
+            "key": "req-b",
+            "actor": "orch",
+        }
+
+        # 1. create_plan
+        c_pos = parse_command({**base_boot, "kind": "create_plan", "payload": {"creation_id": "c1", "draft": draft(), "new_plan_intent": None}})
+        self.assertEqual(c_pos.kind, "create_plan")
+        with self.assertRaises(DomainError):
+            parse_command({**base_boot, "kind": "create_plan", "payload": {"creation_id": "c1", "draft": "not-a-draft", "new_plan_intent": None}})
+
+        # 2. revise_plan
+        r_pos = parse_command({**base_orch, "kind": "revise_plan", "payload": {"draft": draft(), "reason": "rev", "authorization_change": None}})
+        self.assertEqual(r_pos.kind, "revise_plan")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "revise_plan", "payload": {"draft": draft(), "reason": 123, "authorization_change": None}})
+
+        # 3. takeover
+        t_pos = parse_command({**base_boot, "kind": "takeover", "payload": {"expected_ownership_version": 2, "reason": "takeover"}})
+        self.assertEqual(t_pos.kind, "takeover")
+        with self.assertRaises(DomainError):
+            parse_command({**base_boot, "kind": "takeover", "payload": {"expected_ownership_version": -1, "reason": "takeover"}})
+
+        # 4. register_resource
+        rr_pos = parse_command({**base_orch, "kind": "register_resource", "payload": {"claim": workspace("/p", 1)}})
+        self.assertEqual(rr_pos.kind, "register_resource")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "register_resource", "payload": {"claim": {"host_id": "h", "kind": "invalid-kind"}}})
+
+        # 5. reconcile_resources
+        rec_pos = parse_command({**base_orch, "kind": "reconcile_resources", "payload": {"resource_ids": ("r1",), "canonical_claim": workspace("/p", 1), "reason": "rec"}})
+        self.assertEqual(rec_pos.kind, "reconcile_resources")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "reconcile_resources", "payload": {"resource_ids": "not-a-tuple", "canonical_claim": workspace("/p", 1), "reason": "rec"}})
+
+        # 6. invalidate_result
+        inv_ev = Evidence("ev", None, None, "chk", "failed", (), ())
+        ir_pos = parse_command({**base_orch, "kind": "invalidate_result", "payload": {"step_id": "s1", "result_version": "v1", "reason": "inv", "evidence": (inv_ev,)}})
+        self.assertEqual(ir_pos.kind, "invalidate_result")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "invalidate_result", "payload": {"step_id": "s1", "result_version": "v1", "reason": "inv", "evidence": ("not-evidence",)}})
+
+        # 7. resolve_invalidation
+        rinv_pos = parse_command({**base_orch, "kind": "resolve_invalidation", "payload": {"invalidation_id": "i1", "affected_step_id": "s1", "disposition": "revalidated", "corrective_step_id": None, "corrected_result_version": None, "evidence": (), "reason": "ok"}})
+        self.assertEqual(rinv_pos.kind, "resolve_invalidation")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "resolve_invalidation", "payload": {"invalidation_id": "i1", "affected_step_id": "s1", "disposition": "invalid-disp", "corrective_step_id": None, "corrected_result_version": None, "evidence": (), "reason": "ok"}})
+
+        # 8. assign_step
+        as_pos = parse_command({**base_orch, "kind": "assign_step", "payload": {"step_id": "s1", "assignee": "w1", "context": context(None)}})
+        self.assertEqual(as_pos.kind, "assign_step")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "assign_step", "payload": {"step_id": "s1", "assignee": "w1", "context": "not-a-context"}})
+
+        # 9. bind_availability
+        avail = Availability("s0", "v1", "ancestor", "base", None, Evidence("s", None, None, "c", "passed", (), ()))
+        ba_pos = parse_command({**base_orch, "kind": "bind_availability", "payload": {"bindings": (avail,), "checked_base": "base"}})
+        self.assertEqual(ba_pos.kind, "bind_availability")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "bind_availability", "payload": {"bindings": ("not-avail",), "checked_base": "base"}})
+
+        # 10. start_step
+        ss_pos = parse_command({**base_worker, "kind": "start_step", "payload": {"origin_worker": "worker-a", "relay": None, "observed_activity": "act"}})
+        self.assertEqual(ss_pos.kind, "start_step")
+        with self.assertRaises(DomainError):
+            parse_command({**base_worker, "kind": "start_step", "payload": {"origin_worker": 123, "relay": None, "observed_activity": "act"}})
+
+        # 11. report_activity
+        ra_pos = parse_command({**base_worker, "kind": "report_activity", "payload": {"origin_worker": "worker-a", "relay": None, "observed_activity": "act"}})
+        self.assertEqual(ra_pos.kind, "report_activity")
+        with self.assertRaises(DomainError):
+            parse_command({**base_worker, "kind": "report_activity", "payload": {"origin_worker": "worker-a", "relay": None, "observed_activity": None}})
+
+        # 12. record_checkpoint
+        rc_pos = parse_command({**base_worker, "kind": "record_checkpoint", "payload": {"checkpoint": checkpoint()}})
+        self.assertEqual(rc_pos.kind, "record_checkpoint")
+        with self.assertRaises(DomainError):
+            parse_command({**base_worker, "kind": "record_checkpoint", "payload": {"checkpoint": "not-a-checkpoint"}})
+
+        # 13. resolve_reassessment
+        rr_pos2 = parse_command({**base_orch, "kind": "resolve_reassessment", "payload": {"checkpoint_id": "cp1", "decision": "apply", "reason": "r", "draft": None, "affected_steps": (), "unbounded": False}})
+        self.assertEqual(rr_pos2.kind, "resolve_reassessment")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "resolve_reassessment", "payload": {"checkpoint_id": "cp1", "decision": "bad-decision", "reason": "r", "draft": None, "affected_steps": (), "unbounded": False}})
+
+        # 14. reopen_attempt
+        ro_pos = parse_command({**base_orch, "kind": "reopen_attempt", "payload": {"reason": "reopen"}})
+        self.assertEqual(ro_pos.kind, "reopen_attempt")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "reopen_attempt", "payload": {"reason": 999}})
+
+        # 15. sweep_stale
+        sw_pos = parse_command({**base_orch, "kind": "sweep_stale", "payload": {}})
+        self.assertEqual(sw_pos.kind, "sweep_stale")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "sweep_stale", "payload": {"extra": "forbidden"}})
+
+        # 16. record_review
+        rev = Review("reviewer-1", ArtifactRef("code", "art-1", "v1", None, "summary"), "passed", (), (), None)
+        rv_pos = parse_command({**base_orch, "kind": "record_review", "payload": {"step_id": "s1", "review": rev}})
+        self.assertEqual(rv_pos.kind, "record_review")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "record_review", "payload": {"step_id": "s1", "review": "not-a-review"}})
+
+        # 17. accept_step
+        acc_art = ArtifactRef("code", "art-1", "v1", None, "summary")
+        ac_pos = parse_command({**base_orch, "kind": "accept_step", "payload": {"step_id": "s1", "artifact": acc_art, "stopped_resource_ids": (), "stopped_reason": None}})
+        self.assertEqual(ac_pos.kind, "accept_step")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "accept_step", "payload": {"step_id": "s1", "artifact": "not-an-artifact", "stopped_resource_ids": (), "stopped_reason": None}})
+
+        # 18. resolve_attempt
+        ra_pos2 = parse_command({**base_orch, "kind": "resolve_attempt", "payload": {"resolution": "confirm-owner", "reason": "ok", "next_step_state": "pending", "stopped_resource_ids": (), "replacement_assignee": None, "replacement_context": None, "attached_context": None}})
+        self.assertEqual(ra_pos2.kind, "resolve_attempt")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "resolve_attempt", "payload": {"resolution": "unknown-res", "reason": "ok", "next_step_state": "pending", "stopped_resource_ids": (), "replacement_assignee": None, "replacement_context": None, "attached_context": None}})
+
+        # 19. reserve_verification
+        rv_pos2 = parse_command({**base_orch, "kind": "reserve_verification", "payload": {"step_id": "s1", "verifier": "v1", "context": context(None), "handoff_from": None, "stopped_reason": None}})
+        self.assertEqual(rv_pos2.kind, "reserve_verification")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "reserve_verification", "payload": {"step_id": "s1", "verifier": 123, "context": context(None), "handoff_from": None, "stopped_reason": None}})
+
+        # 20. release_resource_use
+        ru_pos = parse_command({**base_orch, "kind": "release_resource_use", "payload": {"use_id": "u1", "resource_ids": (), "reason": "rel", "stopped": True}})
+        self.assertEqual(ru_pos.kind, "release_resource_use")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "release_resource_use", "payload": {"use_id": "u1", "resource_ids": (), "reason": "rel", "stopped": "not-bool"}})
+
+        # 21. append_late_evidence
+        ale_pos = parse_command({**base_orch, "kind": "append_late_evidence", "payload": {"origin_attempt_id": "att-1", "evidence": (), "stopped_resource_ids": (), "reason": "ok"}})
+        self.assertEqual(ale_pos.kind, "append_late_evidence")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "append_late_evidence", "payload": {"origin_attempt_id": 123, "evidence": (), "stopped_resource_ids": (), "reason": "ok"}})
+
+        # 22. import_plan
+        doc = DocumentRef("path", None, None, "v1", None)
+        ip_pos = parse_command({**base_boot, "kind": "import_plan", "payload": {"host_id": "h", "source_directory_id": "d1", "source_directory_claim": None, "original_task_id": "t1", "original_snapshot": {"schemaVersion": 2}, "provenance": doc, "writers_stopped": "yes", "known_contexts": {}}})
+        self.assertEqual(ip_pos.kind, "import_plan")
+        with self.assertRaises(DomainError):
+            parse_command({**base_boot, "kind": "import_plan", "payload": {"host_id": "h", "source_directory_id": None, "source_directory_claim": None, "original_task_id": "t1", "original_snapshot": {"schemaVersion": 2}, "provenance": doc, "writers_stopped": "yes", "known_contexts": {}}})
+
+        # 23. resolve_store_hold
+        rsh_pos = parse_command({**base_orch, "kind": "resolve_store_hold", "payload": {"backup_cutoff": "2026-10-06T00:00:00Z", "inventory_complete": True, "absent_work_inventory": (), "resource_resolutions": (), "reason": "ok"}})
+        self.assertEqual(rsh_pos.kind, "resolve_store_hold")
+        with self.assertRaises(DomainError):
+            parse_command({**base_orch, "kind": "resolve_store_hold", "payload": {"backup_cutoff": "2026-10-06T00:00:00Z", "inventory_complete": "not-bool", "absent_work_inventory": (), "resource_resolutions": (), "reason": "ok"}})
+
+        # Non-finite float test
+        with self.assertRaises(DomainError):
+            parse_command({**base_boot, "kind": "takeover", "expected_revision": float("nan"), "payload": {"expected_ownership_version": 1, "reason": "r"}})
+
+    def test_prepare_publication_propagates_internal_type_error(self):
+        """Validator-internal TypeError propagates and max_history is never silently dropped."""
+        prop = legacy_proposal()
+        def faulty_validator(published, **kwargs):
+            raise TypeError("Internal bug in validator implementation")
+
+        with self.assertRaises(TypeError) as ctx:
+            prepare_publication(
+                prop, None, timestamp="2026-10-06T12:00:00Z", generation="gen-1",
+                expected_revision=0, expected_generation=None, authorization_note="note",
+                max_file_bytes=10000, max_history=10,
+                validate_snapshot_fn=faulty_validator,
+            )
+        self.assertIn("Internal bug in validator implementation", str(ctx.exception))
+
+    def test_service_status_coordination_backing_and_planning_rejection(self):
+        """planning with in-progress step is rejected; blocked/stopped requires backing stale attempt in coordination."""
+        prop = legacy_proposal()
+        prop["steps"][0]["status"] = "in-progress"
+        stale_attempt = AttemptView(
+            "x", "step-1", "worker-a", "stale", "active", 1, "v1", "2026-10-06T00:00:00Z",
+            context(None, writes=False), True, None
+        )
+        # 1. planning status with in-progress step ALWAYS rejected even if coordination has attempts
+        prop["status"] = "planning"
+        with self.assertRaises(PlanValidationError):
+            validate_service_graph(prop, None, coordination((stale_attempt,)))
+
+        # 2. blocked/stopped status with in-progress step without backing coordination attempt is rejected
+        for st in ("blocked", "stopped"):
+            prop["status"] = st
+            # Empty coordination has no stale attempt backing step-1
+            with self.assertRaises(PlanValidationError):
+                validate_service_graph(prop, None, coordination(()))
+            # Active/non-stale attempt does not back retained in-progress under blocked/stopped
+            active_attempt = dataclasses.replace(stale_attempt, state="active")
+            with self.assertRaises(PlanValidationError):
+                validate_service_graph(prop, None, coordination((active_attempt,)))
+            # Stale attempt for step-1 backs it -> succeeds
+            validate_service_graph(prop, None, coordination((stale_attempt,)))
+
+    def test_service_fixture_metadata_and_attempt_version(self):
+        """ServiceFixture reads current metadata and attempt version when refresh_metadata=True, freezes on False."""
+        from unittest.mock import MagicMock
+        clock = FakeClock()
+        mock_service = MagicMock()
+        mock_service.read_service_info.return_value = InstallationView(
+            epoch="epoch-current", schema_version=2, host_id="synthetic-host", dashboard_url="http://dash",
+            store_hold=False, restore_cutoff=None
+        )
+        plan_meta = Metadata("epoch-current", "p-1", "gen-curr", 5, 2, "http://dash")
+        mock_plan = MagicMock()
+        mock_plan.metadata = plan_meta
+        mock_service.read_plan.return_value = mock_plan
+
+        coord_attempt = AttemptView(
+            "att-1", "step-1", "worker-a", "active", "assigned", 4, "v1", "2026-10-06T00:00:00Z",
+            context(None, writes=False), False, None
+        )
+        coord_page = CoordinationPage(
+            plan_id="p-1", revision=5, store_sequence=1,
+            items=(CoordinationItem(kind="attempt", value=coord_attempt),),
+            next_cursor=None, total_counts={"attempts": 1}
+        )
+        mock_service.read_coordination.return_value = coord_page
+
+        fixture = ServiceFixture(service=mock_service, store=None, directory=Path("/tmp"), clock=clock, epoch="epoch-init")
+
+        receipt_meta = Metadata("epoch-orig", "p-1", "gen-orig", 1, 1, "url")
+        receipt = MutationReceipt(
+            committed={}, committed_metadata=receipt_meta, current_metadata=receipt_meta,
+            replayed=False, private=PrivateGrant("orch-tok", None)
+        )
+        attempt_receipt = MutationReceipt(
+            committed={"attempt_id": "att-1", "version": 1, "definition_version": "v1"},
+            committed_metadata=receipt_meta, current_metadata=receipt_meta,
+            replayed=False, private=PrivateGrant(None, "att-tok")
+        )
+
+        # refresh_metadata=True reads CURRENT epoch, generation, revision (5), and attempt version (4)
+        cmd_refreshed = fixture.command(
+            "report_activity",
+            {"origin_worker": "worker-a", "relay": None, "observed_activity": "working"},
+            receipt=receipt,
+            attempt=attempt_receipt,
+            refresh_metadata=True,
+        )
+        self.assertEqual(cmd_refreshed.epoch, "epoch-current")
+        self.assertEqual(cmd_refreshed.generation, "gen-curr")
+        self.assertEqual(cmd_refreshed.expected_revision, 5)
+        self.assertEqual(cmd_refreshed.attempt_version, 4)
+
+        # refresh_metadata=False freezes original metadata and attempt version (1)
+        cmd_frozen = fixture.command(
+            "report_activity",
+            {"origin_worker": "worker-a", "relay": None, "observed_activity": "working"},
+            receipt=receipt,
+            attempt=attempt_receipt,
+            refresh_metadata=False,
+        )
+        self.assertEqual(cmd_frozen.epoch, "epoch-orig")
+        self.assertEqual(cmd_frozen.generation, "gen-orig")
+        self.assertEqual(cmd_frozen.expected_revision, 1)
+        self.assertEqual(cmd_frozen.attempt_version, 1)
 
 
 if __name__ == "__main__":

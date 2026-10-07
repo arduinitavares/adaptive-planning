@@ -546,6 +546,41 @@ def validate_service_graph(
     if previous is not None:
         _validate_cross_revision(proposed, previous)  # type: ignore[arg-type]
 
+    task_status = proposed.get("status")
+    steps = proposed.get("steps")
+    in_progress_steps = [
+        s.get("id")
+        for s in steps
+        if isinstance(s, dict) and s.get("status") == "in-progress"
+    ] if isinstance(steps, list) else []
+
+    if task_status == "planning" and in_progress_steps:
+        raise PlanValidationError(
+            f"Plan status 'planning' cannot have in-progress steps: {in_progress_steps}"
+        )
+
+    if task_status in ("blocked", "stopped") and in_progress_steps:
+        stale_step_ids = {
+            att.step_id
+            for att in getattr(coordination, "attempts", ())
+            if getattr(att, "state", None) == "stale"
+        }
+        hold_step_ids = {
+            hold.step_id
+            for hold in getattr(coordination, "holds", ())
+            if getattr(hold, "step_id", None) is not None
+        }
+        has_general_hold = (
+            getattr(coordination, "has_plan_holds", False)
+            or getattr(coordination, "store_hold", False)
+            or any(getattr(h, "step_id", None) is None for h in getattr(coordination, "holds", ()))
+        )
+        for sid in in_progress_steps:
+            if not (has_general_hold or sid in stale_step_ids or sid in hold_step_ids):
+                raise PlanValidationError(
+                    f"In-progress step '{sid}' under '{task_status}' status requires backing stale attempt or hold in coordination"
+                )
+
 
 def validate_execution_scope(
     previous: Authorization,
@@ -897,13 +932,7 @@ def prepare_publication(
         "history": new_history,
     }
 
-    try:
-        validate_snapshot_fn(published_state, max_file_bytes=max_file_bytes, max_history=max_history)
-    except TypeError:
-        try:
-            validate_snapshot_fn(published_state, max_file_bytes=max_file_bytes)
-        except TypeError:
-            validate_snapshot_fn(published_state)
+    validate_snapshot_fn(published_state, max_file_bytes=max_file_bytes, max_history=max_history)
     try:
         serialized = json.dumps(published_state, indent=2, ensure_ascii=False, allow_nan=False).encode("utf-8")
     except (ValueError, UnicodeError, RecursionError) as exc:

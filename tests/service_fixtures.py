@@ -7,7 +7,7 @@ from __future__ import annotations
 import copy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 import uuid
 
 from adaptive_planning.types import (
@@ -39,6 +39,7 @@ from adaptive_planning.types import (
     BOOTSTRAP_KINDS,
     WORKER_KINDS,
     ORCHESTRATOR_KINDS,
+    parse_command,
 )
 
 
@@ -174,6 +175,7 @@ def checkpoint(
     affected: tuple[str, ...] = (),
     unbounded: bool = False,
     artifact_version: str = "v1",
+    relay: str | None = None,
 ) -> Checkpoint:
     """Create a synthetic Checkpoint fixture."""
     art = ArtifactRef(
@@ -208,7 +210,7 @@ def checkpoint(
         evidence=(ev,),
         reassessment=reassess,
         origin_worker="worker-a",
-        relay=None,
+        relay=relay,
         artifact=art,
     )
 
@@ -333,6 +335,38 @@ class ServiceFixture:
             if attempt.private and attempt_id:
                 self._cached_attempt_grants[attempt_id] = attempt.private
 
+        # Dynamic metadata refresh from live service if available
+        if refresh_metadata and self.service is not None:
+            if hasattr(self.service, "read_service_info"):
+                try:
+                    info = self.service.read_service_info()
+                    if hasattr(info, "epoch"):
+                        cmd_epoch = info.epoch
+                        self.epoch = info.epoch
+                except Exception:
+                    pass
+            if plan_id and hasattr(self.service, "read_plan"):
+                try:
+                    plan_view = self.service.read_plan(plan_id)
+                    if hasattr(plan_view, "metadata"):
+                        pm = plan_view.metadata
+                        generation = getattr(pm, "generation", generation)
+                        if expected_revision is None and hasattr(pm, "revision"):
+                            exp_rev = pm.revision
+                        ownership_version = getattr(pm, "ownership_version", ownership_version)
+                except Exception:
+                    pass
+            if plan_id and attempt_id and hasattr(self.service, "read_coordination"):
+                try:
+                    coord_page = self.service.read_coordination(plan_id)
+                    for item in getattr(coord_page, "items", ()):
+                        val = getattr(item, "value", None)
+                        if getattr(val, "attempt_id", None) == attempt_id:
+                            attempt_version = getattr(val, "version", attempt_version)
+                            break
+                except Exception:
+                    pass
+
         # Determine tokens based on normative matrix
         orchestrator_token: str | None = None
         attempt_token: str | None = None
@@ -341,7 +375,17 @@ class ServiceFixture:
             orchestrator_token = None
             attempt_token = None
         elif kind in WORKER_KINDS:
-            relay = payload.get("relay") if isinstance(payload, dict) else None
+            relay = None
+            if isinstance(payload, (dict, Mapping)):
+                if kind == "record_checkpoint":
+                    cp_val = payload.get("checkpoint")
+                    if isinstance(cp_val, Checkpoint):
+                        relay = cp_val.relay
+                    elif isinstance(cp_val, (dict, Mapping)):
+                        relay = cp_val.get("relay")
+                else:
+                    relay = payload.get("relay")
+
             if relay is not None:
                 if receipt and receipt.private and receipt.private.orchestrator_token:
                     orchestrator_token = receipt.private.orchestrator_token
@@ -361,23 +405,23 @@ class ServiceFixture:
                 orchestrator_token = self._cached_grants[plan_id].orchestrator_token
             attempt_token = None
 
-        cmd = CommandEnvelope(
-            kind=kind,
-            epoch=cmd_epoch,
-            key=req_key,
-            actor=actor,
-            plan_id=plan_id,
-            generation=generation,
-            expected_revision=exp_rev,
-            ownership_version=ownership_version,
-            orchestrator_token=orchestrator_token,
-            attempt_id=attempt_id,
-            attempt_token=attempt_token,
-            attempt_version=attempt_version,
-            definition_version=definition_version,
-            payload=payload,
-        )
-        return copy.deepcopy(cmd)
+        raw_cmd: dict[str, Any] = {
+            "kind": kind,
+            "epoch": cmd_epoch,
+            "key": req_key,
+            "actor": actor,
+            "plan_id": plan_id,
+            "generation": generation,
+            "expected_revision": exp_rev,
+            "ownership_version": ownership_version,
+            "orchestrator_token": orchestrator_token,
+            "attempt_id": attempt_id,
+            "attempt_token": attempt_token,
+            "attempt_version": attempt_version,
+            "definition_version": definition_version,
+            "payload": payload,
+        }
+        return parse_command(raw_cmd)
 
     def create(
         self,
@@ -476,10 +520,8 @@ def make_service(directory: Path, clock: FakeClock | None = None) -> ServiceFixt
     # Lazy import service components
     from adaptive_planning.app import PlanningService
     from adaptive_planning.store import Store
-    from adaptive_planning.config import Config
 
-    cfg = Config(data_dir=directory)
-    store = Store(directory / "planning.sqlite")
-    service = PlanningService(cfg, store=store, clock=clock)
-    epoch = store.get_epoch() if hasattr(store, "get_epoch") else "epoch-0"
+    store = Store(directory / "planning.sqlite", clock, host_id="synthetic-host")
+    service = PlanningService(store, base_url="http://127.0.0.1:8000", clock=clock)
+    epoch = store.installation_epoch()
     return ServiceFixture(service=service, store=store, directory=directory, clock=clock, epoch=epoch)
