@@ -172,6 +172,7 @@ END;""",
     FOREIGN KEY (host_id, resource_id) REFERENCES resources (host_id, resource_id) ON DELETE CASCADE
 );""",
     """CREATE INDEX IF NOT EXISTS idx_aliases_host ON aliases (host_id);""",
+    """CREATE INDEX IF NOT EXISTS idx_aliases_host_resource ON aliases (host_id, resource_id);""",
     # 9. absent_host_work
     """CREATE TABLE IF NOT EXISTS absent_host_work (
     absent_work_id TEXT PRIMARY KEY,

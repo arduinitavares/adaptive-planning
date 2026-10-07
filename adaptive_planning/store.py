@@ -172,6 +172,10 @@ class Store:
                 conn.close()
             except Exception:
                 pass
+            try:
+                self._enforce_file_permissions()
+            except Exception:
+                pass
 
     def installation_epoch(self) -> Epoch:
         """Return the immutable installation epoch."""
@@ -245,8 +249,7 @@ class Store:
             self._enforce_file_permissions()
 
             # Read latest event sequence inside the transaction before COMMIT
-            seq_row = conn.execute("SELECT COALESCE(MAX(sequence), 0) FROM events").fetchone()
-            latest_seq = seq_row[0] if seq_row else 0
+            latest_seq = self.get_store_sequence(conn)
 
             conn.execute("COMMIT")
             committed = True
@@ -267,6 +270,10 @@ class Store:
                     conn.close()
                 except Exception:
                     pass
+            try:
+                self._enforce_file_permissions()
+            except Exception:
+                pass
 
         # Post-commit sequence-only notification; post-commit cleanup/notification failures cannot replace result
         try:

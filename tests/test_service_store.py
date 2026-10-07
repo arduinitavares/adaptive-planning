@@ -46,8 +46,8 @@ class TestService(unittest.TestCase):
             )
             self.assertEqual(store.get_store_sequence(), 2)
 
-            # Reopen store
-            reopened = Store(path, clock, host_id="test-host")
+            # Reopen store without specifying host_id: must recover stored host_id
+            reopened = Store(path, clock)
             self.assertEqual(reopened.installation_epoch(), epoch)
             self.assertEqual(reopened.host_id, host)
 
@@ -281,7 +281,7 @@ class TestService(unittest.TestCase):
             raw.commit()
             raw.close()
 
-            reopened = Store(path, clock)
+            # 1. Existing already-open store instance refuses newer schema on write
             callback_executed = False
 
             def mutating_callback(db: sqlite3.Connection) -> None:
@@ -293,9 +293,26 @@ class TestService(unittest.TestCase):
                 )
 
             with self.assertRaises(DomainError) as ctx:
-                reopened.write(mutating_callback)
+                store.write(mutating_callback)
             self.assertEqual(ctx.exception.code, "schema_newer")
             self.assertFalse(callback_executed, "Mutating callback must not run on newer schema")
+
+            # 2. Reopened store also refuses newer schema on write
+            reopened = Store(path, clock)
+            reopened_callback_executed = False
+
+            def reopened_mutating_callback(db: sqlite3.Connection) -> None:
+                nonlocal reopened_callback_executed
+                reopened_callback_executed = True
+                db.execute(
+                    "INSERT INTO plans (plan_id, generation, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                    ("p-mut2", "g-mut2", clock().isoformat(), clock().isoformat()),
+                )
+
+            with self.assertRaises(DomainError) as ctx:
+                reopened.write(reopened_mutating_callback)
+            self.assertEqual(ctx.exception.code, "schema_newer")
+            self.assertFalse(reopened_callback_executed, "Mutating callback must not run on newer schema after reopen")
 
             # Verify no mutation was persisted
             raw_check = sqlite3.connect(str(path))
@@ -840,6 +857,16 @@ class TestService(unittest.TestCase):
                     "VALUES (?, ?, ?, ?, 'unresolved', ?)",
                     ("u-orphan", "res-orphan", "ab-orphan", "workspace", now),
                 )
+                # Released history row: must also be conservatively retained against parent deletion
+                db.execute(
+                    "INSERT INTO attempts (plan_id, attempt_id, step_id) VALUES (?, ?, ?)",
+                    ("p1", "a-rel", "s1"),
+                )
+                db.execute(
+                    "INSERT INTO resource_uses (use_id, resource_id, plan_id, attempt_id, scope, status, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'released', ?)",
+                    ("u-released", "res-normal", "p1", "a-rel", "workspace", now),
+                )
                 db.execute(
                     "INSERT INTO events (kind, actor, published_at, payload) VALUES (?, ?, ?, ?)",
                     ("create_plan", "tester", now, "{}"),
@@ -847,7 +874,7 @@ class TestService(unittest.TestCase):
 
             store.write(setup)
 
-            # 1. Attempt to delete res-normal (referenced by u-normal)
+            # 1. Attempt to delete res-normal (referenced by u-normal and u-released)
             with self.assertRaises(sqlite3.IntegrityError):
                 store.write(lambda db: db.execute("DELETE FROM resources WHERE resource_id = 'res-normal'"))
 
@@ -855,21 +882,25 @@ class TestService(unittest.TestCase):
             with self.assertRaises(sqlite3.IntegrityError):
                 store.write(lambda db: db.execute("DELETE FROM attempts WHERE attempt_id = 'a1'"))
 
-            # 3. Attempt to delete plan p1 (cascades to a1, which is restricted by u-normal)
+            # 3. Attempt to delete attempt a-rel (referenced by released u-released: history must be retained)
+            with self.assertRaises(sqlite3.IntegrityError):
+                store.write(lambda db: db.execute("DELETE FROM attempts WHERE attempt_id = 'a-rel'"))
+
+            # 4. Attempt to delete plan p1 (cascades to attempts, which are restricted by u-normal / u-released)
             with self.assertRaises(sqlite3.IntegrityError):
                 store.write(lambda db: db.execute("DELETE FROM plans WHERE plan_id = 'p1'"))
 
-            # 4. Attempt to delete res-orphan (referenced by absent_host_work and u-orphan)
+            # 5. Attempt to delete res-orphan (referenced by absent_host_work and u-orphan)
             with self.assertRaises(sqlite3.IntegrityError):
                 store.write(lambda db: db.execute("DELETE FROM resources WHERE resource_id = 'res-orphan'"))
 
-            # 5. Attempt to delete ab-orphan (referenced by u-orphan)
+            # 6. Attempt to delete ab-orphan (referenced by u-orphan)
             with self.assertRaises(sqlite3.IntegrityError):
                 store.write(lambda db: db.execute("DELETE FROM absent_host_work WHERE absent_work_id = 'ab-orphan'"))
 
-            # Assert all uses and events remain intact
+            # Assert all uses (including released) and events remain intact
             uses = store.read(lambda db: [r[0] for r in db.execute("SELECT use_id FROM resource_uses ORDER BY use_id").fetchall()])
-            self.assertEqual(uses, ["u-normal", "u-orphan"])
+            self.assertEqual(uses, ["u-normal", "u-orphan", "u-released"])
             events_count = store.read(lambda db: db.execute("SELECT count(*) FROM events").fetchone()[0])
             self.assertEqual(events_count, 1)
 
@@ -992,10 +1023,11 @@ class TestService(unittest.TestCase):
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
             store = Store(path, clock)
 
-            # 1. Post-commit chmod failure: write succeeds and returns value
+            # 1. Post-commit chmod failure: write succeeds and returns value; proves late chmod is called & caught
             real_connect = sqlite3.connect
             real_chmod = os.chmod
             committed = False
+            chmod_after_commit_called = False
 
             class CommitTrackingConn:
                 def __init__(self, real_c: sqlite3.Connection) -> None:
@@ -1016,6 +1048,8 @@ class TestService(unittest.TestCase):
 
             def selective_chmod(target_path: os.PathLike[str] | str, mode: int, *args: object, **kwargs: object) -> None:
                 if committed:
+                    nonlocal chmod_after_commit_called
+                    chmod_after_commit_called = True
                     raise OSError("Late chmod EPERM")
                 return real_chmod(target_path, mode, *args, **kwargs)
 
@@ -1030,26 +1064,61 @@ class TestService(unittest.TestCase):
                  patch("os.chmod", side_effect=selective_chmod):
                 result = store.write(test_write)
                 self.assertEqual(result, "write_success")
+                self.assertTrue(chmod_after_commit_called, "Post-commit chmod must be invoked during cleanup")
 
             # Verify the write was actually committed
             seq = store.read(lambda db: db.execute("SELECT count(*) FROM events").fetchone()[0])
             self.assertEqual(seq, 1)
 
-            # 2. Before-commit chmod failure: fails closed and rolls back
+            # 2. Post-commit close failure: close failure in finally does not mask successful result
+            class FailingCloseConn:
+                def __init__(self, real_c: sqlite3.Connection) -> None:
+                    self._c = real_c
+
+                def close(self) -> None:
+                    self._c.close()
+                    raise sqlite3.OperationalError("Simulated post-commit close error")
+
+                def __getattr__(self, name: str):
+                    return getattr(self._c, name)
+
+            with patch("sqlite3.connect", side_effect=lambda *args, **kwargs: FailingCloseConn(real_connect(*args, **kwargs))):
+                res2 = store.write(
+                    lambda db: db.execute(
+                        "INSERT INTO events (kind, actor, published_at, payload) VALUES (?, ?, ?, ?)",
+                        ("revise_plan", "tester", clock().isoformat(), "{}"),
+                    )
+                )
+                self.assertIsNotNone(res2)
+
+            seq2 = store.read(lambda db: db.execute("SELECT count(*) FROM events").fetchone()[0])
+            self.assertEqual(seq2, 2)
+
+            # 3. Before-commit chmod failure: mutating operation runs, but pre-commit chmod fails; transaction rolls back
+            mutating_called = False
+
             def fail_before_commit_write(db: sqlite3.Connection) -> None:
+                nonlocal mutating_called
+                mutating_called = True
                 db.execute(
                     "INSERT INTO events (kind, actor, published_at, payload) VALUES (?, ?, ?, ?)",
                     ("revise_plan", "tester", clock().isoformat(), "{}"),
                 )
 
-            with patch("os.chmod", side_effect=OSError("Pre-commit chmod EPERM")):
+            def failing_precommit_chmod(target_path: os.PathLike[str] | str, mode: int, *args: object, **kwargs: object) -> None:
+                if mutating_called:
+                    raise OSError("Pre-commit chmod EPERM")
+                return real_chmod(target_path, mode, *args, **kwargs)
+
+            with patch("os.chmod", side_effect=failing_precommit_chmod):
                 with self.assertRaises(DomainError) as ctx:
                     store.write(fail_before_commit_write)
                 self.assertEqual(ctx.exception.code, "invalid")
+                self.assertTrue(mutating_called, "Mutating operation must run before pre-commit chmod failure")
 
-            # Verify the second event was rolled back
+            # Verify the attempted third event was rolled back
             seq_after = store.read(lambda db: db.execute("SELECT count(*) FROM events").fetchone()[0])
-            self.assertEqual(seq_after, 1)
+            self.assertEqual(seq_after, 2)
 
     def test_constructor_post_commit_cleanup_failure_does_not_fail(self) -> None:
         """I4: Constructor cleanup failure after installation commit does not report initialized store as failed."""
@@ -1060,6 +1129,7 @@ class TestService(unittest.TestCase):
             real_connect = sqlite3.connect
             real_chmod = os.chmod
             committed = False
+            constructor_chmod_after_commit_called = False
 
             class CommitTrackingConn:
                 def __init__(self, real_c: sqlite3.Connection) -> None:
@@ -1080,6 +1150,8 @@ class TestService(unittest.TestCase):
 
             def selective_chmod(target_path: os.PathLike[str] | str, mode: int, *args: object, **kwargs: object) -> None:
                 if committed:
+                    nonlocal constructor_chmod_after_commit_called
+                    constructor_chmod_after_commit_called = True
                     raise OSError("Late constructor chmod EPERM")
                 return real_chmod(target_path, mode, *args, **kwargs)
 
@@ -1087,6 +1159,7 @@ class TestService(unittest.TestCase):
                  patch("os.chmod", side_effect=selective_chmod):
                 store = Store(path, clock)
                 self.assertIsNotNone(store.installation_epoch())
+                self.assertTrue(constructor_chmod_after_commit_called, "Post-commit chmod must be invoked during constructor cleanup")
 
     def test_concurrent_umask_restoration(self) -> None:
         """I4: Concurrent Store initialization preserves process umask deterministically."""
@@ -1291,6 +1364,22 @@ class TestService(unittest.TestCase):
                 )
             )
 
+            # Real SHA-256 hex digest succeeds and round-trips identically
+            import hashlib
+            real_sha = hashlib.sha256(b"canonical-envelope-bytes").hexdigest()
+            self.assertEqual(len(real_sha), 64)
+            store.write(
+                lambda db: db.execute(
+                    "INSERT INTO requests (request_id, epoch, key, command_digest, response_payload, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    ("req-real-sha", epoch, "k-real-sha", real_sha, "{}", now),
+                )
+            )
+            stored_sha = store.read(
+                lambda db: db.execute("SELECT command_digest FROM requests WHERE request_id = 'req-real-sha'").fetchone()[0]
+            )
+            self.assertEqual(stored_sha, real_sha)
+
             # Missing (NULL) command_digest is rejected
             with self.assertRaises(sqlite3.IntegrityError):
                 store.write(
@@ -1298,6 +1387,16 @@ class TestService(unittest.TestCase):
                         "INSERT INTO requests (request_id, epoch, key, command_digest, response_payload, created_at) "
                         "VALUES (?, ?, ?, ?, ?, ?)",
                         ("req-null", epoch, "k-null", None, "{}", now),
+                    )
+                )
+
+            # Empty string (< 64) is rejected
+            with self.assertRaises(sqlite3.IntegrityError):
+                store.write(
+                    lambda db: db.execute(
+                        "INSERT INTO requests (request_id, epoch, key, command_digest, response_payload, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        ("req-empty", epoch, "k-empty", "", "{}", now),
                     )
                 )
 
