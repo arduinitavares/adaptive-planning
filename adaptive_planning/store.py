@@ -13,6 +13,9 @@ from adaptive_planning.types import Clock, DomainError, Epoch
 
 T = TypeVar("T")
 
+# Process-wide lock to serialize temporary umask mutations across threads
+_UMASK_LOCK = threading.Lock()
+
 
 class Store:
     """Atomic SQLite planning authority, epochs, and event projection."""
@@ -24,7 +27,7 @@ class Store:
         self._listeners: list[Callable[[int], None]] = []
         self._lock = threading.Lock()
 
-        # Enforce directory permissions (0700) with umask 0077
+        # Enforce directory permissions (0700) with umask 0077 under process lock
         self._ensure_storage_environment()
 
         # Initialize or load installation metadata atomically
@@ -34,23 +37,24 @@ class Store:
         self._init_installation()
 
     def _ensure_storage_environment(self) -> None:
-        old_umask = os.umask(0o077)
-        try:
-            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with _UMASK_LOCK:
+            old_umask = os.umask(0o077)
             try:
-                os.chmod(self.path.parent, 0o700)
-            except OSError as e:
-                raise DomainError(
-                    "invalid",
-                    f"Failed to enforce private storage directory mode 0700 on {self.path.parent}: {e}",
-                ) from e
-            if stat.S_IMODE(os.stat(self.path.parent).st_mode) != 0o700:
-                raise DomainError(
-                    "invalid",
-                    f"Directory permissions {oct(stat.S_IMODE(os.stat(self.path.parent).st_mode))} do not match 0700",
-                )
-        finally:
-            os.umask(old_umask)
+                self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                try:
+                    os.chmod(self.path.parent, 0o700)
+                except OSError as e:
+                    raise DomainError(
+                        "invalid",
+                        f"Failed to enforce private storage directory mode 0700 on {self.path.parent}: {e}",
+                    ) from e
+                if stat.S_IMODE(os.stat(self.path.parent).st_mode) != 0o700:
+                    raise DomainError(
+                        "invalid",
+                        f"Directory permissions {oct(stat.S_IMODE(os.stat(self.path.parent).st_mode))} do not match 0700",
+                    )
+            finally:
+                os.umask(old_umask)
 
     def _enforce_file_permissions(self) -> None:
         try:
@@ -75,37 +79,38 @@ class Store:
                     raise DomainError("invalid", f"Failed to set file mode 0600 on {p}: {e}") from e
 
     def _connect(self) -> sqlite3.Connection:
-        old_umask = os.umask(0o077)
         conn: sqlite3.Connection | None = None
-        try:
-            conn = sqlite3.connect(str(self.path), timeout=2.0, isolation_level=None)
-            conn.execute("PRAGMA foreign_keys = ON")
-            conn.execute("PRAGMA busy_timeout = 2000")
-            conn.execute("PRAGMA journal_mode = WAL")
-            conn.execute("PRAGMA synchronous = FULL")
-            self._enforce_file_permissions()
-            return conn
-        except sqlite3.OperationalError as e:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            if "locked" in str(e).lower() or "busy" in str(e).lower():
-                raise DomainError("busy", f"Database is busy during connection setup: {e}") from e
-            raise
-        except Exception:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            raise
-        finally:
-            os.umask(old_umask)
+        with _UMASK_LOCK:
+            old_umask = os.umask(0o077)
+            try:
+                conn = sqlite3.connect(str(self.path), timeout=2.0, isolation_level=None)
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute("PRAGMA busy_timeout = 2000")
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("PRAGMA synchronous = FULL")
+                return conn
+            except sqlite3.OperationalError as e:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                if "locked" in str(e).lower() or "busy" in str(e).lower():
+                    raise DomainError("busy", f"Database is busy during connection setup: {e}") from e
+                raise
+            except Exception:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                raise
+            finally:
+                os.umask(old_umask)
 
     def _init_installation(self) -> None:
         conn = self._connect()
+        committed = False
         try:
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -129,7 +134,9 @@ class Store:
                     "VALUES (1, ?, ?, ?, 'authority', ?)",
                     (epoch, SCHEMA_VERSION, actual_host_id, created_at),
                 )
+                self._enforce_file_permissions()
                 conn.execute("COMMIT")
+                committed = True
                 self._epoch = epoch
                 self._host_id = actual_host_id
                 self._schema_version = SCHEMA_VERSION
@@ -147,20 +154,24 @@ class Store:
                         "invalid",
                         f"Host ID mismatch: stored {stored_host_id!r} != requested {self._requested_host_id!r}",
                     )
+                self._enforce_file_permissions()
                 conn.execute("COMMIT")
+                committed = True
                 self._epoch = epoch
                 self._host_id = stored_host_id
                 self._schema_version = schema_ver
         except Exception:
-            if conn.in_transaction:
+            if not committed and conn.in_transaction:
                 try:
                     conn.execute("ROLLBACK")
                 except Exception:
                     pass
             raise
         finally:
-            conn.close()
-            self._enforce_file_permissions()
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def installation_epoch(self) -> Epoch:
         """Return the immutable installation epoch."""
@@ -206,7 +217,10 @@ class Store:
     def write(self, operation: Callable[[sqlite3.Connection], T]) -> T:
         """Execute a short write operation in an exclusive transaction."""
         conn: sqlite3.Connection | None = None
+        committed = False
         try:
+            # Enforce file permissions before mutation
+            self._enforce_file_permissions()
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -226,29 +240,41 @@ class Store:
                 )
 
             result = operation(conn)
-            conn.execute("COMMIT")
 
-            # Sequence-only notification happens after successful commit
+            # Enforce file permissions (for any newly created WAL/SHM files) before COMMIT
+            self._enforce_file_permissions()
+
+            # Read latest event sequence inside the transaction before COMMIT
             seq_row = conn.execute("SELECT COALESCE(MAX(sequence), 0) FROM events").fetchone()
             latest_seq = seq_row[0] if seq_row else 0
-            self._notify_listeners(latest_seq)
-            return result
+
+            conn.execute("COMMIT")
+            committed = True
         except Exception as e:
-            if conn is not None and conn.in_transaction:
-                try:
-                    conn.execute("ROLLBACK")
-                except Exception:
-                    pass
-            if isinstance(e, sqlite3.OperationalError) and ("locked" in str(e).lower() or "busy" in str(e).lower()):
-                raise DomainError("busy", f"Database is busy: {e}") from e
-            raise
+            if conn is not None and not committed:
+                if conn.in_transaction:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+            if not committed:
+                if isinstance(e, sqlite3.OperationalError) and ("locked" in str(e).lower() or "busy" in str(e).lower()):
+                    raise DomainError("busy", f"Database is busy: {e}") from e
+                raise
         finally:
             if conn is not None:
                 try:
                     conn.close()
                 except Exception:
                     pass
-            self._enforce_file_permissions()
+
+        # Post-commit sequence-only notification; post-commit cleanup/notification failures cannot replace result
+        try:
+            self._notify_listeners(latest_seq)
+        except Exception:
+            pass
+
+        return result
 
     def read(self, operation: Callable[[sqlite3.Connection], T]) -> T:
         """Execute a read operation in a single consistent SQLite snapshot."""
@@ -264,7 +290,10 @@ class Store:
 
             result = operation(conn)
             if conn.in_transaction:
-                conn.execute("ROLLBACK")
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
             return result
         except sqlite3.OperationalError as e:
             if "locked" in str(e).lower() or "busy" in str(e).lower():

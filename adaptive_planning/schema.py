@@ -53,6 +53,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     stopped_at TEXT,
     payload TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY (plan_id, attempt_id),
+    UNIQUE (plan_id, attempt_id, step_id),
     FOREIGN KEY (plan_id, step_id) REFERENCES steps (plan_id, step_id) ON DELETE CASCADE
 );""",
     # 5. capabilities
@@ -72,12 +73,54 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     resource_id TEXT PRIMARY KEY,
     host_id TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('repository', 'workspace', 'external')),
+    repository_id TEXT,
     physical_identity TEXT,
     canonical_path TEXT,
     status TEXT NOT NULL DEFAULT 'active',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    CHECK (repository_id IS NULL OR kind = 'workspace'),
+    UNIQUE (host_id, resource_id),
+    FOREIGN KEY (host_id, repository_id) REFERENCES resources (host_id, resource_id) ON DELETE RESTRICT
 );""",
     """CREATE INDEX IF NOT EXISTS idx_resources_host ON resources (host_id);""",
+    """CREATE INDEX IF NOT EXISTS idx_resources_host_physical ON resources (host_id, physical_identity);""",
+    """CREATE TRIGGER IF NOT EXISTS trg_resources_validate_parent_insert
+BEFORE INSERT ON resources
+WHEN NEW.repository_id IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN NOT EXISTS (
+            SELECT 1 FROM resources
+            WHERE resource_id = NEW.repository_id
+              AND host_id = NEW.host_id
+              AND kind = 'repository'
+        )
+        THEN RAISE(ABORT, 'Parent repository must exist on same host with kind repository')
+    END;
+END;""",
+    """CREATE TRIGGER IF NOT EXISTS trg_resources_validate_parent_update
+BEFORE UPDATE OF repository_id, host_id, kind ON resources
+WHEN NEW.repository_id IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN NOT EXISTS (
+            SELECT 1 FROM resources
+            WHERE resource_id = NEW.repository_id
+              AND host_id = NEW.host_id
+              AND kind = 'repository'
+        )
+        THEN RAISE(ABORT, 'Parent repository must exist on same host with kind repository')
+    END;
+END;""",
+    """CREATE TRIGGER IF NOT EXISTS trg_resources_prevent_parent_kind_change
+BEFORE UPDATE OF kind ON resources
+WHEN OLD.kind = 'repository' AND NEW.kind != 'repository'
+BEGIN
+    SELECT CASE
+        WHEN EXISTS (SELECT 1 FROM resources WHERE repository_id = OLD.resource_id)
+        THEN RAISE(ABORT, 'Cannot change kind of repository with dependent workspace resources')
+    END;
+END;""",
     # 7. resource_redirects
     """CREATE TABLE IF NOT EXISTS resource_redirects (
     retired_id TEXT PRIMARY KEY,
@@ -126,7 +169,7 @@ END;""",
     resource_id TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT '',
     UNIQUE (host_id, canonical_path),
-    FOREIGN KEY (resource_id) REFERENCES resources (resource_id) ON DELETE CASCADE
+    FOREIGN KEY (host_id, resource_id) REFERENCES resources (host_id, resource_id) ON DELETE CASCADE
 );""",
     """CREATE INDEX IF NOT EXISTS idx_aliases_host ON aliases (host_id);""",
     # 9. absent_host_work
@@ -138,7 +181,8 @@ END;""",
     declared_identity TEXT,
     status TEXT NOT NULL DEFAULT 'unresolved',
     created_at TEXT NOT NULL DEFAULT '',
-    FOREIGN KEY (resource_id) REFERENCES resources (resource_id) ON DELETE SET NULL
+    UNIQUE (absent_work_id, scope),
+    FOREIGN KEY (resource_id) REFERENCES resources (resource_id) ON DELETE RESTRICT
 );""",
     """CREATE INDEX IF NOT EXISTS idx_absent_host_work_host ON absent_host_work (host_id);""",
     # 10. store_hold_reasons
@@ -160,9 +204,9 @@ END;""",
     scope TEXT NOT NULL CHECK (scope IN ('repository', 'workspace', 'external')),
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'unresolved', 'released')),
     created_at TEXT NOT NULL DEFAULT '',
-    FOREIGN KEY (resource_id) REFERENCES resources (resource_id) ON DELETE CASCADE,
-    FOREIGN KEY (plan_id, attempt_id) REFERENCES attempts (plan_id, attempt_id) ON DELETE CASCADE,
-    FOREIGN KEY (absent_work_id) REFERENCES absent_host_work (absent_work_id) ON DELETE CASCADE,
+    FOREIGN KEY (resource_id) REFERENCES resources (resource_id) ON DELETE RESTRICT,
+    FOREIGN KEY (plan_id, attempt_id) REFERENCES attempts (plan_id, attempt_id) ON DELETE RESTRICT,
+    FOREIGN KEY (absent_work_id, scope) REFERENCES absent_host_work (absent_work_id, scope) ON DELETE RESTRICT,
     CHECK (
         (plan_id IS NOT NULL AND attempt_id IS NOT NULL AND absent_work_id IS NULL)
         OR
@@ -173,6 +217,32 @@ END;""",
 WHERE status IN ('active', 'unresolved');""",
     """CREATE INDEX IF NOT EXISTS idx_resource_uses_plan_attempt ON resource_uses (plan_id, attempt_id);""",
     """CREATE INDEX IF NOT EXISTS idx_resource_uses_absent ON resource_uses (absent_work_id);""",
+    """CREATE TRIGGER IF NOT EXISTS trg_resource_uses_scope_insert
+BEFORE INSERT ON resource_uses
+WHEN NEW.absent_work_id IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN EXISTS (
+            SELECT 1 FROM absent_host_work
+            WHERE absent_work_id = NEW.absent_work_id
+              AND scope != NEW.scope
+        )
+        THEN RAISE(ABORT, 'Orphan resource_use scope must match absent_host_work scope')
+    END;
+END;""",
+    """CREATE TRIGGER IF NOT EXISTS trg_resource_uses_scope_update
+BEFORE UPDATE OF absent_work_id, scope ON resource_uses
+WHEN NEW.absent_work_id IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN EXISTS (
+            SELECT 1 FROM absent_host_work
+            WHERE absent_work_id = NEW.absent_work_id
+              AND scope != NEW.scope
+        )
+        THEN RAISE(ABORT, 'Orphan resource_use scope must match absent_host_work scope')
+    END;
+END;""",
     # 12. availability
     """CREATE TABLE IF NOT EXISTS availability (
     plan_id TEXT NOT NULL,
@@ -184,8 +254,7 @@ WHERE status IN ('active', 'unresolved');""",
     evidence TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (plan_id, prerequisite, result_version),
-    FOREIGN KEY (plan_id, prerequisite) REFERENCES steps (plan_id, step_id) ON DELETE CASCADE,
-    FOREIGN KEY (plan_id, result_version) REFERENCES result_versions (plan_id, result_version) ON DELETE CASCADE
+    FOREIGN KEY (plan_id, result_version, prerequisite) REFERENCES result_versions (plan_id, result_version, step_id) ON DELETE CASCADE
 );""",
     # 13. checkpoints
     """CREATE TABLE IF NOT EXISTS checkpoints (
@@ -225,8 +294,7 @@ WHERE status IN ('active', 'unresolved');""",
     artifact TEXT NOT NULL,
     verification_use_id TEXT,
     created_at TEXT NOT NULL DEFAULT '',
-    FOREIGN KEY (plan_id, attempt_id) REFERENCES attempts (plan_id, attempt_id) ON DELETE CASCADE,
-    FOREIGN KEY (plan_id, step_id) REFERENCES steps (plan_id, step_id) ON DELETE CASCADE
+    FOREIGN KEY (plan_id, attempt_id, step_id) REFERENCES attempts (plan_id, attempt_id, step_id) ON DELETE CASCADE
 );""",
     # 16. result_versions
     """CREATE TABLE IF NOT EXISTS result_versions (
@@ -239,6 +307,7 @@ WHERE status IN ('active', 'unresolved');""",
     digest TEXT,
     created_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (plan_id, result_version),
+    UNIQUE (plan_id, result_version, step_id),
     FOREIGN KEY (plan_id, step_id) REFERENCES steps (plan_id, step_id) ON DELETE CASCADE
 );""",
     # 17. events
@@ -260,6 +329,7 @@ WHERE status IN ('active', 'unresolved');""",
     request_id TEXT PRIMARY KEY,
     epoch TEXT NOT NULL,
     key TEXT NOT NULL,
+    command_digest TEXT NOT NULL CHECK (length(command_digest) = 64),
     plan_id TEXT,
     response_payload TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT '',
