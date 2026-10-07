@@ -334,6 +334,8 @@ class ServiceFixture:
             definition_version = attempt.committed.get("definition_version", "v1")
             if attempt.private and attempt_id:
                 self._cached_attempt_grants[attempt_id] = attempt.private
+            if plan_id is None and attempt.committed_metadata.plan_id:
+                plan_id = attempt.committed_metadata.plan_id
 
         # Dynamic metadata refresh from live service if requested
         if refresh_metadata:

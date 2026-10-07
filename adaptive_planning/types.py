@@ -41,6 +41,8 @@ class DomainError(ValueError):
 
 
 def _freeze_value(val: Any) -> Any:
+    if isinstance(val, FrozenDict):
+        return val
     if isinstance(val, Mapping):
         return FrozenDict(val)
     elif isinstance(val, (list, tuple)):
@@ -559,6 +561,8 @@ class MutationReceipt:
     private: PrivateGrant | None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.committed, Mapping):
+            raise DomainError("invalid", f"MutationReceipt committed must be a mapping, got {type(self.committed).__name__}")
         object.__setattr__(self, "committed", _validate_and_freeze_json_tree(self.committed))
 
 

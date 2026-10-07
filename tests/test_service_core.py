@@ -1899,6 +1899,26 @@ class TestServiceCore(unittest.TestCase):
             MutationReceipt(committed={"bad": {1, 2}}, committed_metadata=meta, current_metadata=meta, replayed=False, private=None)
         self.assertEqual(ctx_rcpt.exception.code, "invalid")
 
+        # 3b. Non-mapping root in MutationReceipt committed (scalars, lists, tuples, None) must be rejected
+        for bad_root in (7, True, "scalar-string", [1, 2], (), None):
+            with self.assertRaises(DomainError) as ctx_root:
+                MutationReceipt(committed=bad_root, committed_metadata=meta, current_metadata=meta, replayed=False, private=None)
+            self.assertEqual(ctx_root.exception.code, "invalid")
+
+        # 3c. Non-mapping root in import_plan original_snapshot (scalars, lists, tuples) must be rejected
+        for bad_snap_root in (7, True, "scalar-string", [1, 2], ()):
+            with self.assertRaises(DomainError) as ctx_snap:
+                parse_command({
+                    "kind": "import_plan", "epoch": "epoch-1", "key": "k-snap", "actor": "orch",
+                    "payload": {
+                        "host_id": "h", "source_directory_id": "d1", "source_directory_claim": None,
+                        "original_task_id": "t1", "original_snapshot": bad_snap_root,
+                        "provenance": {"path": "p", "branch": None, "commit": None, "version": "v1", "task_id": None},
+                        "writers_stopped": "yes", "known_contexts": {},
+                    }
+                })
+            self.assertEqual(ctx_snap.exception.code, "invalid")
+
         # 4. PlanDraft.workflow rejects non-string values
         with self.assertRaises(DomainError) as ctx_wf:
             d = draft()
