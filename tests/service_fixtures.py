@@ -97,8 +97,8 @@ def draft(
         )
     auth = Authorization(
         mode=mode,  # type: ignore[arg-type]
-        interval="synthetic-interval-0",
-        since_revision=1,
+        interval="",
+        since_revision=0,
         note="Synthetic authorization for testing",
         baseline=(),
         claimed=None,
