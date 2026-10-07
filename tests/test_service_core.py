@@ -1568,6 +1568,22 @@ class TestServiceCore(unittest.TestCase):
         self.assertEqual(cmd_refreshed.attempt_version, 4)
         self.assertEqual(cmd_refreshed.ownership_version, 1)
 
+        # attempt-only command (receipt=None) resolves plan scope from attempt and refreshes generation, revision, attempt version
+        cmd_attempt_only = fixture.command(
+            "report_activity",
+            {"origin_worker": "worker-a", "relay": None, "observed_activity": "working"},
+            receipt=None,
+            attempt=attempt_receipt,
+            refresh_metadata=True,
+        )
+        self.assertEqual(cmd_attempt_only.plan_id, "p-1")
+        self.assertEqual(cmd_attempt_only.epoch, "epoch-current")
+        self.assertEqual(cmd_attempt_only.generation, "gen-curr")
+        self.assertEqual(cmd_attempt_only.expected_revision, 5)
+        self.assertEqual(cmd_attempt_only.attempt_version, 4)
+        self.assertEqual(cmd_attempt_only.attempt_token, "att-tok")
+        self.assertIsNone(cmd_attempt_only.orchestrator_token)
+
         # refresh_metadata=False freezes original metadata and attempt version (1)
         cmd_frozen = fixture.command(
             "report_activity",
