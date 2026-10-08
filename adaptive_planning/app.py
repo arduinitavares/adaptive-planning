@@ -15,7 +15,7 @@ from starlette.routing import Mount
 from adaptive_planning.admin import load_service_token
 from adaptive_planning.config import Config, RequestBoundary, http_allowlist
 
-from adaptive_planning import plans, resources
+from adaptive_planning import attempts, plans, resources
 from adaptive_planning.ownership import command_relay, require_kind_capabilities, require_orchestrator
 from adaptive_planning.store import Store
 from adaptive_planning.types import (
@@ -30,13 +30,14 @@ from adaptive_planning.types import (
     ReadyStep,
 )
 
-# Planning, ownership and identity mutations are enabled; execution remains disabled.
+# Bounded assignment is enabled; worker execution remains disabled until the start gates exist.
 HANDLERS: dict[str, Callable[[sqlite3.Connection, Command], MutationReceipt]] = {
     "create_plan": plans.create_plan,
     "revise_plan": plans.revise_plan,
     "takeover": plans.takeover,
     "register_resource": resources.register_resource,
     "reconcile_resources": resources.reconcile_resources,
+    "assign_step": attempts.assign_step,
 }
 
 
@@ -110,7 +111,7 @@ class PlanningService:
         return self._run_read(lambda db: plans.project_plan(db, plan_id))  # type: ignore[return-value]
 
     def list_ready(self, plan_id: PlanId) -> tuple[ReadyStep, ...]:
-        return self._run_read(lambda db: plans.list_ready(db, plan_id))  # type: ignore[return-value]
+        return self._run_read(lambda db: attempts.ready_steps(db, plan_id))  # type: ignore[return-value]
 
     def read_events(
         self, plan_id: PlanId, after: int = 0, limit: int = plans.EVENTS_LIMIT_DEFAULT,

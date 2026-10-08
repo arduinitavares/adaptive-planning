@@ -90,6 +90,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     UNIQUE (plan_id, attempt_id, step_id),
     FOREIGN KEY (plan_id, step_id) REFERENCES steps (plan_id, step_id) ON DELETE CASCADE
 );""",
+    """CREATE INDEX IF NOT EXISTS idx_attempts_step_history ON attempts (plan_id, step_id);""",
     # 5. capabilities
     """CREATE TABLE IF NOT EXISTS capabilities (
     capability_id TEXT PRIMARY KEY,

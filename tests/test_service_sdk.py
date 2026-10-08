@@ -24,6 +24,7 @@ from mcp.types import TextContent
 import uvicorn
 
 from adaptive_planning import plans
+from adaptive_planning.types import DomainError
 from tests.service_fixtures import draft, make_service
 from tests.test_service_http import CapturedLogs, SYNTHETIC_TOKEN
 
@@ -385,7 +386,10 @@ async def running_service(app, sock):
 
 @contextmanager
 def _private_sdk_client_logs(captured):
-    """Keep client wire records in the supplied memory capture for this test only.
+    """Keep client wire records in the supplied memory capture during serial tests.
+
+    This process-global record-factory boundary requires serial use; concurrent
+    client-log capture contexts are unsupported.
 
     Delegate to the previous public record factory without changing the record.
     Before dispatch, filter its actual handler path, including handlers on dotted
@@ -487,14 +491,19 @@ class TestService(unittest.TestCase):
             self.assertNotEqual(taken.structured_content["private"]["orchestrator_token"], token)
         asyncio.run(exercise())
 
-    def test_no_assignment_tool_in_planning_milestone(self):
+    def test_plan_only_denies_assignment(self):
+        from adaptive_planning.app import HANDLERS
         from adaptive_planning.transport import build_mcp
         names = asyncio.run(list_tool_names(build_mcp(self.f.service)))
         self.assertEqual(set(names), {"read_service_info", "list_plans", "read_plan", "read_events",
-                                      "list_ready", "read_coordination", "create_plan", "revise_plan", "takeover",
-                                      "register_resource", "reconcile_resources"})
-        self.assertIn("create_plan", names)
-        self.assertNotIn("assign_step", names)
+                                      "list_ready", "read_coordination", *HANDLERS})
+        self.assertIn("assign_step", names)
+        planning = self.f.create("plan-only", creation_id="planning-only")
+        before = self.snapshot()
+        with self.assertRaises(DomainError):
+            self.f.assign(planning)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.f.service.read_plan(planning.current_metadata.plan_id).coordination.attempts, ())
 
     def invalid_commands(self):
         base = self.command_input()
@@ -789,7 +798,7 @@ class TestService(unittest.TestCase):
                             self.assertEqual(str(client.protocol_version), version)
                             names = {tool.name for tool in (await client.list_tools()).tools}
                             self.assertIn("create_plan", names)
-                            self.assertNotIn("assign_step", names)
+                            self.assertIn("assign_step", names)
                             info = await client.call_tool("read_service_info", {})
                             self.assertFalse(info.is_error)
                             self.assertEqual(info.structured_content["dashboard_url"], config.base_url + "/")

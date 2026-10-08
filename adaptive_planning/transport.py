@@ -30,6 +30,7 @@ _ARGUMENTS = {
     "list_ready": frozenset({"plan_id"}), "read_coordination": frozenset({"plan_id", "after", "limit"}),
     "create_plan": frozenset({"command"}), "revise_plan": frozenset({"command"}), "takeover": frozenset({"command"}),
     "register_resource": frozenset({"command"}), "reconcile_resources": frozenset({"command"}),
+    "assign_step": frozenset({"command"}),
 }
 _MESSAGES = {
     "invalid": "Tool arguments are invalid.", "not_found": "The requested planning record was not found.",
@@ -204,6 +205,22 @@ class _ReconcileResourcesPayload(_InputModel):
     reason: str
 
 
+class _ExecutionContextInput(_InputModel):
+    kind: Literal["repository", "non-repository", "external-only", "read-only"]
+    repository_id: str | None
+    workspace_id: str | None
+    repository_exclusive: bool
+    external_ids: list[str]
+    writes: bool
+    checked_base: str | None
+
+
+class _AssignStepPayload(_InputModel):
+    step_id: str
+    assignee: str
+    context: _ExecutionContextInput
+
+
 class _Envelope(_InputModel):
     epoch: str
     key: str
@@ -244,12 +261,18 @@ class ReconcileResourcesInput(_Envelope):
     payload: _ReconcileResourcesPayload
 
 
-CommandInput = Annotated[CreatePlanInput | RevisePlanInput | TakeoverInput | RegisterResourceInput | ReconcileResourcesInput,
+class AssignStepInput(_Envelope):
+    kind: Literal["assign_step"]
+    payload: _AssignStepPayload
+
+
+CommandInput = Annotated[CreatePlanInput | RevisePlanInput | TakeoverInput | RegisterResourceInput | ReconcileResourcesInput | AssignStepInput,
                          Field(discriminator="kind")]
 _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_fields,
                            *_CreatePayload.model_fields, *_RevisePayload.model_fields, *_TakeoverPayload.model_fields,
                            *_ResourceClaimInput.model_fields, *_RegisterResourcePayload.model_fields,
                            *_ReconcileResourcesPayload.model_fields,
+                           *_ExecutionContextInput.model_fields, *_AssignStepPayload.model_fields,
                            "plan_id", "include_terminal", "after", "limit", *_ARGUMENTS})
 
 
@@ -390,5 +413,10 @@ def build_mcp(service: PlanningService) -> MCPServer:
     def reconcile_resources(command: CommandInput) -> dict[str, Any]:
         """Reconcile explicitly attested equivalent identities while preserving every unresolved use."""
         return execute("reconcile_resources", command)
+
+    @server.tool(annotations=write)
+    def assign_step(command: CommandInput) -> dict[str, Any]:
+        """Assign one frozen authorized step after atomic scope, ownership and resource checks."""
+        return execute("assign_step", command)
 
     return server

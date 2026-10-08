@@ -852,10 +852,10 @@ def create_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
 # --------------------------------------------------------------------------------------
 # revise_plan
 # --------------------------------------------------------------------------------------
-def retire_step(
-    connection: sqlite3.Connection, plan_id: PlanId, request: RetirementRequest, actor: str,
-) -> None:
-    """Explicitly retire a pending or blocked step that has no live attempt, retaining its node and reason."""
+def _cancel_retirement_claims(
+    connection: sqlite3.Connection, plan_id: PlanId, request: RetirementRequest,
+) -> tuple[str, str, str]:
+    """Validate one retirement target and cancel its claims before the batch's graph transition."""
     reason = request.reason.strip()
     if not reason or len(reason) > MAX_TEXT_LEN:
         raise DomainError("invalid", f"Retirement of {request.step_id!r} requires a bounded non-empty reason")
@@ -863,17 +863,43 @@ def retire_step(
         "SELECT state, payload FROM steps WHERE plan_id = ? AND step_id = ?", (plan_id, request.step_id)).fetchone()
     if row is None:
         raise DomainError("invalid", f"Cannot retire unknown step {request.step_id!r}")
-    if row[0] not in ("pending", "blocked"):
+    if row[0] not in ("pending", "blocked", "in-progress"):
         raise DomainError("invalid", f"Step {request.step_id!r} is {row[0]}; only pending or blocked steps retire")
     if connection.execute(
-            f"SELECT 1 FROM attempts WHERE plan_id = ? AND step_id = ? AND state IN ({_LIVE_SQL})",
-            (plan_id, request.step_id)).fetchone() is not None:
-        raise DomainError("invalid", f"Step {request.step_id!r} has a live attempt and cannot be retired")
-    data = json.loads(row[1])
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE plan_id=?1 AND step_id=?2 AND state='accepted') "
+            "OR EXISTS(SELECT 1 FROM result_versions WHERE plan_id=?1 AND step_id=?2)",
+            (plan_id, request.step_id)).fetchone()[0]:
+        raise DomainError("invalid", "Completed attempt or result history cannot be retired")
+    claimed = connection.execute(
+        f"SELECT attempt_id FROM attempts WHERE plan_id=? AND step_id=? AND state IN ({_LIVE_SQL})",
+        (plan_id, request.step_id)).fetchall()
+    if row[0] == "in-progress" and not claimed:
+        raise DomainError("invalid", "In-progress retirement requires an exact live attempt to cancel")
+    if claimed:
+        # Local import keeps the handler module ownership separate without a plans/attempts import cycle.
+        from adaptive_planning.attempts import cancel_attempt
+        for attempt_id, in claimed:
+            cancel_attempt(connection, plan_id, attempt_id, reason)
+    return row[0], row[1], reason
+
+
+def retire_step(
+    connection: sqlite3.Connection, plan_id: PlanId, request: RetirementRequest, actor: str,
+) -> None:
+    """Retire bounded work; the caller validates pending/blocked retirements as one graph batch."""
+    previous = project_plan(connection, plan_id)
+    state, payload, reason = _cancel_retirement_claims(connection, plan_id, request)
+    if state == "in-progress":
+        # Keep strict legacy in-progress -> retired refusal. Both real transitions
+        # are validated inside the same write transaction, before the one revision.
+        previous = _commit_projection(connection, plan_id, previous)
+    data = json.loads(payload)
     step = _Step(request.step_id, "retired", data["definition"], list(data.get("evidence", [])), reason,
                  data.get("ordinal", 0))
     connection.execute("UPDATE steps SET state = 'retired', payload = ? WHERE plan_id = ? AND step_id = ?",
                        (_step_payload(step, actor), plan_id, request.step_id))
+    if state == "in-progress":
+        _commit_projection(connection, plan_id, previous)
 
 
 def _check_preconditions(plan: _Plan, command: Command) -> None:
@@ -905,6 +931,10 @@ def _apply_steps(connection: sqlite3.Connection, plan: _Plan, draft: PlanDraft) 
             continue
         if current.state in ("complete", "retired") and current.definition != data:
             raise DomainError("invalid", f"{current.state.capitalize()} step {current.step_id!r} cannot be altered")
+        if current.definition != data and connection.execute(
+                f"SELECT 1 FROM attempts WHERE plan_id=? AND step_id=? AND state IN ({_LIVE_SQL})",
+                (plan.plan_id, current.step_id)).fetchone() is not None:
+            raise DomainError("invalid", f"Claimed step {current.step_id!r} has a frozen definition")
         current.definition, current.ordinal = data, ordinal
         connection.execute(
             "UPDATE steps SET title = ?, definition_version = ?, payload = ? WHERE plan_id = ? AND step_id = ?",
@@ -948,6 +978,14 @@ def revise_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
     ts = _timestamp(plan.updated_at)
 
     _apply_steps(connection, plan, draft)
+    if retirements:
+        # A prerequisite and all its dependents may retire together. Cancel all
+        # claims first and validate the real intermediate blocked graph, then
+        # validate the complete retirement batch at final publication.
+        previous = _commit_projection(connection, plan.plan_id, previous)
+        for request in retirements:
+            _cancel_retirement_claims(connection, plan.plan_id, request)
+        previous = _commit_projection(connection, plan.plan_id, previous)
     for request in retirements:
         retire_step(connection, plan.plan_id, request, command.actor)
 
@@ -999,7 +1037,23 @@ def replay_request(connection: sqlite3.Connection, command: Command) -> Mutation
         return None
     if stored[0] != command_digest(command):
         raise DomainError("conflict", f"Request key {command.key!r} was already used for a different command")
-    committed, committed_metadata, private = decode_response(stored[1])
+    try:
+        committed, committed_metadata, private = decode_response(stored[1])
+    except (ValueError, TypeError, KeyError):
+        raise DomainError("invalid", "The stored request receipt is malformed") from None
+    if command.kind == "assign_step":
+        # Caller authority was checked before replay. An output grant is a separate
+        # disclosure decision tied to the original receipt, never a replacement lookup.
+        bound = (isinstance(committed, dict) and isinstance(committed.get("attempt_id"), str)
+                 and private is not None and private.orchestrator_token is None
+                 and isinstance(private.attempt_token, str)
+                 and committed_metadata.plan_id == stored[2] == command.plan_id
+                 and committed_metadata.epoch == command.epoch == _installation_epoch(connection)
+                 and committed_metadata.generation == command.generation)
+        grant = (current_private(connection, command.plan_id, private,
+                                 generation=committed_metadata.generation, attempt_id=committed["attempt_id"])
+                 if bound else None)
+        return MutationReceipt(committed, committed_metadata, _metadata(connection, command.plan_id), True, grant)
     return MutationReceipt(committed, committed_metadata, _metadata(connection, stored[2]), True,
                            current_private(connection, stored[2], private))
 

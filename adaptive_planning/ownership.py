@@ -107,14 +107,70 @@ def require_orchestrator(connection: sqlite3.Connection, command: Command) -> No
         raise DomainError("stale", "The plan generation has changed; re-read the plan")
 
 
+def _require_attempt_capability(connection: sqlite3.Connection, plan_id: str | None, generation: str | None,
+                                attempt_id: str | None, token: str | None):
+    """Validate one exact hashed worker capability and its current epoch/generation/attempt binding."""
+    if any(not isinstance(value, str) or not value for value in (plan_id, generation, attempt_id, token)):
+        raise DomainError("forbidden", "An exact attempt capability and scope are required")
+    current = connection.execute("SELECT generation FROM plans WHERE plan_id=?", (plan_id,)).fetchone()
+    if current is None:
+        raise DomainError("forbidden", "Attempt capability is not valid for this plan")
+    if current[0] != generation:
+        raise DomainError("stale", "The plan generation has changed")
+    epoch = _installation_epoch(connection)
+    rows = connection.execute(
+        "SELECT revoked,valid_until,payload FROM capabilities WHERE epoch=? AND plan_id=? "
+        "AND role='attempt' AND secret_hash=?", (epoch, plan_id, hash_token(token))).fetchall()
+    if len(rows) != 1 or rows[0][1] is not None:
+        raise DomainError("forbidden", "Attempt capability is not valid for this scope")
+    if rows[0][0]:
+        raise DomainError("fenced", "Attempt capability has been fenced")
+    try:
+        binding = json.loads(rows[0][2])
+    except (ValueError, TypeError):
+        raise DomainError("forbidden", "Attempt capability has no valid binding") from None
+    if (not isinstance(binding, dict) or binding.get("attempt_id") != attempt_id
+            or binding.get("generation") != generation):
+        raise DomainError("forbidden", "Attempt capability has no valid binding")
+    row = connection.execute(
+        "SELECT attempt_id,step_id,assignee,state,version,definition_version,started_at,payload "
+        "FROM attempts WHERE plan_id=? AND attempt_id=?", (plan_id, attempt_id)).fetchone()
+    if row is None:
+        raise DomainError("forbidden", "Attempt capability has no bound attempt")
+    if row[3] not in ("assigned", "active", "submitted", "accepted", "stale"):
+        raise DomainError("fenced", "Attempt capability has been fenced")
+    try:
+        data = json.loads(row[7])
+    except (ValueError, TypeError):
+        raise DomainError("forbidden", "Attempt capability has no coherent bound attempt") from None
+    if (not isinstance(data, dict) or data.get("epoch") != epoch or data.get("generation") != generation
+            or not isinstance(data.get("definition"), dict)
+            or data["definition"].get("step_id") != row[1]
+            or data["definition"].get("definition_version") != row[5]):
+        raise DomainError("forbidden", "Attempt capability has no coherent bound attempt")
+    if "cancelled_from" in data:
+        raise DomainError("fenced", "Attempt capability has been logically cancelled")
+    return row
+
+
 def current_private(
-    connection: sqlite3.Connection, plan_id: PlanId, private: PrivateGrant | None,
+    connection: sqlite3.Connection, plan_id: PlanId, private: PrivateGrant | None, *,
+    generation: str | None = None, attempt_id: str | None = None,
 ) -> PrivateGrant | None:
-    """Return recovered grant material only while its orchestrator capability is current in this epoch.
+    """Recover an original grant only while its exact capability binding is valid in the current epoch.
 
     Anything else, including grant material this module did not issue, is withheld.
     """
-    if private is None or private.orchestrator_token is None or private.attempt_token is not None:
+    if private is None:
+        return None
+    if private.orchestrator_token is None and private.attempt_token is not None:
+        try:
+            _require_attempt_capability(connection, plan_id, generation, attempt_id, private.attempt_token)
+        except DomainError:
+            return None
+        return private
+    if (not isinstance(private.orchestrator_token, str) or not private.orchestrator_token
+            or private.attempt_token is not None):
         return None
     row = connection.execute(
         "SELECT 1 FROM capabilities WHERE plan_id = ? AND role = 'orchestrator' AND secret_hash = ? "
