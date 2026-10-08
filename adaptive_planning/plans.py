@@ -362,6 +362,8 @@ def _status_kernel(states, stop, block, counts, *, store_hold, has_live_attempts
             or (has_live_attempts and not counts["attempts"])
             or (has_unresolved_uses and not counts["owned_nonreleased_uses"])
             or counts["logical_executable_pending_steps"] > states.count("pending")
+            or (counts["logical_executable_pending_steps"] and has_live_attempts
+                and not counts["recorded_nonstale_live_attempts"])
             or (counts["logical_executable_pending_steps"] and (stop or block or store_hold or counts["global_holds"]))):
         raise DomainError("invalid", "Derived status facts contradict their graph, control, or authority domain")
     if stop:

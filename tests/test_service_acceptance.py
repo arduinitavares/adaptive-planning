@@ -768,6 +768,26 @@ class TestService(unittest.TestCase):
         with self.assertRaises(DomainError):
             self.f.assign(first, "b")
 
+    def test_status_rejects_executable_pending_fact_with_started_stale_only_claim(self):
+        p = self.f.create(steps=(step("a"), step("b")))
+        a = self.f.start(p, self.f.assign(p))
+        # TEST-ONLY synthetic stale setup; this does not assert a real recovery sweep or host execution.
+        self.f.store.write(lambda db: db.execute("UPDATE attempts SET state='stale' WHERE attempt_id=?", (a.committed["attempt_id"],)))
+        view = self.f.service.read_plan(p.current_metadata.plan_id)
+        self.assertEqual(plans.derive_plan_status(view), "blocked")
+        self.assertTrue(view.coordination.has_live_attempts)
+        counts = view.coordination.total_counts
+        self.assertEqual(counts["recorded_started_attempts"], 1)
+        self.assertEqual(counts["recorded_nonstale_live_attempts"], 0)
+        self.assertEqual(counts["logical_executable_pending_steps"], 0)
+        self.assertEqual(next(s["status"] for s in view.legacy_snapshot["steps"] if s["id"] == "b"), "pending")
+        contradictory = replace(view, coordination=replace(view.coordination, total_counts={
+            **counts, "logical_executable_pending_steps": 1,
+        }))
+        with self.assertRaises(DomainError) as error:
+            plans.derive_plan_status(contradictory)
+        self.assertEqual(error.exception.code, "invalid")
+
     def test_stale_only_and_cancelled_unstarted_work_report_retained_obligations(self):
         p = self.f.create(steps=(step("a"), step("b")))
         a = self.f.assign(p)
