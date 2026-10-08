@@ -105,7 +105,7 @@ isolated synthetic installation. They must not be copied as credentials into rea
 client files. Installation bearer authentication and the plan's private
 orchestrator grant are separate capabilities; keep both out of public evidence.
 
-The automated equivalent is
+The automated SDK planning scenario is
 `tests.test_service_interop.run_planning_interop(service: PlanningService) -> tuple[MutationReceipt, ...]`.
 It opens three distinct official SDK HTTP sessions against an ephemeral
 `build_app` production stack sharing the supplied fixture's SQLite installation.
@@ -128,8 +128,8 @@ planning-only sequence through the actual products:
 1. Each fresh client negotiates MCP, lists the actual tools, and calls
    `read_service_info({})` before constructing a command. Record the observed
    protocol, epoch, host ID and installation dashboard URL; do not assume a
-   protocol version from the SDK or an app-server handshake. The current planning
-   tools are `read_service_info`, `list_plans`, `read_plan`, `read_events`,
+   protocol version from the SDK or an app-server handshake. The planning subset
+   used by this earlier gate is `read_service_info`, `list_plans`, `read_plan`, `read_events`,
    `list_ready`, `read_coordination`, `create_plan`, `revise_plan` and `takeover`.
 2. The creator calls `create_plan({"command": ...})` with a fresh request key and
    creation ID, an explicit new-plan intent, a `plan-only` draft and the first
@@ -183,3 +183,131 @@ actual authorized observations; any missing client remains a release blocker.
 | Codex | Pending: record CLI or Desktop and its actual credential method | Pending | Pending | Pending | Release blocker |
 | Antigravity | Pending: record actual AGY surface and private literal-header method | Pending | Pending | Pending | Release blocker |
 | Copilot | Pending: record CLI or VS Code; CLI additionally needs actual environment-expansion proof | Pending | Pending | Pending | Release blocker |
+
+## Three-client worker checkpoint gate
+
+Task 20 adds a source interoperability checkpoint to the earlier planning gate.
+`tests.test_service_interop.run_worker_interop(service: PlanningService) -> tuple[Event, ...]`
+returns that auto-mode run's three canonical finished-checkpoint events. The
+named test calls it once, then runs a separate legacy cycle. Each cycle creates
+three distinct official SDK `Client` objects against one owned ephemeral
+production HTTP app, with actual bearer-authenticated wire requests and the
+production wall clock. The observed, asserted negotiations are auto `2026-07-28`
+and legacy `2025-11-25`. Creation, resource registration, assignment, direct
+worker start/checkpoint, reassessment classification, required review, owner
+acceptance and explicit resource release all traverse SDK `call_tool` and
+central `PlanningService.execute`. The captured public proof identifies actual
+synthetic plans, attempts, checkpoint/event sequences, revisions, artifacts,
+accepted result UUIDs and the applicable original review UUID/sequence.
+
+The source actors `codex-worker`, `agy-worker` and `copilot-worker` are synthetic
+labels. They do not establish that any installed product or real model ran.
+Separate wire regressions use actual acceptance to test missing availability,
+full-artifact/final-base binding, consumer start, invalidation and named
+post-invalidation revalidation. An unremediated affected consumer remains held.
+Another regression proves that `plan-only` refuses assignment even when the
+worker tools are visible. Resource paths, identity declarations and stopped-use
+facts in these tests are synthetic; they certify no real host liveness.
+
+The tested catalog at this source checkpoint contains six reads:
+`read_service_info`, `list_plans`, `read_plan`, `read_events`, `list_ready` and
+`read_coordination`. Eighteen mutations are enabled: `create_plan`, `revise_plan`,
+`takeover`, `register_resource`, `reconcile_resources`, `assign_step`,
+`bind_availability`, `start_step`, `report_activity`, `record_checkpoint`,
+`resolve_reassessment`, `invalidate_result`, `resolve_invalidation`,
+`record_review`, `accept_step`, `reserve_verification`, `release_resource_use`
+and `reopen_attempt`. Five declared future kinds remain disabled: `import_plan`,
+`sweep_stale`, `resolve_attempt`, `append_late_evidence` and `resolve_store_hold`.
+Their appearance in the capability vocabulary is not tool availability.
+
+### Roles, checkpoints and reconciliation
+
+Every MCP request needs the installation bearer. It is separate from the private
+domain grants returned by creation/takeover and assignment. Public reads show
+canonical metadata, targets, events and paged coordination without grants;
+listing tools and advisory readiness do not authorize work. Bootstrap commands
+use neither domain token. Enabled owner operations require the current owner
+grant and forbid attempt tokens. Missing required grants without forbidden
+extras yield `forbidden`; unexpected extra tokens yield `invalid`.
+
+Direct `start_step`, `report_activity` and `record_checkpoint` use only the
+current attempt grant. Their actor and origin match the assignee, global
+`expected_revision` and `ownership_version` are null, and their own attempt ID,
+version and definition match the actual target. A relay requires both grants,
+current owner CAS and `relay` equal to the exact current owner actor. Takeover
+fences old owners and relays while leaving coherent direct worker grants alive.
+Owner commands use current global revision/ownership and exact nonsecret target
+fields where required, without a worker token.
+
+Keep the original immutable command envelope and request key for an uncertain
+retry. Authenticate before exact replay. Accepted worker grants become replay
+only for their own already committed commands; a new key or new terminal
+activity is refused. Changing the envelope to a later revision/version creates
+a different request, even when the caller intended a retry. After uncertainty,
+read canonical events and paged coordination to reconcile what committed before
+dispatching anything else. Resource identity reconciliation records identity;
+it neither proves stopped use nor renews scope or the first-step latch.
+
+A finished checkpoint carries outcome/check, full `ArtifactRef`, meaningful
+artifact-bound evidence, origin/relay and reassessment. Its public
+`checkpoint_id` is the actual global checkpoint event sequence represented as
+a string. Passing submission leaves the attempt submitted and the step in progress.
+Material reassessment creates provisional holds that the current owner must
+classify explicitly. Acceptance requires the exact current attempt/version/
+definition, full submitted artifact, passing checkpoint evidence, current
+execution authorization and satisfied holds/prerequisites. A required review uses the
+latest original matching verdict and evidence; a final gate also requires
+review. Neither role may bypass that review.
+
+The owner supplies `accept_step.payload` with `step_id`, full `artifact`,
+`stopped_resource_ids` and `stopped_reason`. Empty stop IDs retain physical
+obligations, so accepted logical work can leave the plan blocked until explicit
+resource release. Named stopped IDs/reason must support those original
+implementation obligations; they do not stop unrelated verification uses.
+Acceptance returns a durable result UUID distinct from the artifact's version,
+checkpoint sequence and review UUID. The acceptance event preserves its
+checkpoint sequence and applicable original review ID/sequence.
+
+Before a dependent worker starts, the owner binds availability to the exact
+accepted result UUID, full artifact and the consumer's final checked base.
+Missing availability or a different full artifact refuses start/binding without
+publication. Invalidation preserves result identities and holds the producer
+plus affected consumers. Each named resolution must prove the appropriate exact
+accepted artifact/result; required revalidation needs a passing original review
+recorded after invalidation. Resolving the producer does not automatically clear
+consumer holds, redispatch accepted work, grant authorization or renew scope.
+
+### Genuine installed-client and lifecycle evidence remains open
+
+The source test/docs checkpoint may integrate locally only after the
+coordinator's source specification and code-quality review. It does not satisfy
+the installed-client release gate. Actual Task 20 installed-client runs remain
+**0**, `all_client_gate_passed=false` and `full_task_acceptance=false`. Release,
+shared-default activation and full completion remain blocked. Existing Task 10
+planning preparation/probes and any historical installed versions are separate
+evidence; Task 20 did not refresh installed versions or activate client files.
+
+For each later authorized actual surface, record the installed product/version,
+chosen surface and private credential method; observed negotiated protocol,
+fresh tools and installation epoch/host/endpoint; shared plan/generation/revision/
+dashboard URL; own assigned step/attempt/version/definition; visible finished
+checkpoint ID/event sequence/actor/origin/relay and evidence/artifact/reassessment;
+current owner acceptance result UUID/event sequence and applicable original
+review UUID/sequence. Publish sanitized observations and evidence references,
+never grants or raw private wire captures. Launch receipts, configuration entries,
+SDK results and connected status cannot fill these rows.
+
+| Actual client | Finished checkpoint and owner acceptance | Close/reopen client | Service restart | Container recreation |
+| --- | --- | --- | --- | --- |
+| Codex: actual CLI/Desktop surface and version unobserved | NOT RUN — release blocker | NOT RUN | NOT RUN | NOT RUN |
+| Antigravity: actual surface and version unobserved | NOT RUN — release blocker | NOT RUN | NOT RUN | NOT RUN |
+| Copilot: actual CLI/VS Code surface and version unobserved | NOT RUN — release blocker | NOT RUN | NOT RUN | NOT RUN |
+
+Each lifecycle row must compare before/after assignments, evidence, revisions,
+result identities and URLs while preserving accepted work without redispatch.
+Rebuilding an app over a synthetic store is source evidence, not the actual
+service/container lifecycle gate. Retain NOT RUN, failed or unsupported rows and
+specific call/allowance gaps. This checkpoint grants no provider retry, account/
+billing change or client activation to close those gaps. Raw test evidence stays
+private; complete captures can contain diagnostic data and are not universally
+secret free.

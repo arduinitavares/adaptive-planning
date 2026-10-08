@@ -4,6 +4,10 @@ The service MCP endpoint is `http://127.0.0.1:8790/mcp`; the dashboard is
 `http://127.0.0.1:8790/`. **Copilot CLI** uses the user file
 `~/.copilot/mcp-config.json` with this schema:
 
+This setup material retains Task 10 preparation. Task 20 source tests do not
+refresh installed versions, activate configuration or verify current CLI/VS Code
+environment handling; each actual surface still needs its own runtime evidence.
+
 ```json
 {
   "mcpServers": {
@@ -76,3 +80,39 @@ with the actual selected surface, installed version, negotiated protocol, fresh
 tools, plan ID, committed revision and dashboard observation. Record unavailable
 call capability or allowance as a gap. An official SDK equivalent is separate
 from installed Copilot acceptance.
+
+## Worker checkpoints and the remaining client gate
+
+The installation bearer authorizes MCP transport access, while the private owner
+and attempt grants authorize domain commands. Direct worker start/activity/
+checkpoint calls use only the assignment's attempt token and exact current own
+target/version/definition, null global revision/ownership fields, and assigned
+actor/origin. Relays name the exact current owner actor and need both grants.
+Takeover fences old owner relays without fencing current direct workers. Read
+projections carry targets and proof; they never convey either private grant.
+
+Publish a finished checkpoint with the complete artifact, evidence and
+reassessment. It is submitted work until the current owner accepts with current
+CAS, exact target and full artifact, after explicit reassessment resolution and
+any required latest original passing review. Supply only supported stopped
+resource IDs/reason; empty IDs retain physical obligations. Reconciliation of
+resource identity is not stop confirmation. Preserve the original immutable
+envelope/key for uncertain retries. Accepted grants allow exact authenticated
+replay of committed worker commands, and refuse new terminal progress.
+
+Consumer availability must bind the actual acceptance-returned result UUID,
+exact artifact and final checked base. Invalidation holds the producer and each
+affected consumer for explicit named remediation, with a post-invalidation
+review when required. Tools, reads and readiness do not renew scope or grant
+execution; `plan-only` still refuses assignment. The [worker gate](../operations.md#three-client-worker-checkpoint-gate)
+records the tested 24-tool catalog, five disabled future kinds and proof fields.
+
+The Task 20 source checkpoint uses three synthetic official SDK clients per
+protocol, auto `2026-07-28` and legacy `2025-11-25`. `copilot-worker` is an actor
+label, not an installed Copilot or model run. Genuine Copilot finished-worker
+and close/reopen/service-restart/container-recreation rows remain **NOT RUN**;
+actual runs are **0**, and full Task 20 acceptance remains **false**. Task 10's
+planning evidence and historical versions do not satisfy those rows. Later
+authorized evidence must identify the exact CLI/VS Code surface and version,
+actual negotiation, shared plan, visible checkpoint sequence and owner
+acceptance/review IDs, retaining capability or allowance gaps honestly.
