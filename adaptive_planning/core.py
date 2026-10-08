@@ -597,8 +597,15 @@ def validate_service_graph(
                 for att in getattr(coordination, "attempts", ())
                 if getattr(att, "state", None) == "stale"
             }
+            control = getattr(coordination, "total_counts", {}).get("explicit_block_controls")
+            explicitly_backed = {
+                getattr(att, "step_id", None)
+                for att in getattr(coordination, "attempts", ())
+                if (type(control) is int and control == 1 and proposed.get("executionMode") != "plan-only"
+                    and getattr(att, "state", None) in {"active", "submitted", "stale"})
+            }
             for sid in in_progress_steps:
-                if not (has_global_hold or sid in stale_step_ids or sid in hold_step_ids):
+                if not (has_global_hold or sid in stale_step_ids or sid in hold_step_ids or sid in explicitly_backed):
                     raise PlanValidationError(
                         f"In-progress step '{sid}' under 'blocked' status requires backing stale attempt or hold in coordination"
                     )

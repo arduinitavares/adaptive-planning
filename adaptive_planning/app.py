@@ -47,6 +47,7 @@ HANDLERS: dict[str, Callable[[sqlite3.Connection, Command], MutationReceipt]] = 
     "invalidate_result": checkpoints.invalidate_result,
     "resolve_invalidation": checkpoints.resolve_invalidation,
     "record_review": reviews.record_review,
+    "accept_step": attempts.accept_step,
     "reserve_verification": reviews.reserve_verification,
     "release_resource_use": reviews.release_resource_use,
     "reopen_attempt": attempts.reopen_attempt,

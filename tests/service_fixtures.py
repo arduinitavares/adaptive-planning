@@ -521,19 +521,25 @@ class ServiceFixture:
         value: Checkpoint,
     ) -> MutationReceipt:
         """Accept a completed step without fabricating stop confirmation."""
-        step_id = attempt.committed.get("step_id", "a")
-        artifact = value.artifact or ArtifactRef(
-            kind="code", identity="synthetic-artifact", version="v1", digest=None, summary="accepted"
-        )
+        step_id = attempt.committed.get("step_id")
+        cursor = None
+        while step_id is None:
+            page = self.service.read_coordination(receipt.current_metadata.plan_id, after=cursor)
+            step_id = next((item.value.step_id for item in page.items
+                            if item.kind == "attempt" and item.value.attempt_id == attempt.committed.get("attempt_id")), None)
+            cursor = page.next_cursor
+            if step_id is None and cursor is None:
+                raise ValueError("Acceptance fixture requires its actual retained public attempt target")
         cmd = self.command(
             "accept_step",
             {
                 "step_id": step_id,
-                "artifact": artifact,
+                "artifact": value.artifact,
                 "stopped_resource_ids": (),
                 "stopped_reason": None,
             },
             receipt=receipt,
+            attempt=attempt,
         )
         return self.service.execute(cmd)
 
@@ -627,6 +633,88 @@ def seed_store_hold(fixture: ServiceFixture, reason: str) -> None:
                     fixture.clock().isoformat()))
 
     fixture.store.write(insert)
+
+
+def seed_terminal_history(fixture: ServiceFixture, plan_id: PlanId, step_id: StepId, count: int) -> None:
+    """TEST-ONLY coherent rejected history; no grant, graph evidence, result, hold or use mutation."""
+    import json
+    from tempfile import TemporaryDirectory
+    from adaptive_planning import plans
+    from adaptive_planning.store import Store
+    from adaptive_planning.types import DomainError
+
+    def owned_database():
+        if (not isinstance(fixture, ServiceFixture) or not isinstance(fixture._temporary_owner, TemporaryDirectory)
+                or fixture._temporary_closed or fixture._temporary_identity is None):
+            raise DomainError("invalid", "Terminal history requires a live fixture-owned temporary directory")
+        try:
+            owned = Path(fixture._temporary_owner.name).resolve(strict=True)
+            identity = owned.stat()
+            directory = fixture.directory.resolve(strict=True)
+            if not isinstance(fixture.store, Store):
+                raise DomainError("invalid", "Terminal history requires the fixture's actual Store")
+            database = fixture.store.path.resolve(strict=True)
+        except (OSError, TypeError, AttributeError) as error:
+            raise DomainError("invalid", "The terminal-history fixture is no longer valid") from error
+        if ((identity.st_dev, identity.st_ino) != fixture._temporary_identity or not owned.is_dir()
+                or directory != owned or database != owned / "planning.sqlite"
+                or getattr(fixture.service, "_store", None) is not fixture.store or fixture.store.host_id != "synthetic-host"):
+            raise DomainError("invalid", "Terminal history must stay in the original owned temporary store")
+        return database
+
+    database = owned_database()
+    if type(count) is not int or count < 0:
+        raise DomainError("invalid", "Terminal history count must be a nonnegative integer")
+
+    def insert(db):
+        if owned_database() != database or not any(name == "main" and Path(path).resolve() == database
+                                                  for _, name, path in db.execute("PRAGMA database_list")):
+            raise DomainError("invalid", "Terminal history connection is outside the owned fixture")
+        plan = plans._load_plan(db, plan_id)
+        target = next((node for node in plan.steps if node.step_id == step_id), None)
+        if target is None:
+            raise DomainError("not_found", "Terminal history target is outside the named plan")
+        previous = plans.project_plan(db, plan_id)
+        encoded = lambda value: json.dumps(plans.to_jsonable(value), sort_keys=True, ensure_ascii=False)
+        worker, reviewer, ts = "synthetic-terminal-worker", "synthetic-terminal-reviewer", fixture.clock().isoformat()
+        for _ in range(count):
+            aid, review_id = str(uuid.uuid4()), str(uuid.uuid4())
+            value = replace(checkpoint("failed", artifact_version="synthetic-terminal-" + aid), origin_worker=worker)
+            payload = {"epoch": plans._installation_epoch(db), "generation": plan.generation,
+                       "definition": target.definition, "context": plans.to_jsonable(context(None, writes=False)),
+                       "last_activity": ts, "recovery_required": False, "synthetic_terminal_history": True}
+            db.execute("INSERT INTO attempts(plan_id,attempt_id,step_id,assignee,state,version,definition_version,payload) "
+                       "VALUES(?,?,?,?,'rejected',3,?,?)",
+                       (plan_id, aid, step_id, worker, target.definition["definition_version"], encoded(payload)))
+            links = {"step_id": step_id, "attempt_id": aid, "definition_version": target.definition["definition_version"],
+                     "definition": target.definition, "artifact": plans.to_jsonable(value.artifact)}
+            plans._insert_event(db, plan_id, None, "record_checkpoint", worker, ts,
+                                {**links, "version": 3, "checkpoint": plans.to_jsonable(value)})
+            sequence = plans._store_sequence(db)
+            event = {**links, "version": 3, "checkpoint_id": str(sequence), "checkpoint": plans.to_jsonable(value)}
+            db.execute("UPDATE events SET payload=?,origin_worker=? WHERE sequence=?", (encoded(event), worker, sequence))
+            db.execute("INSERT INTO checkpoints(plan_id,attempt_id,sequence,outcome,check_name,evidence,origin_worker,relay,artifact,reassessment,created_at) "
+                       "VALUES(?,?,?,'failed',?,?,?,NULL,?,?,?)",
+                       (plan_id, aid, sequence, value.check, encoded(value.evidence), worker,
+                        encoded(value.artifact), encoded(value.reassessment), ts))
+            findings = ("x" * 8192, "y" * 8192)
+            db.execute("INSERT INTO reviews(review_id,plan_id,attempt_id,step_id,reviewer,verdict,findings,evidence,artifact,verification_use_id,created_at) "
+                       "VALUES(?,?,?,?,?,'failed',?,?,?,NULL,?)",
+                       (review_id, plan_id, aid, step_id, reviewer, encoded(findings), encoded(value.evidence), encoded(value.artifact), ts))
+            cycle = {"kind": "submission", "plan_id": plan_id, "step_id": step_id, "attempt_id": aid,
+                     "definition_version": target.definition["definition_version"], "checkpoint_sequence": sequence}
+            plans._insert_event(db, plan_id, None, "record_review", reviewer, ts,
+                                {**links, "review_id": review_id, "reviewer": reviewer, "verdict": "failed",
+                                 "cycle": cycle, "verification_use_id": None})
+            plans._insert_event(db, plan_id, None, "synthetic_terminal_rejection", "synthetic-history-fixture", ts,
+                                {**links, "checkpoint_sequence": sequence, "review_id": review_id,
+                                 "summary": "Synthetic rejected historical observation, no execution authority"})
+        if db.execute("PRAGMA foreign_key_check").fetchall():
+            raise DomainError("invalid", "Terminal history has contradictory same-plan relationships")
+        plans._commit_projection(db, plan_id, previous)
+
+    with plans.service_context("http://127.0.0.1:8790", fixture.clock):
+        fixture.store.write(insert)
 
 
 def seed_accepted_result(

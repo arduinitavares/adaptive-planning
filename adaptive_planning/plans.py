@@ -16,7 +16,7 @@ import sqlite3
 import uuid
 from contextvars import ContextVar
 from datetime import datetime
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Literal, Mapping
 
 from adaptive_planning.core import (
     MAX_FILE_BYTES,
@@ -234,8 +234,56 @@ def _metadata(connection: sqlite3.Connection, plan_id: PlanId) -> Metadata:
 # Authority aggregates and derived status
 # --------------------------------------------------------------------------------------
 _LIVE_SQL = ",".join(f"'{s}'" for s in LIVE_ATTEMPT_STATES)
-_GLOBAL_HOLD_SQL = (
-    "CASE WHEN json_valid(reason) THEN json_extract(reason, '$.step_id') ELSE NULL END IS NULL")
+_STATUS_FACTS = (
+    "recorded_nonstale_live_attempts", "global_holds", "owned_nonreleased_uses",
+    "recorded_started_attempts", "logical_executable_pending_steps", "explicit_block_controls",
+)
+
+
+def _eligibility_facts(connection: sqlite3.Connection, plan: _Plan):
+    """Complete current inputs, independent of summaries, status, and public readiness."""
+    steps = {s.step_id for s in plan.steps}
+    holds = tuple(_hold_view(h, r, steps) for h, r in connection.execute(
+        "SELECT hold_id,reason FROM holds WHERE plan_id=? AND active=1 ORDER BY rowid", (plan.plan_id,)))
+    claims = tuple(connection.execute(
+        f"SELECT step_id,state FROM attempts WHERE plan_id=? AND state IN ({_LIVE_SQL})", (plan.plan_id,)))
+    return holds, claims
+
+
+def _eligibility_reasons(plan: _Plan, step: _Step, store_hold: bool, holds, claims) -> list[str]:
+    """Pure logical assignment predicates; no context, host proof, or latch mutation."""
+    reasons = []
+    if plan.draft_json.get("stop_reason"):
+        reasons.append(f"plan is stopped: {plan.draft_json['stop_reason']}")
+    if plan.draft_json.get("block_reason"):
+        reasons.append(f"plan is blocked: {plan.draft_json['block_reason']}")
+    if store_hold:
+        reasons.append("store hold is active")
+    if any(h.step_id is None for h in holds):
+        reasons.append("a plan-level hold is active")
+    if any(state == "stale" for _, state in claims):
+        reasons.append("a stale attempt requires recovery")
+    if step.state != "pending":
+        reasons.append(f"step is {step.state}")
+    live_steps = {sid for sid, _ in claims}
+    if step.step_id in live_steps:
+        reasons.append("step already has a live attempt")
+    nodes = {s.step_id: s for s in plan.steps}
+    for prerequisite in step.definition["dependencies"]:
+        producer = nodes.get(prerequisite)
+        if producer is None or producer.state != "complete":
+            reasons.append(f"prerequisite {prerequisite!r} is not complete")
+        elif not producer.evidence or any(not isinstance(e, str) or not e.strip() for e in producer.evidence):
+            reasons.append(f"prerequisite {prerequisite!r} has no meaningful completed evidence")
+        if prerequisite in live_steps:
+            reasons.append(f"prerequisite {prerequisite!r} has a live attempt")
+    relevant = {step.step_id, *step.definition["dependencies"]}
+    reasons.extend(f"hold {h.hold_id} ({h.kind}): {h.reason}" for h in holds if h.step_id in relevant)
+    try:
+        validate_execution_scope(plan.authorization, step.step_id)
+    except PlanValidationError as error:
+        reasons.append(str(error))
+    return reasons
 
 
 @dataclasses.dataclass(frozen=True)
@@ -259,6 +307,9 @@ def _aggregates(connection: sqlite3.Connection, plan_id: PlanId) -> _Aggregates:
     epoch = _installation_epoch(connection)
     unresolved_reason = one(
         "SELECT EXISTS(SELECT 1 FROM store_hold_reasons WHERE epoch = ? AND resolved = 0)", epoch)
+    plan = _load_plan(connection, plan_id)
+    holds, claims = _eligibility_facts(connection, plan)
+    store_hold = bool(install[0]) or bool(unresolved_reason)
     counts = {
         "attempts": one("SELECT COUNT(*) FROM attempts WHERE plan_id = ?", plan_id),
         "reservations": sum(view.plan_id == plan_id for view in reservation_projections(connection, plan_id)[0].values()),
@@ -268,6 +319,13 @@ def _aggregates(connection: sqlite3.Connection, plan_id: PlanId) -> _Aggregates:
             "SELECT COUNT(*) FROM events WHERE plan_id = ? AND kind = 'invalidate_result'", plan_id),
         "orphan_uses": one(
             "SELECT COUNT(*) FROM resource_uses WHERE plan_id IS NULL AND status != 'released'"),
+        "recorded_nonstale_live_attempts": sum(state != "stale" for _, state in claims),
+        "global_holds": sum(h.step_id is None for h in holds),
+        "owned_nonreleased_uses": one("SELECT COUNT(*) FROM resource_uses WHERE plan_id=? AND status!='released'", plan_id),
+        "recorded_started_attempts": one("SELECT COUNT(*) FROM attempts WHERE plan_id=? AND started_at IS NOT NULL", plan_id),
+        "logical_executable_pending_steps": sum(not _eligibility_reasons(plan, s, store_hold, holds, claims)
+                                                for s in plan.steps if s.state == "pending"),
+        "explicit_block_controls": int(bool(plan.draft_json.get("block_reason"))),
     }
     return _Aggregates(
         has_live_attempts=bool(one(
@@ -277,29 +335,68 @@ def _aggregates(connection: sqlite3.Connection, plan_id: PlanId) -> _Aggregates:
         has_unresolved_uses=bool(one(
             "SELECT EXISTS(SELECT 1 FROM resource_uses WHERE plan_id = ? AND status = 'unresolved')", plan_id)),
         has_plan_holds=bool(counts["holds"]),
-        has_global_hold=bool(one(
-            f"SELECT EXISTS(SELECT 1 FROM holds WHERE plan_id = ? AND active = 1 AND {_GLOBAL_HOLD_SQL})",
-            plan_id)),
-        store_hold=bool(install[0]) or bool(unresolved_reason),
+        has_global_hold=bool(counts["global_holds"]),
+        store_hold=store_hold,
         restore_cutoff=install[1],
         counts=counts,
     )
 
 
-def _derive_status(plan: _Plan, agg: _Aggregates) -> str:
-    draft = plan.draft_json
-    states = [s.state for s in plan.steps]
-    if draft.get("stop_reason"):
+def _status_kernel(states, stop, block, counts, *, store_hold, has_live_attempts, has_unresolved_uses, has_plan_holds):
+    """One pure reduction over full graph/control facts and authoritative scalar inputs."""
+    for key in (*_STATUS_FACTS, "attempts", "holds"):
+        if type(counts.get(key)) is not int or counts[key] < 0:
+            raise DomainError("invalid", f"Derived status requires a nonnegative integer fact: {key}")
+    if any(type(flag) is not bool for flag in (store_hold, has_live_attempts, has_unresolved_uses, has_plan_holds)):
+        raise DomainError("invalid", "Derived status flags must be authoritative booleans")
+    if any(reason is not None and (not isinstance(reason, str) or not reason.strip()) for reason in (stop, block)):
+        raise DomainError("invalid", "Derived status controls must be meaningful strings or null")
+    if any(state not in ("pending", "in-progress", "blocked", "complete", "retired") for state in states):
+        raise DomainError("invalid", "Derived status requires valid full graph states")
+    if (counts["explicit_block_controls"] != int(block is not None)
+            or counts["recorded_nonstale_live_attempts"] > counts["attempts"]
+            or counts["recorded_started_attempts"] > counts["attempts"]
+            or counts["global_holds"] > counts["holds"]
+            or has_plan_holds != bool(counts["holds"])
+            or (counts["recorded_nonstale_live_attempts"] and not has_live_attempts)
+            or (has_live_attempts and not counts["attempts"])
+            or (has_unresolved_uses and not counts["owned_nonreleased_uses"])
+            or counts["logical_executable_pending_steps"] > states.count("pending")
+            or (counts["logical_executable_pending_steps"] and (stop or block or store_hold or counts["global_holds"]))):
+        raise DomainError("invalid", "Derived status facts contradict their graph, control, or authority domain")
+    if stop:
         return "stopped"
-    if draft.get("block_reason") or agg.store_hold or agg.has_global_hold or agg.has_stale_attempt:
+    if block or store_hold or counts["global_holds"]:
         return "blocked"
     if states and all(state in ("complete", "retired") for state in states):
-        if agg.has_live_attempts or agg.has_unresolved_uses or agg.has_plan_holds:
+        if has_live_attempts or has_unresolved_uses or has_plan_holds or counts["owned_nonreleased_uses"]:
             return "blocked"
         return "complete"
-    if "in-progress" in states or agg.has_live_attempts:
+    started = counts["recorded_started_attempts"] > 0 or any(state in ("in-progress", "complete") for state in states)
+    if counts["recorded_nonstale_live_attempts"] or (started and counts["logical_executable_pending_steps"]):
         return "running"
+    if started or has_live_attempts or has_unresolved_uses or has_plan_holds or counts["owned_nonreleased_uses"]:
+        return "blocked"
     return "planning"
+
+
+def _derive_status(plan: _Plan, agg: _Aggregates) -> str:
+    return _status_kernel([s.state for s in plan.steps], plan.draft_json.get("stop_reason"),
+                          plan.draft_json.get("block_reason"), agg.counts, store_hold=agg.store_hold,
+                          has_live_attempts=agg.has_live_attempts, has_unresolved_uses=agg.has_unresolved_uses,
+                          has_plan_holds=agg.has_plan_holds)
+
+
+def derive_plan_status(view: PlanView) -> Literal["planning", "running", "stopped", "blocked", "complete"]:
+    """Derive independently of bounded arrays and all precomputed overall status outputs."""
+    try:
+        states = [s["status"] for s in view.legacy_snapshot["steps"]]
+        coordination = view.coordination
+        return _status_kernel(states, view.draft.stop_reason, view.draft.block_reason, coordination.total_counts,
+                              store_hold=coordination.store_hold, has_live_attempts=coordination.has_live_attempts,
+                              has_unresolved_uses=coordination.has_unresolved_uses, has_plan_holds=coordination.has_plan_holds)
+    except (KeyError, TypeError, AttributeError) as error:
+        raise DomainError("invalid", "Derived status requires full graph and authoritative coordination facts") from error
 
 
 def _next_step_id(plan: _Plan) -> str | None:
@@ -404,14 +501,19 @@ def _attempt_view(row: Any) -> AttemptView:
         result_version=data.get("result_version"))
 
 
-def _hold_view(hold_id: str, reason: str) -> HoldView:
+def _hold_view(hold_id: str, reason: str, step_ids=None) -> HoldView:
     try:
         data = json.loads(reason)
-    except ValueError:
+    except (ValueError, TypeError, RecursionError):
         data = None
-    if isinstance(data, dict) and isinstance(data.get("kind"), str):
-        return HoldView(hold_id=hold_id, kind=data["kind"], step_id=data.get("step_id"),
-                        source_id=str(data.get("source_id", hold_id)), reason=str(data.get("reason", "")))
+    if isinstance(data, dict) and isinstance(data.get("kind"), str) and data["kind"].strip():
+        sid = data.get("step_id")
+        if not isinstance(sid, str) or not sid.strip() or (step_ids is not None and sid not in step_ids):
+            sid = None
+        source = data.get("source_id")
+        return HoldView(hold_id=hold_id, kind=data["kind"], step_id=sid,
+                        source_id=source if isinstance(source, str) and source.strip() else hold_id,
+                        reason=data["reason"] if isinstance(data.get("reason"), str) else reason)
     return HoldView(hold_id=hold_id, kind="identity", step_id=None, source_id=hold_id, reason=reason)
 
 
@@ -429,7 +531,8 @@ def _load_item(connection: sqlite3.Connection, plan_id: PlanId, kind: str, rid: 
         return CoordinationItem("reservation", value)
     if kind == "hold":
         hold_id, reason = connection.execute("SELECT hold_id, reason FROM holds WHERE rowid = ?", (rid,)).fetchone()
-        return CoordinationItem("hold", _hold_view(hold_id, reason))
+        step_ids = {row[0] for row in connection.execute("SELECT step_id FROM steps WHERE plan_id=?", (plan_id,))}
+        return CoordinationItem("hold", _hold_view(hold_id, reason, step_ids))
     if kind == "review":
         (step_id, attempt_id, reviewer, verdict, findings, evidence, artifact, use_id,
          definition_version) = connection.execute(
@@ -624,47 +727,12 @@ def read_events(connection: sqlite3.Connection, plan_id: PlanId, after: int, lim
 def list_ready(connection: sqlite3.Connection, plan_id: PlanId) -> tuple[ReadyStep, ...]:
     plan = _load_plan(connection, plan_id)
     agg = _aggregates(connection, plan_id)
-    status = _derive_status(plan, agg)
-    plan_reasons: list[str] = []
-    if status == "stopped":
-        plan_reasons.append(f"plan is stopped: {plan.draft_json['stop_reason']}")
-    elif status == "complete":
-        plan_reasons.append("plan is complete")
-    elif status == "blocked":
-        if plan.draft_json.get("block_reason"):
-            plan_reasons.append(f"plan is blocked: {plan.draft_json['block_reason']}")
-        if agg.store_hold:
-            plan_reasons.append("store hold is active")
-        if agg.has_global_hold:
-            plan_reasons.append("a plan-level hold is active")
-        if agg.has_stale_attempt:
-            plan_reasons.append("a stale attempt requires recovery")
-    step_holds: dict[str, list[str]] = {}
-    for hold_id, reason in connection.execute(
-            "SELECT hold_id, reason FROM holds WHERE plan_id = ? AND active = 1 ORDER BY rowid", (plan_id,)):
-        hold = _hold_view(hold_id, reason)
-        if hold.step_id is not None:
-            step_holds.setdefault(hold.step_id, []).append(f"hold {hold.hold_id} ({hold.kind}): {hold.reason}")
-    live_steps = {row[0] for row in connection.execute(
-        f"SELECT step_id FROM attempts WHERE plan_id = ? AND state IN ({_LIVE_SQL})", (plan_id,))}
-    states = {s.step_id: s.state for s in plan.steps}
+    holds, claims = _eligibility_facts(connection, plan)
     ready = []
     for step in plan.steps:
         if step.state in ("complete", "retired"):
             continue
-        reasons = list(plan_reasons)
-        if step.state != "pending":
-            reasons.append(f"step is {step.state}")
-        for dep in step.definition["dependencies"]:
-            if states.get(dep) != "complete":
-                reasons.append(f"prerequisite {dep!r} is not complete")
-        reasons.extend(step_holds.get(step.step_id, ()))
-        if step.step_id in live_steps:
-            reasons.append("step already has a live attempt")
-        try:
-            validate_execution_scope(plan.authorization, step.step_id)
-        except PlanValidationError as error:
-            reasons.append(str(error))
+        reasons = _eligibility_reasons(plan, step, agg.store_hold, holds, claims)
         ready.append(ReadyStep(step.step_id, not reasons, tuple(reasons)))
     return tuple(ready)
 
@@ -708,8 +776,7 @@ def _validation_coordination(connection: sqlite3.Connection, plan_id: PlanId) ->
     attempts = tuple(_attempt_view(row) for row in connection.execute(
         "SELECT attempt_id, step_id, assignee, state, version, definition_version, started_at, payload "
         f"FROM attempts WHERE plan_id = ? AND state IN ({_LIVE_SQL})", (plan_id,)))
-    holds = tuple(_hold_view(h, r) for h, r in connection.execute(
-        "SELECT hold_id, reason FROM holds WHERE plan_id = ? AND active = 1", (plan_id,)))
+    holds, _ = _eligibility_facts(connection, _load_plan(connection, plan_id))
     agg = _aggregates(connection, plan_id)
     actor, version = current_ownership(connection, plan_id)
     return CoordinationView(

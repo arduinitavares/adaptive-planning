@@ -583,6 +583,93 @@ def report_activity(connection: sqlite3.Connection, command: Command) -> Mutatio
     return _worker_progress(connection, command, start=False)
 
 
+def accept_step(connection: sqlite3.Connection, command: Command) -> MutationReceipt:
+    """Accept one exact current submitted output without asserting worker or host activity."""
+    from adaptive_planning import checkpoints, reviews
+    plan = checkpoints._owner_target(connection, command, "accept_step")
+    if (not _nonblank(command.attempt_id) or command.attempt_version is None
+            or command.definition_version is None):
+        raise DomainError("invalid", "Acceptance requires the exact attempt, own version and frozen definition")
+    row, data, step = reviews._submitted_row(connection, plan, command.payload["step_id"])
+    if (command.attempt_id != row[0] or command.attempt_version != row[4]
+            or command.definition_version != row[5]):
+        raise DomainError("stale", "Acceptance assertions do not identify the current exact submitted target")
+    try:
+        validate_execution_scope(plan.authorization, step.step_id)
+    except PlanValidationError as error:
+        raise DomainError("forbidden", str(error)) from error
+    coordination = plans._validation_coordination(connection, plan.plan_id)
+    if [a.attempt_id for a in coordination.attempts if a.step_id == step.step_id] != [row[0]]:
+        raise DomainError("invalid", "Acceptance requires exactly one current live claim on its target")
+    relevant = {step.step_id, *step.definition["dependencies"]}
+    if (coordination.store_hold or any(h.step_id is None or h.step_id in relevant for h in coordination.holds)
+            or plan.draft_json.get("stop_reason") or plan.draft_json.get("block_reason")):
+        raise DomainError("held", "Acceptance is held pending explicit resolution")
+    nodes = {s.step_id: s for s in plan.steps}
+    for prerequisite in step.definition["dependencies"]:
+        producer = nodes.get(prerequisite)
+        if (producer is None or producer.state != "complete" or not producer.evidence
+                or any(not _nonblank(item) for item in producer.evidence)
+                or any(a.step_id == prerequisite for a in coordination.attempts)):
+            raise DomainError("invalid", "Acceptance requires coherent completed prerequisites without live claims")
+    try:
+        activity = datetime.fromisoformat(data["last_activity"])
+        if activity.tzinfo is None or activity.utcoffset() is None:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise DomainError("invalid", "Acceptance requires a valid observed activity timestamp") from None
+    if (plans._now() - activity).total_seconds() >= _STALE_SECONDS.get():
+        raise DomainError("stale", "The submitted attempt exceeded its inactivity threshold")
+    artifact, cycle = reviews._submission(connection, plan, row, data, step)
+    supplied = _artifact(command.payload["artifact"])
+    value, _ = checkpoints._linked_checkpoint(connection, plan.plan_id, str(cycle["checkpoint_sequence"]))
+    if (artifact != supplied or value.outcome != "passed" or not _nonblank(value.check)
+            or not _passing_evidence(value.evidence, artifact)
+            or not any(item.check == value.check and item.artifact == artifact for item in value.evidence)
+            or not step.evidence or any(not _nonblank(item) for item in step.evidence)):
+        raise DomainError("invalid", "Acceptance requires the current full artifact and passing checkpoint evidence")
+    target = reviews._Target(plan, row, data, step, artifact, cycle)
+    selected = reviews._selected_review(connection, target) if step.definition["review_required"] else None
+    if step.definition["review_required"] and selected is None:
+        raise DomainError("invalid", "Acceptance requires the latest original passing review of this exact submission")
+    # Decode ALL retained rows, including released originals and verifier groups. Acceptance never reacquires writing.
+    namespace, owned = resources.execution_uses(connection, plan.plan_id, row[0])
+    stopped, reason = command.payload["stopped_resource_ids"], command.payload["stopped_reason"]
+    if not stopped and reason is not None:
+        raise DomainError("invalid", "A stopped reason without named implementation resources asserts no release")
+    release_ids = []
+    if stopped:
+        checkpoints._text(reason, "Stopped implementation reason")
+        canonical = {resources.resolve_resource_id(connection, rid) for rid in stopped}
+        release_ids = reviews._implementation_release_ids(connection, namespace, owned, canonical)
+    previous = plans.project_plan(connection, plan.plan_id)
+    result_version = str(uuid.uuid4())
+    revision, version, ts = plan.revision + 1, row[4] + 1, plans._timestamp(plan.updated_at)
+    links = {"step_id": step.step_id, "attempt_id": row[0], "version": version,
+             "result_version": result_version, "definition_version": row[5], "definition": step.definition,
+             "artifact": plans.to_jsonable(artifact), "checkpoint_sequence": cycle["checkpoint_sequence"]}
+    if selected is not None:
+        links.update(review_id=selected[0], review_sequence=selected[1])
+    event = {**links, "stopped_resource_ids": list(stopped), "stopped_reason": reason, "released_use_ids": release_ids}
+    checkpoints._event_limits(event)
+    plans._insert_event(connection, plan.plan_id, revision, command.kind, command.actor, ts, event)
+    accepted_sequence = plans._store_sequence(connection)
+    data.update({key: value for key, value in links.items() if key not in ("step_id", "attempt_id", "version")},
+                accepted_sequence=accepted_sequence)
+    connection.execute("INSERT INTO result_versions(plan_id,result_version,step_id,artifact_kind,identity,summary,digest,created_at) "
+                       "VALUES(?,?,?,?,?,?,?,?)", (plan.plan_id, result_version, step.step_id, artifact.kind,
+                                                artifact.identity, artifact.summary, artifact.digest, ts))
+    connection.execute("UPDATE attempts SET state='accepted',version=?,payload=? WHERE plan_id=? AND attempt_id=?",
+                       (version, json.dumps(data, sort_keys=True, ensure_ascii=False), plan.plan_id, row[0]))
+    connection.execute("UPDATE steps SET state='complete' WHERE plan_id=? AND step_id=?", (plan.plan_id, step.step_id))
+    reviews._release_rows(connection, release_ids)
+    connection.execute("UPDATE plans SET revision=?,updated_at=? WHERE plan_id=?", (revision, ts, plan.plan_id))
+    view = plans._commit_projection(connection, plan.plan_id, previous)
+    committed = {"step_id": step.step_id, "attempt_id": row[0], "version": version,
+                 "definition_version": row[5], "result_version": result_version}
+    return MutationReceipt(committed, view.metadata, view.metadata, False, None)
+
+
 def reopen_attempt(connection: sqlite3.Connection, command: Command) -> MutationReceipt:
     """Reacquire the same submitted worker only after exact scope and retained-use proof."""
     from adaptive_planning import checkpoints, reviews

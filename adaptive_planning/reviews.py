@@ -249,13 +249,10 @@ def record_review(connection: sqlite3.Connection, command: Command) -> MutationR
                            view.metadata, view.metadata, False, None)
 
 
-def review_satisfied(connection: sqlite3.Connection, plan_id: PlanId, step_id: StepId, attempt_id: AttemptId,
-                     definition_version: DefinitionVersion, artifact: ArtifactRef) -> bool:
-    """Select the latest original exact-cycle verdict before testing successful review evidence."""
+def _selected_review(connection: sqlite3.Connection, target: _Target) -> tuple[str, int] | None:
+    """Return the original successful review pointer under the current verdict policy."""
     try:
-        target = _resolve_review_target(connection, plans._load_plan(connection, plan_id), step_id, require_open=False)
-        if target.row[0] != attempt_id or target.row[5] != definition_version or target.artifact != attempts._artifact(artifact):
-            return False
+        plan_id, step_id, attempt_id = target.plan.plan_id, target.step.step_id, target.row[0]
         rows = {row[0]: row for row in connection.execute(
             "SELECT review_id,reviewer,verdict,artifact,evidence,findings,verification_use_id FROM reviews "
             "WHERE plan_id=? AND step_id=? AND attempt_id=?", (plan_id, step_id, attempt_id))}
@@ -285,15 +282,28 @@ def review_satisfied(connection: sqlite3.Connection, plan_id: PlanId, step_id: S
                     namespace, _ = resources.execution_uses(connection, plan_id, attempt_id)
                     if namespace["groups"][row[6]]["creation"]["sequence"] >= sequence:
                         continue
-                latest = row
+                latest = row, sequence
             except (DomainError, ValueError, TypeError, KeyError):
                 continue
-        if latest is None or latest[2] != "passed":
-            return False
-        selected = _to_review({"reviewer": latest[1], "verdict": latest[2], "artifact": json.loads(latest[3]),
-                               "evidence": json.loads(latest[4]), "findings": json.loads(latest[5]), "verification_use_id": latest[6]})
+        if latest is None or latest[0][2] != "passed":
+            return None
+        row, sequence = latest
+        selected = _to_review({"reviewer": row[1], "verdict": row[2], "artifact": json.loads(row[3]),
+                               "evidence": json.loads(row[4]), "findings": json.loads(row[5]), "verification_use_id": row[6]})
         _review_content(selected, target)
-        return True
+        return row[0], sequence
+    except (DomainError, ValueError, TypeError, KeyError, RecursionError):
+        return None
+
+
+def review_satisfied(connection: sqlite3.Connection, plan_id: PlanId, step_id: StepId, attempt_id: AttemptId,
+                     definition_version: DefinitionVersion, artifact: ArtifactRef) -> bool:
+    """Select the latest original exact-cycle verdict before testing successful review evidence."""
+    try:
+        target = _resolve_review_target(connection, plans._load_plan(connection, plan_id), step_id, require_open=False)
+        if target.row[0] != attempt_id or target.row[5] != definition_version or target.artifact != attempts._artifact(artifact):
+            return False
+        return _selected_review(connection, target) is not None
     except (DomainError, ValueError, TypeError, KeyError, RecursionError):
         return False
 
@@ -377,6 +387,27 @@ def reserve_verification(connection: sqlite3.Connection, command: Command) -> Mu
     return MutationReceipt({"use_id": anchor, "attempt_id": target.row[0], "resource_ids": list(selected)}, view.metadata, view.metadata, False, None)
 
 
+def _implementation_release_ids(connection, namespace, owned, canonical_ids):
+    """Validate stopped original rows without publishing or stopping another actor."""
+    selected = [item["use_id"] for item in namespace["implementation"]["members"]
+                if resources.resolve_resource_id(connection, owned[item["use_id"]][1]) in canonical_ids]
+    if {resources.resolve_resource_id(connection, owned[uid][1]) for uid in selected} != canonical_ids:
+        raise DomainError("invalid", "Stopped resources must belong to the exact original implementation cohort")
+    for uid in selected:
+        row = owned[uid]
+        identity = resources.resolve_resource_id(connection, row[1])
+        conflicts = set(resources.conflicting_uses(connection, (identity,), row[5] == "repository"))
+        if any(uid in group["source_use_ids"] and any(item["use_id"] in conflicts for item in group["members"])
+               for group in namespace["groups"].values()):
+            raise DomainError("resource_conflict", "Linked verifier obligations must be stopped and released before the parent guard")
+    return selected
+
+
+def _release_rows(connection, use_ids):
+    for use_id in use_ids:
+        connection.execute("UPDATE resource_uses SET status='released' WHERE use_id=?", (use_id,))
+
+
 def release_resource_use(connection: sqlite3.Connection, command: Command) -> MutationReceipt:
     plan = checkpoints._owner_target(connection, command, "release_resource_use")
     payload = command.payload
@@ -411,10 +442,7 @@ def release_resource_use(connection: sqlite3.Connection, command: Command) -> Mu
         if row[0] in originals:
             expected = {resources.resolve_resource_id(connection, row[1])}
             if payload["stopped"]:
-                conflicts = set(resources.conflicting_uses(connection, tuple(expected), row[5] == "repository"))
-                if any(row[0] in candidate["source_use_ids"] and any(item["use_id"] in conflicts for item in candidate["members"])
-                       for candidate in namespace["groups"].values()):
-                    raise DomainError("resource_conflict", "Linked verifier obligations must be stopped and released before the parent guard")
+                _implementation_release_ids(connection, namespace, owned, expected)
         elif row[0] in namespace["groups"]:
             group = namespace["groups"][row[0]]
             ids = [item["use_id"] for item in group["members"]]
@@ -439,8 +467,7 @@ def release_resource_use(connection: sqlite3.Connection, command: Command) -> Mu
             connection.execute("UPDATE events SET payload=? WHERE plan_id=? AND sequence=?",
                                (json.dumps(event, sort_keys=True, ensure_ascii=False), plan.plan_id, sequence))
             resources.save_execution_uses(connection, plan.plan_id, row[3], namespace)
-        for use_id in ids:
-            connection.execute("UPDATE resource_uses SET status='released' WHERE use_id=?", (use_id,))
+        _release_rows(connection, ids)
     connection.execute("UPDATE plans SET revision=?,updated_at=? WHERE plan_id=?", (revision, ts, plan.plan_id))
     view = plans._commit_projection(connection, plan.plan_id, previous)
     return MutationReceipt({"use_id": row[0], "stopped": payload["stopped"], "released": payload["stopped"]},

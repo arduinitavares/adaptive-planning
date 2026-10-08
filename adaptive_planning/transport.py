@@ -37,6 +37,7 @@ _ARGUMENTS = {
     "resolve_reassessment": frozenset({"command"}), "invalidate_result": frozenset({"command"}),
     "resolve_invalidation": frozenset({"command"}),
     "record_review": frozenset({"command"}), "reserve_verification": frozenset({"command"}),
+    "accept_step": frozenset({"command"}),
     "release_resource_use": frozenset({"command"}), "reopen_attempt": frozenset({"command"}),
 }
 _MESSAGES = {
@@ -331,6 +332,13 @@ class _RecordReviewPayload(_InputModel):
     review: _ReviewInput
 
 
+class _AcceptStepPayload(_InputModel):
+    step_id: str
+    artifact: _ArtifactInput
+    stopped_resource_ids: list[str]
+    stopped_reason: str | None
+
+
 class _ReserveVerificationPayload(_InputModel):
     step_id: str
     verifier: str
@@ -435,6 +443,11 @@ class RecordReviewInput(_Envelope):
     payload: _RecordReviewPayload
 
 
+class AcceptStepInput(_Envelope):
+    kind: Literal["accept_step"]
+    payload: _AcceptStepPayload
+
+
 class ReserveVerificationInput(_Envelope):
     kind: Literal["reserve_verification"]
     payload: _ReserveVerificationPayload
@@ -453,7 +466,7 @@ class ReopenAttemptInput(_Envelope):
 CommandInput = Annotated[CreatePlanInput | RevisePlanInput | TakeoverInput | RegisterResourceInput | ReconcileResourcesInput | AssignStepInput
                          | BindAvailabilityInput | StartStepInput | ReportActivityInput | RecordCheckpointInput
                          | ResolveReassessmentInput | InvalidateResultInput | ResolveInvalidationInput
-                         | RecordReviewInput | ReserveVerificationInput | ReleaseResourceUseInput | ReopenAttemptInput,
+                         | RecordReviewInput | AcceptStepInput | ReserveVerificationInput | ReleaseResourceUseInput | ReopenAttemptInput,
                          Field(discriminator="kind")]
 _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_fields,
                            *_CreatePayload.model_fields, *_RevisePayload.model_fields, *_TakeoverPayload.model_fields,
@@ -461,6 +474,7 @@ _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_field
                            *_ReconcileResourcesPayload.model_fields,
                            *_ExecutionContextInput.model_fields, *_AssignStepPayload.model_fields,
                            *_ArtifactInput.model_fields, *_EvidenceInput.model_fields, *_AvailabilityInput.model_fields,
+                           *_AcceptStepPayload.model_fields,
                            *_BindAvailabilityPayload.model_fields, *_ActivityPayload.model_fields,
                            *_ReassessmentInput.model_fields, *_CheckpointInput.model_fields, *_RecordCheckpointPayload.model_fields,
                            *_ResolveReassessmentPayload.model_fields, *_InvalidateResultPayload.model_fields,
@@ -653,6 +667,11 @@ def build_mcp(service: PlanningService) -> MCPServer:
     def record_review(command: CommandInput) -> dict[str, Any]:
         """Record an immutable verdict for the exact submitted or invalidated accepted artifact."""
         return execute("record_review", command)
+
+    @server.tool(annotations=write)
+    def accept_step(command: CommandInput) -> dict[str, Any]:
+        """Accept one exact submitted output; stop only explicitly named original implementation resources."""
+        return execute("accept_step", command)
 
     @server.tool(annotations=write)
     def reserve_verification(command: CommandInput) -> dict[str, Any]:

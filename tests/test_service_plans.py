@@ -584,7 +584,7 @@ class TestProjection(PlanServiceTestCase):
         insert_hold(self.f.store, self.plan_id, "hold-step", "b")
         view = self.f.service.read_plan(self.plan_id)
         self.assertTrue(view.coordination.has_plan_holds)
-        self.assertEqual(view.status, "planning")
+        self.assertEqual(view.status, "blocked")
         ready = {r.step_id: r for r in self.f.service.list_ready(self.plan_id)}
         self.assertTrue(ready["a"].ready)
         self.assertFalse(ready["b"].ready)
