@@ -5,8 +5,10 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import socket
 import stat
+import sys
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -109,7 +111,7 @@ class CapturedLogs(logging.Handler):
         self.lines: list[str] = []
 
     def emit(self, record: logging.LogRecord) -> None:
-        text = self.format(record)
+        text = record.name + ": " + self.format(record)
         if record.exc_info:
             text += "\n" + "".join(logging.Formatter().formatException(record.exc_info))
         self.lines.append(text + " " + repr(record.args))
@@ -526,6 +528,7 @@ class TestService(unittest.TestCase):
 
     def test_bound_ephemeral_port_boundary_over_uvicorn(self):
         sock = bound_ephemeral_socket()
+        self.addCleanup(sock.close)
         port = sock.getsockname()[1]
         self.assertNotEqual(port, 8790)
         config = Config(self.data_dir, base_url=f"http://127.0.0.1:{port}")
@@ -678,6 +681,7 @@ class TestService(unittest.TestCase):
         self.addCleanup(root.setLevel, old_level)
         self.addCleanup(root.removeHandler, captured)
         sock = bound_ephemeral_socket()
+        self.addCleanup(sock.close)
         port = sock.getsockname()[1]
         config = Config(self.data_dir, base_url=f"http://127.0.0.1:{port}")
 
@@ -702,6 +706,217 @@ class TestService(unittest.TestCase):
         for line in captured.lines:
             self.assertNotIn(OTHER_TOKEN, line)
             self.assertNotIn(SYNTHETIC_TOKEN, line)
+
+
+class TestProductionEntry(unittest.TestCase):
+    def setUp(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.data_dir = Path(directory.name) / "installation"
+
+    def cli(self, *arguments):
+        environment = dict(os.environ, ADAPTIVE_PLANNING_DATA_DIR=str(self.data_dir),
+                           ADAPTIVE_PLANNING_BASE_URL="http://127.0.0.1:39123")
+        return subprocess.run([sys.executable, "-B", "-m", "adaptive_planning", *arguments],
+                              env=environment, capture_output=True, text=True, timeout=15)
+
+    def test_build_app_and_actual_serve_fail_without_provisioning_token(self):
+        from adaptive_planning.app import build_app
+        with self.assertRaises(DomainError) as raised:
+            build_app(Config(self.data_dir))
+        self.assertEqual(raised.exception.code, "not_initialized")
+        self.assertFalse(self.data_dir.exists())
+        result = self.cli("serve")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("not_initialized", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(self.data_dir.exists())
+
+    def test_explicit_cli_init_creates_private_token_without_printing_it(self):
+        result = self.cli("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = Config(self.data_dir)
+        token = load_service_token(config)
+        original = (self.data_dir / "service-token").read_bytes()
+        self.assertNotIn(token, result.stdout + result.stderr)
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE((self.data_dir / "service-token").stat().st_mode), 0o600)
+        again = self.cli("init")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual((self.data_dir / "service-token").read_bytes(), original)
+        self.assertNotIn(token, again.stdout + again.stderr)
+
+    def test_cli_invalid_input_diagnostics_do_not_echo_credentials(self):
+        result = self.cli(SYNTHETIC_TOKEN)
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn(SYNTHETIC_TOKEN, result.stdout + result.stderr)
+        environment = dict(os.environ, ADAPTIVE_PLANNING_DATA_DIR=str(self.data_dir),
+                           ADAPTIVE_PLANNING_BASE_URL=f"http://user:{SYNTHETIC_TOKEN}@127.0.0.1:39123")
+        result = subprocess.run([sys.executable, "-B", "-m", "adaptive_planning", "serve"],
+                                env=environment, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(SYNTHETIC_TOKEN, result.stdout + result.stderr)
+        self.assertFalse(self.data_dir.exists())
+
+    def test_installed_project_command_runs_explicit_init(self):
+        environment = dict(os.environ, ADAPTIVE_PLANNING_DATA_DIR=str(self.data_dir),
+                           ADAPTIVE_PLANNING_BASE_URL="http://127.0.0.1:39123")
+        result = subprocess.run(["uv", "run", "--frozen", "adaptive-planning", "init"], env=environment,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        token = load_service_token(Config(self.data_dir))
+        self.assertNotIn(token, result.stdout + result.stderr)
+
+    def test_error_projection_preserves_headers_id_code_and_enforces_exact_budget(self):
+        from adaptive_planning.transport import MCPHttpErrors
+        from mcp.types import ErrorData, JSONRPCError
+        budget = 64 * 1024
+        def diagnostic(extra):
+            empty = JSONRPCError(jsonrpc="2.0", id="request-17", error=ErrorData(code=-32602, message=""))
+            empty_size = len(empty.model_dump_json(by_alias=True, exclude_unset=True).encode())
+            message = SYNTHETIC_TOKEN + "x" * (budget - empty_size - len(SYNTHETIC_TOKEN) + extra)
+            return JSONRPCError(jsonrpc="2.0", id="request-17", error=ErrorData(code=-32602, message=message)).model_dump_json(
+                by_alias=True, exclude_unset=True).encode()
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 422,
+                        "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(payload)).encode()),
+                                    (b"cache-control", b"no-store"), (b"x-public-probe", b"retained")]})
+            await send({"type": "http.response.body", "body": payload[:100], "more_body": True})
+            await send({"type": "http.response.body", "body": payload[100:]})
+        config = Config(self.data_dir)
+        headers = [("host", b"127.0.0.1:8790"), ("authorization", f"Bearer {SYNTHETIC_TOKEN}".encode())]
+        boundary = RequestBoundary(MCPHttpErrors(app), config, SYNTHETIC_TOKEN)
+        payload = diagnostic(0)
+        self.assertEqual(len(payload), budget)
+        status, response_headers, body = call(boundary, "POST", "/mcp", headers)
+        self.assertEqual(status, 422)
+        error = json.loads(body)
+        self.assertEqual((error["id"], error["error"]["code"]), ("request-17", -32602))
+        self.assertIn(("content-length", str(len(body))), response_headers)
+        self.assertIn(("cache-control", "no-store"), response_headers)
+        self.assertIn(("x-public-probe", "retained"), response_headers)
+        self.assertNotIn(SYNTHETIC_TOKEN.encode(), body)
+        payload = diagnostic(1)
+        self.assertEqual(len(payload), budget + 1)
+        status, response_headers, body = call(boundary, "POST", "/mcp", headers)
+        self.assertEqual((status, error_code(body)), (500, "internal_error"))
+        self.assertNotIn(("x-public-probe", "retained"), response_headers)
+        self.assertNotIn(SYNTHETIC_TOKEN.encode(), body)
+
+    def test_success_stream_is_forwarded_and_cancellation_propagates(self):
+        from adaptive_planning.transport import MCPHttpErrors
+        sent = []
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"text/event-stream")]})
+            self.assertEqual(len(sent), 1)
+            await send({"type": "http.response.body", "body": b"data: public\n\n", "more_body": True})
+            self.assertEqual(sent[-1]["body"], b"data: public\n\n")
+            raise asyncio.CancelledError
+        async def exercise():
+            async def receive():
+                return {"type": "http.disconnect"}
+            async def send(message):
+                sent.append(message)
+            with self.assertRaises(asyncio.CancelledError):
+                await MCPHttpErrors(app)(make_scope(), receive, send)
+        asyncio.run(exercise())
+        self.assertEqual(len(sent), 2)
+
+    def test_production_serving_configuration_boundary_no_redirect_and_secret_free_logs(self):
+        from adaptive_planning.__main__ import build_server
+        from starlette.applications import Starlette
+        self.data_dir.mkdir(mode=0o700)
+        token_path = self.data_dir / "service-token"
+        token_path.write_text(SYNTHETIC_TOKEN)
+        token_path.chmod(0o600)
+        sock = bound_ephemeral_socket()
+        self.addCleanup(sock.close)
+        port = sock.getsockname()[1]
+        self.assertNotEqual(port, 8790)
+        config = Config(self.data_dir, base_url=f"http://127.0.0.1:{port}")
+        server = build_server(config)
+        self.assertIsInstance(server.config.app, Starlette)
+        self.assertEqual((server.config.host, server.config.port, server.config.access_log), ("0.0.0.0", port, False))
+        self.assertIsInstance(server.config.app.middleware_stack, RequestBoundary)
+        captured = CapturedLogs()
+        loggers = [logging.getLogger(), logging.getLogger("uvicorn"), logging.getLogger("uvicorn.error")]
+        levels = [logger.level for logger in loggers]
+        for logger in loggers:
+            logger.addHandler(captured)
+            logger.setLevel(logging.DEBUG)
+        thread_errors = []
+        def run():
+            try:
+                server.run(sockets=[sock])
+            except BaseException as error:
+                thread_errors.append(error)
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            def wire(method, path, *headers, body=b"", length=None):
+                lines = "".join(f"{value}\r\n" for value in headers)
+                raw = (f"{method} {path} HTTP/1.1\r\n{lines}Content-Length: {len(body) if length is None else length}\r\n"
+                       "Connection: close\r\n\r\n").encode() + body
+                return TestService.wire(port, raw)
+            host = f"Host: 127.0.0.1:{port}"
+            auth = f"Authorization: Bearer {SYNTHETIC_TOKEN}"
+            for path in ("/", "/missing", "/mcp"):
+                status, payload = wire("GET", path, "Host: example.invalid", auth)
+                self.assertEqual((status, error_code(payload)), (403, "invalid_host"))
+                status, payload = wire("GET", path, host, "Origin: http://example.invalid", auth)
+                self.assertEqual((status, error_code(payload)), (403, "invalid_origin"))
+            for path in ("/mcp", "/mcp/", "/mcp?token=" + OTHER_TOKEN):
+                status, payload = wire("GET", path, host)
+                self.assertEqual((status, error_code(payload)), (401, "unauthorized"))
+            for path in ("/", "/?token=" + OTHER_TOKEN):
+                status, payload = wire("GET", path, host)
+                self.assertEqual(status, 200)
+                public = json.loads(payload)
+                self.assertEqual(public["dashboard_url"], config.base_url + "/")
+                self.assertNotIn(SYNTHETIC_TOKEN.encode(), payload)
+                self.assertNotIn(OTHER_TOKEN.encode(), payload)
+            status, payload = wire("POST", "/mcp?token=" + OTHER_TOKEN, host, auth,
+                                   "Accept: application/json, text/event-stream", "Content-Type: application/json", body=b"{}")
+            self.assertIn(status, {400, 422})
+            self.assertNotIn(SYNTHETIC_TOKEN.encode(), payload)
+            self.assertNotIn(OTHER_TOKEN.encode(), payload)
+            for fields, code, identifier in (({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                               "params": {"name": [SYNTHETIC_TOKEN], "arguments": {}}}, -32602, 1),
+                                              ({"jsonrpc": "2.0", "id": 1, "method": SYNTHETIC_TOKEN, "params": {}}, -32601, 1),
+                                              ({"jsonrpc": SYNTHETIC_TOKEN, "id": 1, "method": "tools/list", "params": {}}, -32602, None),
+                                              ({SYNTHETIC_TOKEN: SYNTHETIC_TOKEN}, -32602, None)):
+                status, payload = wire("POST", "/mcp", host, auth, "Accept: application/json, text/event-stream",
+                                       "Content-Type: application/json", body=json.dumps(fields).encode())
+                self.assertIn(status, {200, 400, 422})
+                self.assertNotIn(SYNTHETIC_TOKEN[:24].encode(), payload)
+                error = json.loads(payload)
+                self.assertEqual((error["id"], error["error"]["code"]), (identifier, code))
+                self.assertIsNone(error["error"].get("data"))
+            at_limit = b"{}" + b" " * (12 * 1024 * 1024 - 2)
+            status, payload = wire("POST", "/mcp", host, auth, "Accept: application/json, text/event-stream",
+                                   "Content-Type: application/json", body=at_limit)
+            self.assertIn(status, {400, 422})
+            # The SDK rejects an oversized declared body before consuming it.
+            status, payload = wire("POST", "/mcp", host, auth, "Accept: application/json, text/event-stream",
+                                   "Content-Type: application/json", length=12 * 1024 * 1024 + 1)
+            self.assertEqual(status, 413)
+        finally:
+            server.should_exit = True
+            thread.join(timeout=15)
+            sock.close()
+            for logger, level in zip(loggers, levels):
+                logger.removeHandler(captured)
+                logger.setLevel(level)
+        self.assertFalse(thread.is_alive(), "owned production server thread did not settle")
+        self.assertEqual(thread_errors, [])
+        with self.assertRaises(OSError):
+            socket.create_connection(("127.0.0.1", port), timeout=0.5)
+        self.assertTrue(captured.lines)
+        for line in captured.lines:
+            for secret in (SYNTHETIC_TOKEN, OTHER_TOKEN):
+                self.assertNotIn(secret, line)
+                self.assertNotIn(secret[:24], line)
 
 
 if __name__ == "__main__":

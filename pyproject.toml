@@ -15,5 +15,8 @@ dependencies = [
     "pydantic==2.13.5",
 ]
 
+[project.scripts]
+adaptive-planning = "adaptive_planning.__main__:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["adaptive_planning"]

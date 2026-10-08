@@ -3,8 +3,17 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
-from datetime import datetime
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Callable
+
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
+
+from adaptive_planning.admin import load_service_token
+from adaptive_planning.config import Config, RequestBoundary, http_allowlist
 
 from adaptive_planning import plans
 from adaptive_planning.ownership import command_relay, require_kind_capabilities, require_orchestrator
@@ -111,3 +120,45 @@ class PlanningService:
     ) -> CoordinationPage:
         return self._run_read(  # type: ignore[return-value]
             lambda db: plans.read_coordination_page(db, plan_id, after, limit))
+
+
+def build_app(config: Config) -> Starlette:
+    """Compose one service authority, its future dashboard interface and the official MCP app."""
+    # Credential loading precedes even Store construction: ordinary startup never initializes it.
+    token = load_service_token(config)
+    clock = lambda: datetime.now(timezone.utc)
+    service = PlanningService(Store(config.data_dir / "planning.sqlite", clock), base_url=config.base_url, clock=clock)
+    from adaptive_planning.transport import MCPHttpErrors, build_mcp
+    server = build_mcp(service)
+    allowed_host, allowed_origin = http_allowlist(config)
+    mcp_app = server.streamable_http_app(
+        streamable_http_path="/mcp", json_response=True, stateless_http=True,
+        max_request_body_size=12 * 1024 * 1024,
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True,
+                                                    allowed_hosts=[allowed_host], allowed_origins=[allowed_origin]),
+        host="0.0.0.0",
+    )
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async with server.session_manager.run():
+            yield
+
+    async def dashboard_placeholder(request):
+        return JSONResponse(plans.to_jsonable(service.read_service_info()), headers={"Cache-Control": "no-store"})
+
+    async def public_server_error(request, error):
+        # Starlette can answer before re-raising to the outer RequestBoundary. Ignore
+        # exception text and use the boundary's same constant public failure shape.
+        return JSONResponse({"error": {"code": "internal_error", "message": "The request could not be completed."}},
+                            status_code=500, headers={"Cache-Control": "no-store"})
+
+    app = Starlette(routes=[Route("/", dashboard_placeholder, methods=["GET", "HEAD"]),
+                            Mount("/", app=MCPHttpErrors(mcp_app))], lifespan=lifespan,
+                    exception_handlers={500: public_server_error})
+    app.state.service = service
+    app.state.mcp = server
+    # Starlette normally places ServerErrorMiddleware outside user middleware. Wrap the
+    # complete eagerly built stack so every route and error path meets the same boundary.
+    app.middleware_stack = RequestBoundary(app.build_middleware_stack(), config, token)
+    return app

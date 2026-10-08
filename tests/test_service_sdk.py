@@ -1,10 +1,15 @@
 """Test suite proving the pinned MCP SDK and client transport contract."""
 
 import asyncio
-from dataclasses import dataclass
+import copy
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
 import errno
 import json
+import logging
+from pathlib import Path
 import socket
+from tempfile import TemporaryDirectory
 from typing import Any
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -17,6 +22,10 @@ from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
 from mcp.types import TextContent
 import uvicorn
+
+from adaptive_planning import plans
+from tests.service_fixtures import draft, make_service
+from tests.test_service_http import CapturedLogs, SYNTHETIC_TOKEN
 
 
 @dataclass(frozen=True)
@@ -339,7 +348,319 @@ async def probe_protocols() -> tuple[SdkProbe, ...]:
     return probes
 
 
-class TestServiceSdk(unittest.TestCase):
+@asynccontextmanager
+async def running_service(app, sock):
+    """Run and settle only the supplied ephemeral listener, including failure paths."""
+    server = uvicorn.Server(uvicorn.Config(app, log_config=None, access_log=False, lifespan="on"))
+    task = asyncio.create_task(server.serve(sockets=[sock]))
+    try:
+        async def ready():
+            while not server.started:
+                if task.done():
+                    task.result()
+                    raise RuntimeError("Owned server exited before readiness")
+                await asyncio.sleep(0)
+        await asyncio.wait_for(ready(), 5)
+        yield server
+    finally:
+        try:
+            await shutdown_probe_server(server, task)
+        finally:
+            sock.close()
+
+
+class TestService(unittest.TestCase):
+    def setUp(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.f = make_service(Path(directory.name))
+
+    def command_input(self, kind="create_plan", payload=None, **fields):
+        if payload is None:
+            payload = {"creation_id": "sdk-create", "draft": draft(), "new_plan_intent": None}
+        return plans.to_jsonable(self.f.command(kind, payload, **fields))
+
+    def snapshot(self):
+        return self.f.store.read(lambda db: tuple(db.iterdump()))
+
+    @staticmethod
+    def result_json(result):
+        return json.dumps(result.model_dump(mode="json", by_alias=True))
+
+    def test_tools_use_service_and_private_mutation_result(self):
+        from adaptive_planning.transport import build_mcp
+        server = build_mcp(self.f.service)
+        async def exercise():
+            created = await server.call_tool("create_plan", {"command": self.command_input()})
+            self.assertFalse(created.is_error, created.content)
+            receipt = created.structured_content
+            metadata = receipt["committed_metadata"]
+            plan_id = metadata["plan_id"]
+            token = receipt["private"]["orchestrator_token"]
+            self.assertTrue(token)
+            self.assertEqual(metadata["epoch"], self.f.epoch)
+            self.assertEqual(metadata["revision"], 1)
+            raw = self.command_input()
+            raw.update(kind="revise_plan", key="sdk-revise", plan_id=plan_id,
+                       generation=metadata["generation"], expected_revision=1,
+                       ownership_version=1, orchestrator_token=token,
+                       payload=plans.to_jsonable({"draft": replace(self.f.service.read_plan(plan_id).draft, next_check="Revised SDK next check"),
+                                                "reason": "SDK revision", "authorization_change": None}))
+            revised = await server.call_tool("revise_plan", {"command": raw})
+            self.assertFalse(revised.is_error, revised.content)
+            self.assertEqual(revised.structured_content["current_metadata"]["revision"], 2)
+            for name, arguments in (
+                ("read_service_info", {}), ("list_plans", {}), ("read_plan", {"plan_id": plan_id}),
+                ("read_events", {"plan_id": plan_id}), ("list_ready", {"plan_id": plan_id}),
+                ("read_coordination", {"plan_id": plan_id}),
+            ):
+                result = await server.call_tool(name, arguments)
+                self.assertFalse(result.is_error, result.content)
+                encoded = self.result_json(result)
+                self.assertNotIn(token, encoded)
+                self.assertNotIn("orchestrator_token", encoded)
+                self.assertNotIn("attempt_token", encoded)
+                self.assertNotIn('"private"', encoded)
+            public = (await server.call_tool("read_plan", {"plan_id": plan_id})).structured_content
+            self.assertEqual(public["metadata"], revised.structured_content["current_metadata"])
+            self.assertEqual(public["draft"]["next_check"], "Revised SDK next check")
+            takeover = copy.deepcopy(raw)
+            takeover.update(kind="takeover", key="sdk-takeover", expected_revision=2,
+                            orchestrator_token=None, payload={"expected_ownership_version": 1, "reason": "New owner"})
+            taken = await server.call_tool("takeover", {"command": takeover})
+            self.assertFalse(taken.is_error, taken.content)
+            self.assertEqual(taken.structured_content["current_metadata"]["ownership_version"], 2)
+            self.assertNotEqual(taken.structured_content["private"]["orchestrator_token"], token)
+        asyncio.run(exercise())
+
+    def test_no_assignment_tool_in_planning_milestone(self):
+        from adaptive_planning.transport import build_mcp
+        names = asyncio.run(list_tool_names(build_mcp(self.f.service)))
+        self.assertEqual(set(names), {"read_service_info", "list_plans", "read_plan", "read_events",
+                                      "list_ready", "read_coordination", "create_plan", "revise_plan", "takeover"})
+        self.assertIn("create_plan", names)
+        self.assertNotIn("assign_step", names)
+
+    def invalid_commands(self):
+        base = self.command_input()
+        variants = []
+        for edit in (
+            {"kind": SYNTHETIC_TOKEN}, {"expected_revision": SYNTHETIC_TOKEN},
+            {"orchestrator_token": {SYNTHETIC_TOKEN: SYNTHETIC_TOKEN}},
+            {SYNTHETIC_TOKEN: "unknown"},
+            {"payload": {**base["payload"], SYNTHETIC_TOKEN: SYNTHETIC_TOKEN}},
+            {"payload": {**base["payload"], "draft": {**base["payload"]["draft"], SYNTHETIC_TOKEN: "unknown"}}},
+            {"payload": {**base["payload"], "draft": {**base["payload"]["draft"], "objective": [SYNTHETIC_TOKEN]}}},
+        ):
+            variants.append({"command": {**copy.deepcopy(base), **edit}})
+        variants.extend(({"command": SYNTHETIC_TOKEN}, {"command": base, SYNTHETIC_TOKEN: "unknown"}))
+        variants.append({"command": {**copy.deepcopy(base), "kind": "takeover",
+                                      "payload": {"expected_ownership_version": 1, "reason": SYNTHETIC_TOKEN}}})
+        return variants
+
+    def test_invalid_arguments_and_sdk_failures_are_secret_free_and_atomic(self):
+        from adaptive_planning.transport import build_mcp
+        captured = CapturedLogs()
+        root = logging.getLogger()
+        old_level = root.level
+        root.addHandler(captured)
+        root.setLevel(logging.DEBUG)
+        self.addCleanup(root.setLevel, old_level)
+        self.addCleanup(root.removeHandler, captured)
+        server = build_mcp(self.f.service)
+        before = self.snapshot()
+        async def exercise():
+            for arguments in self.invalid_commands():
+                result = await server.call_tool("create_plan", arguments)
+                self.assertTrue(result.is_error)
+                text = self.result_json(result)
+                self.assertNotIn(SYNTHETIC_TOKEN, text)
+                self.assertNotIn(SYNTHETIC_TOKEN[:24], text)
+                self.assertEqual(self.snapshot(), before)
+            result = await server.call_tool(SYNTHETIC_TOKEN, {})
+            self.assertTrue(result.is_error)
+            self.assertNotIn(SYNTHETIC_TOKEN, self.result_json(result))
+            with patch.object(self.f.service, "execute", side_effect=RuntimeError(SYNTHETIC_TOKEN)):
+                failed = await server.call_tool("create_plan", {"command": self.command_input()})
+            self.assertTrue(failed.is_error)
+            self.assertEqual(failed.structured_content["error"]["code"], "internal_error")
+            self.assertNotIn(SYNTHETIC_TOKEN, self.result_json(failed))
+            self.assertEqual(self.snapshot(), before)
+        asyncio.run(exercise())
+        for line in captured.lines:
+            self.assertNotIn(SYNTHETIC_TOKEN, line)
+            self.assertNotIn(SYNTHETIC_TOKEN[:24], line)
+
+    def test_list_plans_aggregate_is_bounded_without_truncation(self):
+        from adaptive_planning.transport import build_mcp
+        for number in range(2):
+            self.f.service.execute(self.f.command("create_plan", {
+                "creation_id": f"aggregate-{number}", "draft": replace(draft(), objective=f"Plan {number}"),
+                "new_plan_intent": "Separate bounded aggregate plan" if number else None}))
+        server = build_mcp(self.f.service)
+        full = asyncio.run(server.call_tool("list_plans", {}))
+        self.assertFalse(full.is_error)
+        self.assertEqual(len(full.structured_content["plans"]), 2)
+        size = len("".join(item.text for item in full.content if isinstance(item, TextContent)).encode())
+        individual = max(len(plans.canonical_bytes(p)) for p in self.f.service.list_plans())
+        self.assertGreater(size, individual)
+        with patch.object(plans, "MAX_PAGE_BYTES", size):
+            at_limit = asyncio.run(server.call_tool("list_plans", {}))
+            self.assertFalse(at_limit.is_error)
+            self.assertEqual(len(at_limit.structured_content["plans"]), 2)
+        with patch.object(plans, "MAX_PAGE_BYTES", size - 1):
+            rejected = asyncio.run(server.call_tool("list_plans", {}))
+            self.assertTrue(rejected.is_error)
+            self.assertEqual(rejected.structured_content["error"]["code"], "limit_exceeded")
+
+    def test_duplicate_plan_error_keeps_public_code_and_does_not_mutate(self):
+        from adaptive_planning.transport import build_mcp
+        server = build_mcp(self.f.service)
+        created = asyncio.run(server.call_tool("create_plan", {"command": self.command_input()}))
+        self.assertFalse(created.is_error)
+        before = self.snapshot()
+        duplicate = self.command_input(payload={"creation_id": SYNTHETIC_TOKEN, "draft": draft(), "new_plan_intent": None})
+        result = asyncio.run(server.call_tool("create_plan", {"command": duplicate}))
+        self.assertTrue(result.is_error)
+        self.assertEqual(result.structured_content["error"]["code"], "duplicate_candidate")
+        self.assertNotIn(SYNTHETIC_TOKEN, self.result_json(result))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_schema_error_diagnostics_stay_bounded_and_secret_free(self):
+        from adaptive_planning.transport import build_mcp
+        server = build_mcp(self.f.service)
+        command = self.command_input()
+        command.update({f"{SYNTHETIC_TOKEN}-{number}": SYNTHETIC_TOKEN for number in range(200)})
+        before = self.snapshot()
+        with patch.object(plans, "MAX_PAGE_BYTES", 4096):
+            result = asyncio.run(server.call_tool("create_plan", {"command": command}))
+        self.assertTrue(result.is_error)
+        self.assertEqual(result.structured_content["error"]["code"], "invalid")
+        self.assertEqual(result.structured_content["error"]["validation_error_count"], 200)
+        text = "".join(block.text for block in result.content if isinstance(block, TextContent))
+        self.assertLessEqual(len(text.encode()), 4096)
+        self.assertNotIn(SYNTHETIC_TOKEN[:24], text)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_shared_app_two_protocols_wire_errors_and_lifecycle(self):
+        from adaptive_planning.app import build_app
+        from adaptive_planning.config import Config
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(128)
+        self.addCleanup(sock.close)
+        port = sock.getsockname()[1]
+        self.assertNotEqual(port, 8790)
+        config = Config(self.f.directory, base_url=f"http://127.0.0.1:{port}")
+        token_path = config.data_dir / "service-token"
+        token_path.write_text(SYNTHETIC_TOKEN)
+        token_path.chmod(0o600)
+        app = build_app(config)
+        captured = CapturedLogs()
+        root = logging.getLogger()
+        root.addHandler(captured)
+        old_level = root.level
+        root.setLevel(logging.DEBUG)
+        self.addCleanup(root.setLevel, old_level)
+        self.addCleanup(root.removeHandler, captured)
+        private_tokens = []
+        async def exercise():
+            async with running_service(app, sock):
+                # Preserve actual wire observations while using the production stack.
+                app.middleware_stack = RequestCapturingMiddleware(app.middleware_stack)
+                for mode, version in (("auto", "2026-07-28"), ("legacy", "2025-11-25")):
+                    async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {SYNTHETIC_TOKEN}"},
+                                                 follow_redirects=False) as http_client:
+                        async with Client(streamable_http_client(config.base_url + "/mcp", http_client=http_client), mode=mode) as client:
+                            self.assertEqual(str(client.protocol_version), version)
+                            names = {tool.name for tool in (await client.list_tools()).tools}
+                            self.assertIn("create_plan", names)
+                            self.assertNotIn("assign_step", names)
+                            info = await client.call_tool("read_service_info", {})
+                            self.assertFalse(info.is_error)
+                            self.assertEqual(info.structured_content["dashboard_url"], config.base_url + "/")
+                            creation = self.command_input(payload={"creation_id": f"wire-{mode}", "draft": draft(),
+                                                                 "new_plan_intent": "Separate protocol fixture" if mode == "legacy" else None})
+                            created = await client.call_tool("create_plan", {"command": creation})
+                            self.assertFalse(created.is_error, created.content)
+                            receipt = created.structured_content
+                            metadata = receipt["committed_metadata"]
+                            plan_id = metadata["plan_id"]
+                            grant = receipt["private"]["orchestrator_token"]
+                            private_tokens.append(grant)
+                            revision = {**creation, "kind": "revise_plan", "key": f"wire-revise-{mode}",
+                                        "plan_id": plan_id, "generation": metadata["generation"], "expected_revision": 1,
+                                        "ownership_version": 1, "orchestrator_token": grant,
+                                        "payload": plans.to_jsonable({"draft": replace(self.f.service.read_plan(plan_id).draft,
+                                                                                      next_check="Wire next check"),
+                                                                     "reason": "Protocol revision", "authorization_change": None})}
+                            revised = await client.call_tool("revise_plan", {"command": revision})
+                            self.assertFalse(revised.is_error, revised.content)
+                            self.assertEqual(revised.structured_content["current_metadata"]["revision"], 2)
+                            for name, arguments in (("list_plans", {}), ("read_plan", {"plan_id": plan_id}),
+                                                    ("read_events", {"plan_id": plan_id}), ("list_ready", {"plan_id": plan_id}),
+                                                    ("read_coordination", {"plan_id": plan_id})):
+                                public = await client.call_tool(name, arguments)
+                                self.assertFalse(public.is_error, public.content)
+                                self.assertNotIn(grant, self.result_json(public))
+                                self.assertNotIn("orchestrator_token", self.result_json(public))
+                            takeover = {**revision, "kind": "takeover", "key": f"wire-takeover-{mode}",
+                                        "expected_revision": 2, "orchestrator_token": None,
+                                        "payload": {"expected_ownership_version": 1, "reason": "Wire takeover"}}
+                            taken = await client.call_tool("takeover", {"command": takeover})
+                            self.assertFalse(taken.is_error, taken.content)
+                            self.assertEqual(taken.structured_content["current_metadata"]["ownership_version"], 2)
+                            private_tokens.append(taken.structured_content["private"]["orchestrator_token"])
+                            before = self.snapshot()
+                            for arguments in self.invalid_commands():
+                                result = await client.call_tool("create_plan", arguments)
+                                self.assertTrue(result.is_error)
+                                self.assertNotIn(SYNTHETIC_TOKEN[:24], self.result_json(result))
+                                self.assertEqual(self.snapshot(), before)
+                            unknown = await client.call_tool(SYNTHETIC_TOKEN, {})
+                            self.assertTrue(unknown.is_error)
+                            self.assertNotIn(SYNTHETIC_TOKEN, self.result_json(unknown))
+                    # Force the actual SDK malformed-envelope response beyond a tiny
+                    # diagnostic budget, then prove a healthy subsequent request still works.
+                    from adaptive_planning.transport import MCPHttpErrors
+                    projection = next(route.app for route in app.routes if isinstance(getattr(route, "app", None), MCPHttpErrors))
+                    with patch.object(projection, "max_error_body_bytes", 1):
+                        async with httpx2.AsyncClient() as http_client:
+                            response = await http_client.post(config.base_url + "/mcp",
+                                headers={"Authorization": f"Bearer {SYNTHETIC_TOKEN}",
+                                         "Accept": "application/json, text/event-stream"},
+                                json={"jsonrpc": SYNTHETIC_TOKEN, "id": 1, "method": "tools/list"})
+                            self.assertEqual(response.status_code, 500)
+                            self.assertNotIn(SYNTHETIC_TOKEN[:24], response.text)
+                            self.assertTrue(response.headers["content-type"].startswith("application/json"))
+                            self.assertEqual(response.json()["error"]["code"], "internal_error")
+                            self.assertEqual(response.headers["content-length"], str(len(response.content)))
+                    async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {SYNTHETIC_TOKEN}"}) as http_client:
+                        async with Client(streamable_http_client(config.base_url + "/mcp", http_client=http_client), mode=mode) as client:
+                            healthy = await client.call_tool("read_service_info", {})
+                            self.assertFalse(healthy.is_error)
+                    self.assertEqual(self.snapshot(), before)
+                    requests = app.middleware_stack.captured_requests
+                    selected = [r for r in requests if r.method in ("tools/list", "tools/call")
+                                and r.headers.get("mcp-protocol-version") == version]
+                    self.assertTrue(selected)
+                    self.assertEqual({r.path for r in selected}, {"/mcp"})
+                    self.assertTrue(all(r.headers.get("authorization") == f"Bearer {SYNTHETIC_TOKEN}" for r in selected))
+                self.assertEqual(len(self.f.service.list_plans()), 2)
+        asyncio.run(exercise())
+        with self.assertRaises(OSError):
+            socket.create_connection(("127.0.0.1", port), timeout=0.5)
+        for line in captured.lines:
+            # The test's SDK client has its own DEBUG wire logger. The service owns
+            # server diagnostics; client-side logging is outside this server contract.
+            if line.startswith("mcp.client."):
+                continue
+            self.assertNotIn(SYNTHETIC_TOKEN, line)
+            self.assertNotIn(SYNTHETIC_TOKEN[:24], line)
+            for grant in private_tokens:
+                self.assertNotIn(grant, line)
+        self.assertTrue(any(line.startswith("adaptive_planning.transport:") for line in captured.lines))
+
     def test_list_tool_names(self):
         server = MCPServer(name="synthetic-server")
 
