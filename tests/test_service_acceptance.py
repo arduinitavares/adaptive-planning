@@ -10,9 +10,9 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
-from adaptive_planning import attempts, core, plans
-from adaptive_planning.types import Availability, DomainError, Evidence, ResourceClaim, RetirementRequest, Review
-from tests.service_fixtures import checkpoint, context, make_service, seed_orphan_use, step, workspace
+from adaptive_planning import attempts, core, plans, reviews
+from adaptive_planning.types import AuthorizationChange, Availability, DomainError, Evidence, ResourceClaim, RetirementRequest, Review
+from tests.service_fixtures import checkpoint, context, draft, make_service, seed_orphan_use, step, workspace
 
 
 FACT_KEYS = (
@@ -101,6 +101,444 @@ class TestService(unittest.TestCase):
             "disposition": disposition, "corrective_step_id": corrective, "corrected_result_version": result,
             "evidence": value.evidence, "reason": "explicit proved resolution",
         }, receipt=p))
+
+    def final_gate_state(self):
+        # Omit request responses and capability secrets from rollback diagnostics.
+        retained = self.f.store.read(lambda db: tuple(
+            (table, tuple(db.execute(f"SELECT * FROM {table} ORDER BY rowid")))
+            for table in ("checkpoints", "reviews", "creation_ids")))
+        return self.authority(), retained
+
+    def final_gate_refused(self, command, code="invalid"):
+        before = self.final_gate_state()
+        with self.assertRaises(DomainError) as error:
+            self.f.service.execute(command)
+        self.assertEqual(error.exception.code, code)
+        self.assertEqual(self.final_gate_state(), before)
+
+    def gate_revision_command(self, p, *, steps=None, retirements=(), change=None, **changes):
+        current = self.f.service.read_plan(p.current_metadata.plan_id).draft
+        revised = replace(current, steps=current.steps if steps is None else steps, **changes)
+        return self.f.command("revise_plan", {
+            "draft": revised, "reason": "Explicit final-review graph decision",
+            "authorization_change": change, "retire_steps": retirements,
+        }, receipt=p)
+
+    def bind_gate_inputs(self, p, assigned, bindings):
+        return self.f.service.execute(self.f.command("bind_availability", {
+            "bindings": tuple(bindings), "checked_base": "synthetic-consumer-base",
+        }, receipt=p, attempt=assigned))
+
+    def gate_worker_command(self, kind, p, attempt, payload, *, key=None):
+        command = self.f.command(kind, payload, receipt=p, attempt=attempt, key=key)
+        return replace(command, expected_revision=None, ownership_version=None)
+
+    def accepted_gate_history(self, p, target):
+        pid = p.current_metadata.plan_id
+        return self.f.store.read(lambda db: {
+            table: tuple(db.execute(sql, (pid, target))) for table, sql in {
+                "steps": "SELECT * FROM steps WHERE plan_id=? AND step_id=?",
+                "attempts": "SELECT * FROM attempts WHERE plan_id=? AND step_id=? ORDER BY rowid",
+                "results": "SELECT * FROM result_versions WHERE plan_id=? AND step_id=? ORDER BY rowid",
+                "checkpoints": "SELECT * FROM checkpoints WHERE plan_id=?1 AND attempt_id IN "
+                               "(SELECT attempt_id FROM attempts WHERE plan_id=?1 AND step_id=?2) ORDER BY rowid",
+                "acceptance": "SELECT sequence,plan_revision,kind,payload FROM events WHERE plan_id=? "
+                              "AND kind='accept_step' AND json_extract(payload,'$.step_id')=? ORDER BY sequence",
+            }.items()})
+
+    def test_final_gate_creation_requires_explicit_review_transactionally(self):
+        malformed = draft(steps=(step("final", final_gate=True),))
+        command = self.f.command("create_plan", {
+            "creation_id": "final-invariant", "draft": malformed, "new_plan_intent": None,
+        }, key="final-create")
+        self.final_gate_refused(command)
+        self.assertEqual(self.f.service.list_plans(include_terminal=True), ())
+        corrected = replace(malformed, steps=(step("final", final_gate=True, review_required=True),))
+        accepted = self.f.service.execute(replace(command, payload={**command.payload, "draft": corrected}))
+        self.assertFalse(accepted.replayed)
+        self.assertEqual(self.f.service.read_plan(accepted.current_metadata.plan_id).draft.steps, corrected.steps)
+
+    def test_final_gate_revision_requires_explicit_review_transactionally(self):
+        p = self.f.create(steps=(step("a"),))
+        current = self.f.service.read_plan(p.current_metadata.plan_id).draft
+        malformed = replace(current, steps=(*current.steps, step("final", ("a",), final_gate=True)))
+        command = self.f.command("revise_plan", {
+            "draft": malformed, "reason": "Add the final review gate", "authorization_change": None,
+            "retire_steps": (),
+        }, receipt=p, key="final-revision")
+        self.final_gate_refused(command)
+        corrected = replace(malformed, steps=(*current.steps, step("final", ("a",), final_gate=True, review_required=True)))
+        applied = self.f.service.execute(replace(command, payload={**command.payload, "draft": corrected}))
+        self.assertFalse(applied.replayed)
+        self.assertEqual(self.f.service.read_plan(p.current_metadata.plan_id).draft.steps, corrected.steps)
+
+    def test_final_gate_reassessment_apply_requires_review_but_proposal_is_diagnostic(self):
+        p = self.f.create(steps=(step("a"),))
+        active = self.f.start(p, self.f.assign(p))
+        current = self.f.service.read_plan(p.current_metadata.plan_id).draft
+        malformed = replace(current, steps=(*current.steps, step("final", ("a",), final_gate=True)))
+        value = checkpoint(affected=("a",))
+        value = replace(value, reassessment=replace(value.reassessment, proposed_draft=malformed))
+        published = self.f.submit(p, active, value)
+        self.assertEqual(self.f.service.read_plan(p.current_metadata.plan_id).draft, current)
+        command = self.f.command("resolve_reassessment", {
+            "checkpoint_id": published.committed["checkpoint_id"], "decision": "apply",
+            "reason": "Apply the proposed final gate", "draft": malformed, "affected_steps": (),
+            "unbounded": False,
+        }, receipt=p, key="final-reassessment")
+        self.final_gate_refused(command)
+        corrected = replace(malformed, steps=(*current.steps, step("final", ("a",), final_gate=True, review_required=True)))
+        applied = self.f.service.execute(replace(command, payload={**command.payload, "draft": corrected}))
+        self.assertFalse(applied.replayed)
+        view = self.f.service.read_plan(p.current_metadata.plan_id)
+        self.assertEqual(view.draft.steps, corrected.steps)
+        self.assertFalse(view.coordination.has_plan_holds)
+
+    def test_final_review_not_circular_task_gate(self):
+        p = self.f.create(steps=(step("a"), step("final", ("a",), final_gate=True, review_required=True)),
+                          creation_id="final-plan")
+        prior, prior_value = self.live_accept(p, "a")
+        pid = p.current_metadata.plan_id
+        original = self.accepted_gate_history(p, "a")
+        view = self.f.service.read_plan(pid)
+        self.assertEqual(view.coordination.reviews, ())
+        self.assertTrue({s.step_id: s.ready for s in self.f.service.list_ready(pid)}["final"])
+        self.assertNotEqual(view.status, "complete")
+        assigned = self.f.assign(p, "final")
+        self.final_gate_refused(self.gate_worker_command("start_step", p, assigned, {
+            "origin_worker": "worker-a", "relay": None, "observed_activity": "Start after checking inputs",
+        }))
+        binding = self.binding(prior, prior_value, "a")
+        self.assertNotEqual(binding.result_version, prior_value.artifact.version)
+        self.final_gate_refused(self.f.command("bind_availability", {
+            "bindings": (replace(binding, result_version=prior_value.artifact.version),),
+            "checked_base": "synthetic-consumer-base",
+        }, receipt=p, attempt=assigned))
+        self.bind_gate_inputs(p, assigned, (binding,))
+        active = self.f.start(p, assigned)
+        value = checkpoint()
+        self.f.submit(p, active, value)
+        self.final_gate_refused(self.accept_command(p, active, value))
+        self.review(p, value, verdict="failed", target="final")
+        self.final_gate_refused(self.accept_command(p, active, value))
+        self.f.service.execute(self.f.command("reopen_attempt", {
+            "reason": "Correct the failed final artifact explicitly",
+        }, receipt=p, attempt=active))
+        corrected = checkpoint(artifact_version="v2")
+        self.f.submit(p, active, corrected)
+        self.final_gate_refused(self.f.command("record_review", {
+            "step_id": "final", "review": Review("reviewer", value.artifact, "passed", (), value.evidence, None),
+        }, receipt=p))
+        self.final_gate_refused(self.accept_command(p, active, corrected))
+        passed = self.review(p, corrected, target="final")
+        command = self.accept_command(p, active, corrected)
+        self.assertIsNone(command.attempt_token)
+        accepted = self.f.service.execute(command)
+        proof = json.loads(self.row(p, active)[3])
+        self.assertEqual(proof["review_id"], passed.committed["review_id"])
+        self.assertEqual(proof["artifact"], plans.to_jsonable(corrected.artifact))
+        self.assertTrue(proof["definition"]["final_gate"])
+        self.assertTrue(proof["definition"]["review_required"])
+        uuid.UUID(accepted.committed["result_version"])
+        self.assertEqual(self.f.service.read_plan(pid).status, "complete")
+        self.assertEqual(self.accepted_gate_history(p, "a"), original)
+
+    def test_multiple_final_gates_use_ordinary_dependencies_without_sink_or_closure(self):
+        p = self.f.create(steps=(step("a"), step("first-final", ("a",), final_gate=True, review_required=True),
+                                step("independent-final", final_gate=True, review_required=True),
+                                step("tail", ("first-final",))))
+        self.live_accept(p, "independent-final")
+        prior, value = self.live_accept(p, "a")
+        final, final_value = self.live_accept(p, "first-final", bindings=(self.binding(prior, value, "a"),))
+        self.assertNotEqual(self.f.service.read_plan(p.current_metadata.plan_id).status, "complete")
+        self.live_accept(p, "tail", bindings=(self.binding(final, final_value, "first-final"),))
+        self.assertEqual(self.f.service.read_plan(p.current_metadata.plan_id).status, "complete")
+
+    def test_final_gate_flags_do_not_replace_core_cycle_validation(self):
+        command = self.f.command("create_plan", {
+            "creation_id": "final-cycle", "new_plan_intent": None,
+            "draft": draft(steps=(step("a", ("final",)), step("final", ("a",), final_gate=True, review_required=True))),
+        })
+        self.final_gate_refused(command)
+
+    def test_legacy_final_gate_survivor_requires_repair_when_legally_mutable(self):
+        # TEST-ONLY pre-invariant creation; all other service guards remain active.
+        with mock.patch.object(reviews, "_validate_final_gate_flags", return_value=None, create=True):
+            p = self.f.create(steps=(step("legacy", final_gate=True),))
+        current = self.f.service.read_plan(p.current_metadata.plan_id).draft
+        self.final_gate_refused(self.gate_revision_command(p, facts=(*current.facts, "A new observed fact")))
+        repaired = replace(current.steps[0], review_required=True, definition_version="v2")
+        self.f.service.execute(self.gate_revision_command(p, steps=(repaired,)))
+        self.assertEqual(self.f.service.read_plan(p.current_metadata.plan_id).draft.steps, (repaired,))
+        self.live_accept(p, "legacy")
+        self.assertEqual(self.f.service.read_plan(p.current_metadata.plan_id).status, "complete")
+
+    def test_legacy_final_gate_retirement_exception_requires_exact_existing_definition(self):
+        # TEST-ONLY pre-invariant creation; retirement/cancellation are real public operations.
+        with mock.patch.object(reviews, "_validate_final_gate_flags", return_value=None, create=True):
+            p = self.f.create(steps=(step("legacy", final_gate=True),))
+        current = self.f.service.read_plan(p.current_metadata.plan_id).draft
+        retirement = RetirementRequest("legacy", "End the old route without changing its definition")
+        cases = (
+            ((replace(current.steps[0], title="Changed old definition"),), (retirement,)),
+            ((*current.steps, step("new-bad", final_gate=True)),
+             (retirement, RetirementRequest("new-bad", "New malformed work cannot borrow the exception"))),
+            (current.steps, (retirement, RetirementRequest("unknown", "Unknown retirement still refuses"))),
+            (current.steps, (retirement, retirement)),
+            (current.steps, (RetirementRequest("legacy", " "),)),
+        )
+        for definitions, retirements in cases:
+            self.final_gate_refused(self.gate_revision_command(p, steps=definitions, retirements=retirements))
+        replacement = step("replacement", final_gate=True, review_required=True)
+        self.f.service.execute(self.gate_revision_command(p, steps=(*current.steps, replacement), retirements=(retirement,)))
+        view = self.f.service.read_plan(p.current_metadata.plan_id)
+        self.assertEqual(view.draft.steps, (*current.steps, replacement))
+        self.assertEqual(view.legacy_snapshot["steps"][0]["status"], "retired")
+
+    def test_legacy_retired_final_gate_history_retention_is_exact(self):
+        # TEST-ONLY pre-invariant flags; no history, auth or graph bypass.
+        with mock.patch.object(reviews, "_validate_final_gate_flags", return_value=None, create=True):
+            p = self.f.create(steps=(step("legacy", final_gate=True),))
+            self.f.service.execute(self.gate_revision_command(
+                p, retirements=(RetirementRequest("legacy", "Retain the pre-invariant closed definition"),)))
+        prior = self.f.service.read_plan(p.current_metadata.plan_id)
+        replacement = step("replacement", final_gate=True, review_required=True)
+        self.f.service.execute(self.gate_revision_command(p, steps=(*prior.draft.steps, replacement)))
+        current = self.f.service.read_plan(p.current_metadata.plan_id).draft
+        self.assertEqual(current.steps[0], prior.draft.steps[0])
+        for changed in (replace(current.steps[0], title="Changed closed history"),
+                        replace(current.steps[0], review_required=True)):
+            with self.subTest(changed=changed):
+                self.final_gate_refused(self.gate_revision_command(p, steps=(changed, *current.steps[1:])))
+        self.final_gate_refused(self.gate_revision_command(p, steps=(*current.steps, step("new-bad", final_gate=True))))
+        self.live_accept(p, "replacement")
+        self.assertEqual(self.f.service.read_plan(p.current_metadata.plan_id).status, "complete")
+
+    def test_legacy_submitted_final_gate_reassessment_cannot_borrow_retirement_intent(self):
+        # TEST-ONLY pre-invariant flags; this is an actual submitted checkpoint.
+        with mock.patch.object(reviews, "_validate_final_gate_flags", return_value=None, create=True):
+            p, _, active, published, value, _ = self.submitted(steps=(step("a", final_gate=True),))
+        current = self.f.service.read_plan(p.current_metadata.plan_id).draft
+        replacement = step("replacement", final_gate=True, review_required=True)
+        revised = replace(current, steps=(*current.steps, replacement))
+        self.final_gate_refused(self.f.command("resolve_reassessment", {
+            "checkpoint_id": published.committed["checkpoint_id"], "decision": "apply",
+            "reason": "Reassessment has no retirement payload", "draft": revised, "affected_steps": (), "unbounded": False,
+        }, receipt=p))
+        self.final_gate_refused(self.gate_revision_command(
+            p, steps=(replace(current.steps[0], review_required=True),)))
+        self.f.service.execute(self.gate_revision_command(
+            p, steps=revised.steps, retirements=(RetirementRequest("a", "Explicitly retire the frozen legacy route"),)))
+        view = self.f.service.read_plan(p.current_metadata.plan_id)
+        self.assertEqual(view.draft.steps[0], current.steps[0])
+        self.assertEqual(view.coordination.attempts[0].state, "released")
+        self.assertEqual(json.loads(self.row(p, active)[3])["definition"], plans.to_jsonable(current.steps[0]))
+        self.assertEqual(view.legacy_snapshot["steps"][0]["evidence"], [plans.format_evidence(e) for e in value.evidence])
+
+    def test_legacy_accepted_final_gate_history_replay_and_invalidation_remain_available(self):
+        original_draft = draft(steps=(step("legacy", final_gate=True),))
+        original_create = self.f.command("create_plan", {
+            "creation_id": "legacy-accepted", "draft": original_draft, "new_plan_intent": None,
+        }, key="legacy-create")
+        # TEST-ONLY pre-invariant fixture: a real unreviewed false-flag acceptance,
+        # with all original auth, availability, checkpoint and proof checks enabled.
+        with mock.patch.object(reviews, "_validate_final_gate_flags", return_value=None, create=True):
+            p = self.f.service.execute(original_create)
+            active = self.f.start(p, self.f.assign(p, "legacy"))
+            value = checkpoint()
+            original_checkpoint = self.gate_worker_command("record_checkpoint", p, active, {"checkpoint": value},
+                                                           key="legacy-checkpoint")
+            self.f.service.execute(original_checkpoint)
+            original_accept = self.accept_command(p, active, value, key="legacy-accept")
+            accepted = self.f.service.execute(original_accept)
+        original = self.accepted_gate_history(p, "legacy")
+        self.assertNotIn("review_id", json.loads(self.row(p, active)[3]))
+        for command in (original_create, original_checkpoint, original_accept):
+            with self.subTest(kind=command.kind):
+                before = self.final_gate_state()
+                replay = self.f.service.execute(command)
+                self.assertTrue(replay.replayed)
+                self.assertEqual(self.final_gate_state(), before)
+        creation_replay = self.f.service.execute(replace(original_create, key="legacy-creation-id-replay"))
+        self.assertTrue(creation_replay.replayed)
+        self.assertEqual(creation_replay.committed_metadata.plan_id, p.current_metadata.plan_id)
+        self.final_gate_refused(self.gate_revision_command(
+            p, retirements=(RetirementRequest("legacy", "Accepted history remains ineligible for retirement"),)))
+        current = self.f.service.read_plan(p.current_metadata.plan_id).draft
+        self.final_gate_refused(self.gate_revision_command(
+            p, steps=(replace(current.steps[0], review_required=True),)))
+        invalidation = self.invalidate(p, accepted)
+        self.review(p, value, target="legacy")
+        self.resolve(p, invalidation, "legacy", value, result=accepted.committed["result_version"])
+        self.assertEqual(self.accepted_gate_history(p, "legacy"), original)
+        self.f.service.execute(self.gate_revision_command(p, steps=(*current.steps, step("consumer", ("legacy",)))))
+        self.live_accept(p, "consumer", bindings=(self.binding(accepted, value, "legacy"),))
+        self.assertEqual(self.f.service.read_plan(p.current_metadata.plan_id).status, "complete")
+
+    def test_failed_final_review_corrective_history(self):
+        p = self.f.create("first-step", steps=(step("a"), step("final", ("a",), final_gate=True, review_required=True)),
+                          creation_id="failed-final-plan")
+        pid = p.current_metadata.plan_id
+        prior, prior_value = self.live_accept(p, "a")
+        original_history = self.accepted_gate_history(p, "a")
+        self.final_gate_refused(self.f.command("assign_step", {
+            "step_id": "final", "assignee": "worker-a", "context": context(None, writes=False),
+        }, receipt=p), "forbidden")
+        self.f.service.execute(self.gate_revision_command(
+            p, change=AuthorizationChange("first-step", "User authorized execution of the final-review step")))
+        rid = self.f.register(workspace("/synthetic/final-corrective", 851), p)
+        eid = self.f.register(ResourceClaim("synthetic-host", "external", None, None, None, False, None,
+                                           "final-corrective-external"), p)
+        execution = context(rid, external_ids=(eid,))
+        assigned = self.f.service.execute(self.f.command("assign_step", {
+            "step_id": "final", "assignee": "worker-a", "context": execution,
+        }, receipt=p))
+        self.bind_gate_inputs(p, assigned, (self.binding(prior, prior_value, "a"),))
+        active = self.f.start(p, assigned)
+        failed_value = checkpoint()
+        published = self.f.submit(p, active, failed_value)
+        original_uses = self.f.service.read_plan(pid).coordination.reservations
+        verifier = self.f.service.execute(self.f.command("reserve_verification", {
+            "step_id": "final", "verifier": "reviewer", "context": execution,
+            "handoff_from": original_uses[0].use_id, "stopped_reason": "Implementation cohort stopped for verification",
+        }, receipt=p))
+        failed = self.review(p, failed_value, verdict="failed", use=verifier.committed["use_id"], target="final")
+        self.assertEqual(failed.committed["attempt_id"], active.committed["attempt_id"])
+        self.final_gate_refused(self.accept_command(p, active, failed_value))
+        self.f.service.execute(self.f.command("resolve_reassessment", {
+            "checkpoint_id": published.committed["checkpoint_id"], "decision": "hold",
+            "reason": "Retain the final-review uncertainty until explicit classification", "draft": None,
+            "affected_steps": ("final",), "unbounded": False,
+        }, receipt=p))
+        self.final_gate_refused(self.accept_command(p, active, failed_value), "held")
+        before = self.f.service.read_plan(pid)
+        self.assertEqual(before.draft.authorization.claimed, "final")
+        old_checkpoint = self.f.store.read(lambda db: tuple(db.execute(
+            "SELECT * FROM checkpoints WHERE plan_id=? AND attempt_id=?", (pid, active.committed["attempt_id"]))))
+        corrective = step("fix", ("a",))
+        replacement = step("final-2", ("a", "fix"), final_gate=True, review_required=True)
+        retirements = (RetirementRequest("final", "Retain the failed review and replace this route"),)
+        for definitions in (
+                (*before.draft.steps, replace(corrective, dependencies=("final-2",)), replacement),
+                (*before.draft.steps, corrective, replace(replacement, dependencies=("final", "fix")))):
+            with self.subTest(dependencies=definitions[-1].dependencies):
+                self.final_gate_refused(self.gate_revision_command(p, steps=definitions, retirements=retirements))
+        revised_steps = (*before.draft.steps, corrective, replacement)
+        self.f.service.execute(self.gate_revision_command(p, steps=revised_steps, retirements=retirements))
+        retired = self.f.service.read_plan(pid)
+        self.assertEqual(retired.draft.authorization, before.draft.authorization)
+        self.assertEqual(retired.draft.steps[:2], before.draft.steps)
+        self.assertEqual(retired.coordination.reviews, before.coordination.reviews)
+        self.assertEqual(retired.legacy_snapshot["steps"][1]["status"], "retired")
+        self.assertEqual(retired.legacy_snapshot["steps"][1]["evidence"], before.legacy_snapshot["steps"][1]["evidence"])
+        cancelled = json.loads(self.row(p, active)[3])
+        self.assertEqual(self.row(p, active)[0], "released")
+        self.assertEqual(cancelled["cancelled_from"], "submitted")
+        self.assertEqual(cancelled["definition"], plans.to_jsonable(before.draft.steps[1]))
+        self.assertEqual(self.f.store.read(lambda db: tuple(db.execute(
+            "SELECT * FROM checkpoints WHERE plan_id=? AND attempt_id=?", (pid, active.committed["attempt_id"])))), old_checkpoint)
+        self.assertEqual(retired.coordination.total_counts["owned_nonreleased_uses"], 4)
+        self.assertTrue(retired.coordination.has_unresolved_uses)
+        self.assertTrue(retired.coordination.has_plan_holds)
+        self.assertNotEqual(retired.status, "complete")
+        self.final_gate_refused(self.gate_worker_command("report_activity", p, active, {
+            "origin_worker": "worker-a", "relay": None, "observed_activity": "Cancelled route cannot progress",
+        }), "fenced")
+        self.final_gate_refused(self.f.command("assign_step", {
+            "step_id": "fix", "assignee": "worker-a", "context": context(None, writes=False),
+        }, receipt=p), "forbidden")
+        self.f.service.execute(self.gate_revision_command(
+            p, change=AuthorizationChange("first-step", "User authorized the corrective step after failed review")))
+        self.final_gate_refused(self.f.command("assign_step", {
+            "step_id": "fix", "assignee": "worker-a", "context": execution,
+        }, receipt=p), "resource_conflict")
+        self.final_gate_refused(self.f.command("release_resource_use", {
+            "use_id": original_uses[0].use_id, "resource_ids": original_uses[0].resource_ids,
+            "reason": "The linked verifier is still outstanding", "stopped": True,
+        }, receipt=p), "resource_conflict")
+        self.final_gate_refused(self.f.command("release_resource_use", {
+            "use_id": verifier.committed["use_id"], "resource_ids": (rid,),
+            "reason": "A partial verifier resource set is insufficient", "stopped": True,
+        }, receipt=p))
+        self.f.service.execute(self.f.command("release_resource_use", {
+            "use_id": verifier.committed["use_id"], "resource_ids": (rid, eid),
+            "reason": "Stop remains unconfirmed", "stopped": False,
+        }, receipt=p))
+        self.assertEqual(self.f.service.read_plan(pid).coordination.total_counts["owned_nonreleased_uses"], 4)
+        self.f.service.execute(self.f.command("release_resource_use", {
+            "use_id": verifier.committed["use_id"], "resource_ids": (rid, eid),
+            "reason": "Verifier cohort explicitly stopped", "stopped": True,
+        }, receipt=p))
+        for use in original_uses:
+            self.f.service.execute(self.f.command("release_resource_use", {
+                "use_id": use.use_id, "resource_ids": use.resource_ids,
+                "reason": "Original failed-gate use explicitly stopped", "stopped": True,
+            }, receipt=p))
+        self.assertEqual(self.f.service.read_plan(pid).coordination.total_counts["owned_nonreleased_uses"], 0)
+        fixed_assignment = self.f.service.execute(self.f.command("assign_step", {
+            "step_id": "fix", "assignee": "worker-a", "context": execution,
+        }, receipt=p))
+        self.bind_gate_inputs(p, fixed_assignment, (self.binding(prior, prior_value, "a"),))
+        fixed_active = self.f.start(p, fixed_assignment)
+        corrected_value = checkpoint(artifact_version="v2")
+        self.f.submit(p, fixed_active, corrected_value)
+        corrected = self.f.accept(p, fixed_active, corrected_value)
+        after_fix = self.f.service.read_plan(pid)
+        self.assertEqual(after_fix.draft.authorization.claimed, "fix")
+        self.assertEqual(after_fix.coordination.total_counts["owned_nonreleased_uses"], 2)
+        self.final_gate_refused(self.f.command("assign_step", {
+            "step_id": "final-2", "assignee": "worker-a", "context": context(None, writes=False),
+        }, receipt=p), "forbidden")
+        self.f.service.execute(self.gate_revision_command(
+            p, change=AuthorizationChange("first-step", "User authorized the replacement final-review step")))
+        self.final_gate_refused(self.f.command("assign_step", {
+            "step_id": "final-2", "assignee": "worker-a", "context": execution,
+        }, receipt=p), "resource_conflict")
+        for use in after_fix.coordination.reservations:
+            if use.attempt_id == fixed_active.committed["attempt_id"]:
+                self.f.service.execute(self.f.command("release_resource_use", {
+                    "use_id": use.use_id, "resource_ids": use.resource_ids,
+                    "reason": "Corrective implementation use explicitly stopped", "stopped": True,
+                }, receipt=p))
+        final_assignment = self.f.service.execute(self.f.command("assign_step", {
+            "step_id": "final-2", "assignee": "worker-a", "context": execution,
+        }, receipt=p))
+        self.bind_gate_inputs(p, final_assignment, (self.binding(prior, prior_value, "a"), self.binding(corrected, corrected_value, "fix")))
+        final_active = self.f.start(p, final_assignment)
+        self.f.submit(p, final_active, corrected_value)
+        self.final_gate_refused(self.accept_command(p, final_active, corrected_value))
+        final_review = self.review(p, corrected_value, target="final-2")
+        final_result = self.f.accept(p, final_active, corrected_value)
+        final_proof = json.loads(self.row(p, final_active)[3])
+        self.assertEqual(final_proof["review_id"], final_review.committed["review_id"])
+        self.assertEqual(final_proof["artifact"], plans.to_jsonable(corrected_value.artifact))
+        self.assertEqual(final_proof["definition"]["dependencies"], ["a", "fix"])
+        self.assertNotEqual(final_result.committed["result_version"], corrected.committed["result_version"])
+        self.assertNotEqual(self.f.service.read_plan(pid).status, "complete")
+        self.f.service.execute(self.f.command("resolve_reassessment", {
+            "checkpoint_id": published.committed["checkpoint_id"], "decision": "reject", "draft": None,
+            "reason": "Explicitly classify the retained old-route uncertainty", "affected_steps": (), "unbounded": False,
+        }, receipt=p))
+        pending_stop = self.f.service.read_plan(pid)
+        self.assertFalse(pending_stop.coordination.has_plan_holds)
+        self.assertEqual(pending_stop.coordination.total_counts["owned_nonreleased_uses"], 2)
+        self.assertNotEqual(pending_stop.status, "complete")
+        final_uses = tuple(u for u in pending_stop.coordination.reservations if u.attempt_id == final_active.committed["attempt_id"])
+        for index, use in enumerate(final_uses):
+            self.f.service.execute(self.f.command("release_resource_use", {
+                "use_id": use.use_id, "resource_ids": use.resource_ids,
+                "reason": "Accepted final implementation use explicitly stopped", "stopped": True,
+            }, receipt=p))
+            if index == 0:
+                self.assertNotEqual(self.f.service.read_plan(pid).status, "complete")
+        completed = self.f.service.read_plan(pid)
+        self.assertEqual(completed.status, "complete")
+        self.assertEqual(completed.draft.authorization.claimed, "final-2")
+        self.assertEqual(self.accepted_gate_history(p, "a"), original_history)
+        old_review = next(r for r in completed.coordination.reviews if r.step_id == "final")
+        self.assertEqual((old_review.review.verdict, old_review.review.findings, old_review.review.artifact),
+                         ("failed", ("fix required",), failed_value.artifact))
+        self.assertEqual(old_review, before.coordination.reviews[0])
 
     def test_explicit_acceptance_records_original_proof_and_replay(self):
         p, assigned, active, cp, value, _ = self.submitted(required=True)

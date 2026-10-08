@@ -51,6 +51,7 @@ from adaptive_planning.types import (
     RetirementRequest,
     Review,
     ReviewView,
+    StepId,
     _to_artifact_ref,
     _to_evidence,
     _to_execution_context,
@@ -884,6 +885,8 @@ def create_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
     if not draft.objective.strip() or len(draft.objective) > MAX_TEXT_LEN:
         raise DomainError("invalid", "objective must be a bounded non-empty string")
     _check_draft_limits(draft)
+    from adaptive_planning.reviews import validate_final_gate
+    validate_final_gate(draft)
 
     candidates = _duplicate_candidates(connection, draft)
     if candidates and not (intent and intent.strip()):
@@ -1020,7 +1023,9 @@ def _apply_steps(connection: sqlite3.Connection, plan: _Plan, draft: PlanDraft) 
         connection.execute("DELETE FROM steps WHERE plan_id = ? AND step_id = ?", (plan.plan_id, step.step_id))
 
 
-def _apply_revision_draft(connection: sqlite3.Connection, plan: _Plan, draft: PlanDraft) -> None:
+def _apply_revision_draft(
+    connection: sqlite3.Connection, plan: _Plan, draft: PlanDraft, *, retiring_step_ids: tuple[StepId, ...] = (),
+) -> None:
     """Apply the shared graph rules without publishing an extra owner command or revision."""
     _check_draft_limits(draft)
     if draft.authorization != plan.authorization:
@@ -1028,6 +1033,17 @@ def _apply_revision_draft(connection: sqlite3.Connection, plan: _Plan, draft: Pl
                                      "use authorization_change to renew it")
     if draft.objective != plan.draft_json["objective"]:
         raise DomainError("invalid", "The plan objective cannot change")
+    existing = {s.step_id: s for s in plan.steps}
+    prospective = []
+    for definition in draft.steps:
+        current = existing.get(definition.step_id)
+        if (current is not None and current.definition == to_jsonable(definition)
+                and (current.state in ("complete", "retired") or definition.step_id in retiring_step_ids)):
+            continue
+        prospective.append(definition)
+    from adaptive_planning.reviews import validate_final_gate
+    # Filter only the flag check. Persist and graph-validate the full original draft.
+    validate_final_gate(dataclasses.replace(draft, steps=tuple(prospective)))
     _apply_steps(connection, plan, draft)
 
 
@@ -1062,7 +1078,7 @@ def revise_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
     ts = _timestamp(plan.updated_at)
 
     before_definitions = {s.step_id: s.definition for s in plan.steps}
-    _apply_revision_draft(connection, plan, draft)
+    _apply_revision_draft(connection, plan, draft, retiring_step_ids=tuple(retired_ids))
     if retirements:
         # A prerequisite and all its dependents may retire together. Cancel all
         # claims first and validate the real intermediate blocked graph, then

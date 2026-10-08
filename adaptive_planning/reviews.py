@@ -9,8 +9,19 @@ import uuid
 from adaptive_planning import attempts, checkpoints, plans, resources
 from adaptive_planning.core import MAX_EVIDENCE_ITEMS
 from adaptive_planning.types import (
-    ArtifactRef, AttemptId, Command, DefinitionVersion, DomainError, MutationReceipt, PlanId, StepId, _to_review,
+    ArtifactRef, AttemptId, Command, DefinitionVersion, DomainError, MutationReceipt, PlanDraft, PlanId, StepId, _to_review,
 )
+
+
+def _validate_final_gate_flags(final_gate: bool, review_required: bool) -> None:
+    if final_gate and not review_required:
+        raise DomainError("invalid", "A final gate must explicitly require artifact-bound review")
+
+
+def validate_final_gate(draft: PlanDraft) -> None:
+    """Validate configured final steps without imposing a plan-wide review prerequisite."""
+    for definition in draft.steps:
+        _validate_final_gate_flags(definition.final_gate, definition.review_required)
 
 
 @dataclass
@@ -84,6 +95,7 @@ def _submitted_row(connection, plan, step_id):
         "AND json_extract(payload,'$.generation')=?", (plans._installation_epoch(connection), plan.plan_id, row[0], plan.generation)).fetchone()[0]
     if count != 1:
         raise DomainError("fenced", "Submitted target has no unique current bound capability")
+    _validate_final_gate_flags(step.definition["final_gate"], step.definition["review_required"])
     return row, data, step
 
 

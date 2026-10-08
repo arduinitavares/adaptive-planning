@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from unittest.mock import patch
 
-from adaptive_planning import checkpoints, plans
+from adaptive_planning import checkpoints, plans, reviews
 from adaptive_planning.app import PlanningService
 from adaptive_planning.store import Store
 from adaptive_planning.types import DomainError, Evidence, ResourceClaim, RetirementRequest, Review
@@ -102,6 +102,69 @@ class TestService(unittest.TestCase):
         return self.f.service.execute(self.command("invalidate_result", {
             "step_id": "a", "result_version": self.accepted.result_version,
             "reason": "Revalidate exact accepted output", "evidence": self.value.evidence}))
+
+    def legacy_final_gate_submission(self):
+        current = self.view().draft
+        legacy = replace(current, steps=(replace(current.steps[0], final_gate=True, review_required=False),
+                                        *current.steps[1:]))
+        # TEST-ONLY pre-invariant fixture: only the pure flag implication is disabled.
+        # All publication, auth, checkpoint, artifact and review proof is real.
+        with patch.object(reviews, "_validate_final_gate_flags", return_value=None, create=True):
+            self.f.service.execute(self.command("revise_plan", {
+                "draft": legacy, "reason": "Reproduce the old permissive final flags",
+                "authorization_change": None, "retire_steps": (),
+            }))
+            self.live()
+            command = self.command("record_review", {"step_id": "a", "review": Review(
+                "reviewer", self.value.artifact, "passed", (), self.value.evidence, None)}, key="legacy-review")
+            self.f.service.execute(command)
+        return command
+
+    def test_final_gate_first_review_is_not_circular(self):
+        current = self.view().draft
+        self.f.service.execute(self.command("revise_plan", {
+            "draft": replace(current, steps=(replace(current.steps[0], final_gate=True), *current.steps[1:])),
+            "reason": "Configure the ordinary final-review step", "authorization_change": None, "retire_steps": (),
+        }))
+        self.live()
+        self.assertFalse(self.satisfied())
+        first = self.review()
+        self.assertTrue(self.satisfied())
+        self.assertEqual(self.view().coordination.reviews[0].review.artifact, self.value.artifact)
+        self.assertEqual(first.committed["attempt_id"], self.a.committed["attempt_id"])
+
+    def test_legacy_final_gate_submission_acceptance_fails_closed(self):
+        self.legacy_final_gate_submission()
+        self.refused(lambda: self.f.accept(self.p, self.a, self.value))
+        self.assertFalse(self.view().draft.steps[0].review_required)
+
+    def test_legacy_final_gate_submission_review_fails_closed(self):
+        self.legacy_final_gate_submission()
+        self.refused(lambda: self.review())
+
+    def test_legacy_final_gate_submission_reservation_fails_closed(self):
+        self.legacy_final_gate_submission()
+        rid = self.f.register(workspace("/synthetic/legacy-final-verifier", 550), self.p)
+        self.refused(lambda: self.reserve(context(rid)))
+
+    def test_legacy_final_gate_submission_reopen_fails_closed(self):
+        self.legacy_final_gate_submission()
+        self.refused(lambda: self.reopen())
+
+    def test_legacy_final_gate_submission_cannot_satisfy_new_review(self):
+        self.legacy_final_gate_submission()
+        before = self.state()
+        self.assertFalse(self.satisfied())
+        self.assertEqual(self.state(), before)
+
+    def test_legacy_final_gate_review_exact_replay_precedes_live_guard(self):
+        command = self.legacy_final_gate_submission()
+        before = self.state()
+        replay = self.f.service.execute(command)
+        self.assertTrue(replay.replayed)
+        self.assertEqual(self.state(), before)
+        self.refused(lambda: self.f.service.execute(self.command(
+            "record_review", command.payload, key="new-legacy-review")))
 
     def test_review_bound_to_current_artifact(self):
         self.live()
