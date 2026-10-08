@@ -12,9 +12,12 @@ from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
 
 from adaptive_planning import plans
-from adaptive_planning.core import MAX_TEXT_LEN
+from adaptive_planning.core import MAX_FILE_BYTES, MAX_TEXT_LEN
 from adaptive_planning.ownership import require_kind_capabilities, require_orchestrator
-from adaptive_planning.types import Command, DomainError, ExecutionContext, MutationReceipt, ResourceClaim, ResourceId
+from adaptive_planning.types import (
+    Command, DomainError, ExecutionContext, MutationReceipt, ReservationView, ResourceClaim, ResourceId,
+    _to_execution_context,
+)
 
 _FIELDS = frozenset({"v", "device", "inode", "case_insensitive", "external_identity"})
 
@@ -480,3 +483,253 @@ def conflicting_uses(connection: sqlite3.Connection, resource_ids: tuple[Resourc
         if any(overlaps(request, canonical, scope) for request in requested):
             conflicts.append(use_id)
     return tuple(conflicts)
+
+
+# Execution roles are independent of resource identity and physical obligations.
+_USE_NAMESPACE = "execution_uses"
+
+
+def canonical_context(connection, execution):
+    resolve_context(connection, execution)
+    return replace(execution,
+                   repository_id=None if execution.repository_id is None else resolve_resource_id(connection, execution.repository_id),
+                   workspace_id=None if execution.workspace_id is None else resolve_resource_id(connection, execution.workspace_id),
+                   external_ids=tuple(dict.fromkeys(resolve_resource_id(connection, rid) for rid in execution.external_ids)))
+
+
+def _owned_uses(connection, plan_id, attempt_id):
+    return {row[0]: row for row in connection.execute(
+        "SELECT use_id,resource_id,plan_id,attempt_id,absent_work_id,scope,status,created_at,rowid "
+        "FROM resource_uses WHERE plan_id=? AND attempt_id=? ORDER BY rowid", (plan_id, attempt_id))}
+
+
+def _member(row):
+    return {"use_id": row[0], "resource_id": row[1], "scope": row[5], "created_at": row[7]}
+
+
+def _source(plan_id, attempt_id, step_id, assignee, definition_version, data):
+    return {"plan_id": plan_id, "attempt_id": attempt_id, "step_id": step_id, "assignee": assignee,
+            "definition_version": definition_version, "definition": data.get("definition"),
+            "origin_epoch": data.get("epoch"), "origin_generation": data.get("generation")}
+
+
+def _json_object(raw, label):
+    try:
+        value = json.loads(raw, object_pairs_hook=_unique_object)
+    except (ValueError, TypeError, RecursionError):
+        raise DomainError("invalid", f"The {label} is malformed") from None
+    if not isinstance(value, dict):
+        raise DomainError("invalid", f"The {label} is malformed")
+    return value
+
+
+def _members(connection, declared, owned):
+    if not isinstance(declared, list):
+        raise DomainError("invalid", "Execution-use members must be a complete list")
+    ids = []
+    for item in declared:
+        if (not isinstance(item, dict) or set(item) != {"use_id", "resource_id", "scope", "created_at"}
+                or not isinstance(item.get("use_id"), str) or item["use_id"] not in owned
+                or item != _member(owned[item["use_id"]]) or item["use_id"] in ids):
+            raise DomainError("invalid", "Execution-use membership contradicts retained physical rows")
+        row = owned[item["use_id"]]
+        canonical = resolve_resource_id(connection, row[1])
+        kind = connection.execute("SELECT kind FROM resources WHERE resource_id=?", (canonical,)).fetchone()[0]
+        if row[4] is not None or row[5] != kind:
+            raise DomainError("invalid", "Execution use has contradictory ownership or resource scope")
+        ids.append(item["use_id"])
+    return ids
+
+
+def _original_coverage(connection, execution, members, owned):
+    expected = set(resolve_context(connection, execution)) if execution.writes else set()
+    covered = {resolve_resource_id(connection, owned[item["use_id"]][1]) for item in members}
+    if covered != expected:
+        raise DomainError("invalid", "The original implementation cohort contradicts its frozen context")
+
+
+def _writer_proof(connection, source, writer, role, anchor, ids):
+    if writer is None:  # Coherently proved pre-namespace implementation history has unknown writer liveness.
+        if role != "implementation":
+            raise DomainError("invalid", "Verifier writer provenance is missing")
+        return
+    if (not isinstance(writer, dict) or set(writer) != {"state", "epoch", "generation", "sequence", "reason", "ownership_version", "actor"}
+            or writer["state"] not in ("active", "stopped") or type(writer["sequence"]) is not int
+            or type(writer["ownership_version"]) is not int or writer["ownership_version"] < 1
+            or writer["sequence"] < 1 or any(not isinstance(writer[k], str) or not writer[k].strip()
+                                            for k in ("epoch", "generation", "reason", "actor"))):
+        raise DomainError("invalid", "Execution writer provenance is malformed")
+    row = connection.execute("SELECT kind,payload,actor FROM events WHERE plan_id=? AND sequence=?",
+                             (source["plan_id"], writer["sequence"])).fetchone()
+    event = None if row is None else _json_object(row[1], "writer audit event")
+    transition = {"role": role, "anchor": anchor, "use_ids": ids,
+                  **{key: writer[key] for key in ("state", "epoch", "generation", "reason", "ownership_version", "actor")}}
+    allowed = ("assign_step", "reopen_attempt") if writer["state"] == "active" and role == "implementation" else (
+        ("reserve_verification",) if writer["state"] == "active" else ("reserve_verification", "release_resource_use"))
+    if (row is None or row[0] not in allowed or row[2] != writer["actor"] or event.get("attempt_id") != source["attempt_id"]
+            or event.get("step_id") != source["step_id"] or event.get("definition") != source["definition"]
+            or not isinstance(event.get("execution_transitions"), list)
+            or event["execution_transitions"].count(transition) != 1):
+        raise DomainError("invalid", "Execution writer transition lacks exact original audit proof")
+
+
+def _group_proof(connection, source, anchor, group, owned, original_ids):
+    fields = {"anchor", "members", "verifier", "context", "artifact", "cycle", "definition", "source_use_ids", "creation", "writer"}
+    if (not isinstance(group, dict) or set(group) != fields or group["anchor"] != anchor
+            or not isinstance(anchor, str) or not isinstance(group["verifier"], str) or not group["verifier"].strip()
+            or group["verifier"] == source["assignee"] or group["definition"] != source["definition"]):
+        raise DomainError("invalid", "Verifier group binding is malformed")
+    ids = _members(connection, group["members"], owned)
+    if not ids or anchor not in ids or len({owned[item][6] for item in ids}) != 1:
+        raise DomainError("invalid", "Verifier group has missing or inconsistent physical members")
+    execution = _to_execution_context(group["context"])
+    resources = resolve_context(connection, execution)
+    if not execution.writes or set(resources) != {resolve_resource_id(connection, owned[item][1]) for item in ids}:
+        raise DomainError("invalid", "Verifier members contradict their immutable execution context")
+    sources = group["source_use_ids"]
+    if (not isinstance(sources, list) or any(not isinstance(item, str) for item in sources) or len(sources) != len(set(sources))
+            or (sources and sources != original_ids)):
+        raise DomainError("invalid", "Verifier handoff does not identify the exact implementation cohort")
+    creation = group["creation"]
+    if (not isinstance(creation, dict) or set(creation) != {"sequence", "epoch", "generation", "ownership_version", "actor", "published_at"}
+            or type(creation["sequence"]) is not int or creation["sequence"] < 1
+            or type(creation["ownership_version"]) is not int or creation["ownership_version"] < 1
+            or any(not isinstance(creation[key], str) or not creation[key].strip()
+                   for key in ("epoch", "generation", "actor", "published_at"))):
+        raise DomainError("invalid", "Verifier creation authority is malformed")
+    first = None
+    for sequence, kind, actor, published, raw in connection.execute(
+            "SELECT sequence,kind,actor,published_at,payload FROM events WHERE plan_id=? ORDER BY sequence", (source["plan_id"],)):
+        event = _json_object(raw, "verifier audit event")
+        if event.get("use_id") == anchor:
+            first = (sequence, kind, actor, published, event)
+            break
+    immutable = {key: value for key, value in group.items() if key != "writer"}
+    if (first is None or first[:4] != (creation["sequence"], "reserve_verification", creation["actor"], creation["published_at"])
+            or first[4].get("verification_group") != immutable
+            or first[4].get("attempt_id") != source["attempt_id"]
+            or first[4].get("step_id") != source["step_id"] or first[4].get("definition") != source["definition"]):
+        raise DomainError("invalid", "Verifier group lacks coherent original creation proof")
+    from adaptive_planning.reviews import _validate_review_cycle
+    _validate_review_cycle(connection, source, group["cycle"], group["artifact"], creation["sequence"])
+    _writer_proof(connection, source, group["writer"], "verification", anchor, ids)
+    return ids
+
+
+def execution_uses(connection, plan_id, attempt_id):
+    """Decode every owned physical row exactly once; absent legacy metadata requires full proof."""
+    row = connection.execute("SELECT step_id,assignee,definition_version,payload FROM attempts WHERE plan_id=? AND attempt_id=?",
+                             (plan_id, attempt_id)).fetchone()
+    if row is None:
+        raise DomainError("invalid", "Execution-use owner is missing")
+    data = _json_object(row[3], "execution-use attempt")
+    source = _source(plan_id, attempt_id, *row[:3], data)
+    definition = source["definition"]
+    if (not isinstance(definition, dict) or definition.get("step_id") != row[0]
+            or definition.get("definition_version") != row[2]
+            or not all(isinstance(source[key], str) and source[key].strip()
+                       for key in ("assignee", "origin_epoch", "origin_generation"))):
+        raise DomainError("invalid", "Execution-use frozen source is malformed")
+    execution = _to_execution_context(data.get("context"))
+    owned = _owned_uses(connection, plan_id, attempt_id)
+    if _USE_NAMESPACE not in data:
+        for (raw,) in connection.execute("SELECT payload FROM events WHERE plan_id=? AND kind IN ('reserve_verification','assign_step')", (plan_id,)):
+            event = _json_object(raw, "verification history")
+            if event.get("attempt_id") == attempt_id and ("use_id" in event or "execution_transitions" in event):
+                raise DomainError("invalid", "Missing explicit execution metadata cannot be inferred as legacy implementation")
+        members = [_member(item) for item in owned.values()]
+        _members(connection, members, owned)
+        if len({item["resource_id"] for item in members}) != len(members):
+            raise DomainError("invalid", "Legacy implementation membership is ambiguous")
+        _original_coverage(connection, execution, members, owned)
+        namespace = {"v": 1, "source": source, "implementation": {"members": members, "writer": None}, "groups": {}}
+        return namespace, owned
+    namespace = data[_USE_NAMESPACE]
+    if (not isinstance(namespace, dict) or set(namespace) != {"v", "source", "implementation", "groups"}
+            or type(namespace["v"]) is not int or namespace["v"] != 1 or namespace["source"] != source
+            or not isinstance(namespace["implementation"], dict)
+            or set(namespace["implementation"]) != {"members", "writer"} or not isinstance(namespace["groups"], dict)):
+        raise DomainError("invalid", "Execution-use namespace is unknown or contradictory")
+    implementation = namespace["implementation"]
+    original_ids = _members(connection, implementation["members"], owned)
+    _original_coverage(connection, execution, implementation["members"], owned)
+    _writer_proof(connection, source, implementation["writer"], "implementation", None, original_ids)
+    classified = set(original_ids)
+    for anchor, group in namespace["groups"].items():
+        ids = _group_proof(connection, source, anchor, group, owned, original_ids)
+        if classified.intersection(ids):
+            raise DomainError("invalid", "Execution-use roles have overlapping membership")
+        classified.update(ids)
+    if classified != set(owned):
+        raise DomainError("invalid", "Execution-use namespace leaves physical obligations unclassified")
+    return namespace, owned
+
+
+def save_execution_uses(connection, plan_id, attempt_id, namespace):
+    """Merge role metadata without changing frozen history or worker counters."""
+    row = connection.execute("SELECT payload FROM attempts WHERE plan_id=? AND attempt_id=?", (plan_id, attempt_id)).fetchone()
+    if row is None:
+        raise DomainError("invalid", "Execution-use owner is missing")
+    data = _json_object(row[0], "execution-use attempt")
+    data[_USE_NAMESPACE] = namespace
+    if len(plans.canonical_bytes(data)) > MAX_FILE_BYTES:
+        raise DomainError("limit_exceeded", "Execution-use history exceeds the 10MB content limit")
+    connection.execute("UPDATE attempts SET payload=? WHERE plan_id=? AND attempt_id=?",
+                       (json.dumps(data, sort_keys=True, ensure_ascii=False), plan_id, attempt_id))
+
+
+def writer_transition(namespace, role, anchor, state, command, plan, sequence, reason):
+    target = namespace["implementation"] if role == "implementation" else namespace["groups"][anchor]
+    writer = {"state": state, "epoch": command.epoch, "generation": plan.generation, "sequence": sequence, "reason": reason,
+              "ownership_version": command.ownership_version, "actor": command.actor}
+    target["writer"] = writer
+    return {"role": role, "anchor": anchor, "use_ids": [item["use_id"] for item in target["members"]],
+            **{key: writer[key] for key in ("state", "epoch", "generation", "reason", "ownership_version", "actor")}}
+
+
+def _writer_active(connection, plan_id, writer, rows):
+    if all(row[6] == "released" for row in rows):
+        return False
+    authority = connection.execute("SELECT generation FROM plans WHERE plan_id=?", (plan_id,)).fetchone()[0]
+    return (writer is None or writer["state"] != "stopped" or writer["epoch"] != plans._installation_epoch(connection)
+            or writer["generation"] != authority)
+
+
+def reservation_projections(connection, plan_id):
+    """One coherent verifier anchor or conservative physical fallback, shared by counts and pages."""
+    rows = tuple(connection.execute(
+        "SELECT u.use_id,u.resource_id,u.plan_id,u.attempt_id,u.absent_work_id,u.scope,u.status,u.created_at,u.rowid,"
+        "h.declared_identity FROM resource_uses u LEFT JOIN absent_host_work h ON h.absent_work_id=u.absent_work_id "
+        "WHERE u.plan_id=? OR (u.plan_id IS NULL AND u.status!='released') ORDER BY u.rowid", (plan_id,)))
+    decoded, failed = {}, set()
+    for row in rows:
+        if row[2] is not None and row[3] not in decoded and row[3] not in failed:
+            try:
+                decoded[row[3]] = execution_uses(connection, row[2], row[3])
+            except (DomainError, ValueError, TypeError, KeyError, RecursionError):
+                failed.add(row[3])
+    result = {}
+    for row in rows:
+        actor, writer, selected = row[9] or "", row[6] != "released", [row]
+        if row[2] is not None:
+            actor = ""
+            if row[3] in decoded:
+                namespace, owned = decoded[row[3]]
+                implementation = namespace["implementation"]
+                originals = {item["use_id"] for item in implementation["members"]}
+                if row[0] in originals:
+                    actor = namespace["source"]["assignee"]
+                    writer = _writer_active(connection, row[2], implementation["writer"], [row])
+                else:
+                    anchor, group = next((anchor, group) for anchor, group in namespace["groups"].items()
+                                         if any(item["use_id"] == row[0] for item in group["members"]))
+                    if row[0] != anchor:
+                        continue
+                    selected = [owned[item["use_id"]] for item in group["members"]]
+                    actor, writer = group["verifier"], _writer_active(connection, row[2], group["writer"], selected)
+        result[row[8]] = ReservationView(
+            use_id=row[0], plan_id=row[2], attempt_id=row[3], absent_work_id=row[4],
+            resource_ids=tuple(dict.fromkeys(resolve_resource_id(connection, item[1]) for item in selected)),
+            actor=actor, writer_active=writer, unresolved=any(item[6] == "unresolved" for item in selected),
+            repository_exclusive=any(item[5] == "repository" for item in selected))
+    return result, len(rows) - len(result)

@@ -167,6 +167,15 @@ def assign_step(connection: sqlite3.Connection, command: Command) -> MutationRec
                  "definition_version": definition.definition["definition_version"]}
     plans._insert_event(connection, plan.plan_id, revision, "assign_step", command.actor, ts,
                         {**committed, "step_id": step_id, "assignee": command.payload["assignee"]})
+    sequence = plans._store_sequence(connection)
+    namespace, _ = resources.execution_uses(connection, plan.plan_id, attempt_id)
+    transition = resources.writer_transition(namespace, "implementation", None, "active", command, plan, sequence,
+                                             "Declared implementation assignment")
+    connection.execute("UPDATE events SET payload=? WHERE plan_id=? AND sequence=?",
+                       (json.dumps({**committed, "step_id": step_id, "assignee": command.payload["assignee"],
+                                    "definition": definition.definition, "execution_transitions": [transition]},
+                                   sort_keys=True, ensure_ascii=False), plan.plan_id, sequence))
+    resources.save_execution_uses(connection, plan.plan_id, attempt_id, namespace)
     view = plans._commit_projection(connection, plan.plan_id, previous)
     return MutationReceipt(committed, view.metadata, view.metadata, False, PrivateGrant(None, token))
 
@@ -466,25 +475,28 @@ def _require_start_scope(connection, plan, step):
         raise DomainError("held", "Execution is held pending explicit resolution")
 
 
-def _require_execution_resources(connection, plan_id, attempt_id, execution):
+def _require_execution_resources(connection, plan_id, attempt_id, execution, *, reacquire=False):
     resource_ids = resources.resolve_context(connection, execution)
+    try:
+        namespace, owned = resources.execution_uses(connection, plan_id, attempt_id)
+    except DomainError as error:
+        if error.code == "invalid" and execution.writes and not reacquire:
+            raise DomainError("resource_conflict", "Writable execution lacks coherent retained resource obligations") from error
+        raise
     if not execution.writes:
-        return
-    retained = set()
-    covered = set()
-    for use_id, resource_id, absent_id, scope, status in connection.execute(
-            "SELECT use_id,resource_id,absent_work_id,scope,status FROM resource_uses "
-            "WHERE plan_id=? AND attempt_id=? AND status!='released'", (plan_id, attempt_id)):
-        canonical = resources.resolve_resource_id(connection, resource_id)
-        kind = connection.execute("SELECT kind FROM resources WHERE resource_id=?", (canonical,)).fetchone()[0]
-        if absent_id is not None or status != "active" or canonical not in resource_ids or scope != kind:
+        return namespace, owned
+    retained = {item["use_id"] for item in namespace["implementation"]["members"]}
+    for use_id in retained:
+        if owned[use_id][6] != "active":
             raise DomainError("resource_conflict", "The attempt has an unresolved or inappropriate retained resource use")
-        retained.add(use_id)
-        covered.add(canonical)
-    if covered != set(resource_ids):
-        raise DomainError("resource_conflict", "The attempt is missing its retained active writable reservation")
+    writer = namespace["implementation"]["writer"]
+    if writer is not None and not reacquire and (writer["state"] != "active"
+            or writer["epoch"] != plans._installation_epoch(connection)
+            or writer["generation"] != plans._load_plan(connection, plan_id).generation):
+        raise DomainError("resource_conflict", "The implementation writer requires explicit reacquisition")
     if set(resources.conflicting_uses(connection, resource_ids, execution.repository_exclusive)) - retained:
         raise DomainError("resource_conflict", "Writable execution overlaps another unresolved resource use")
+    return namespace, owned
 
 
 def bind_availability(connection: sqlite3.Connection, command: Command) -> MutationReceipt:
@@ -569,6 +581,61 @@ def report_activity(connection: sqlite3.Connection, command: Command) -> Mutatio
     if command.kind != "report_activity":
         raise DomainError("invalid", "The command kind does not match worker activity")
     return _worker_progress(connection, command, start=False)
+
+
+def reopen_attempt(connection: sqlite3.Connection, command: Command) -> MutationReceipt:
+    """Reacquire the same submitted worker only after exact scope and retained-use proof."""
+    from adaptive_planning import checkpoints, reviews
+    plan = checkpoints._owner_target(connection, command, "reopen_attempt")
+    checkpoints._text(command.payload["reason"], "Reopen reason")
+    if not _nonblank(command.attempt_id) or command.attempt_version is None or command.definition_version is None:
+        raise DomainError("invalid", "Reopen requires an exact attempt, own version and frozen definition")
+    row = _attempt_row(connection, plan.plan_id, command.attempt_id)
+    if row is None:
+        raise DomainError("not_found", "The reopen attempt does not exist in this plan")
+    current, data, step = reviews._submitted_row(connection, plan, row[1])
+    if row[0] != current[0] or command.attempt_version != row[4] or command.definition_version != row[5]:
+        raise DomainError("stale", "Reopen assertions do not identify the current exact submitted target")
+    _require_start_scope(connection, plan, step)
+    try:
+        activity = datetime.fromisoformat(data["last_activity"])
+        if activity.tzinfo is None or activity.utcoffset() is None:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise DomainError("invalid", "Reopen requires a valid observed activity timestamp") from None
+    if (plans._now() - activity).total_seconds() >= _STALE_SECONDS.get():
+        raise DomainError("stale", "The submitted attempt exceeded its inactivity threshold")
+    execution = _to_execution_context(data.get("context"))
+    namespace, _ = _require_execution_resources(connection, plan.plan_id, row[0], execution, reacquire=True)
+    bindings = data.get("availability_bindings", {})
+    if not isinstance(bindings, dict):
+        raise DomainError("invalid", "Reopen has malformed frozen input bindings")
+    for prerequisite in step.definition["dependencies"]:
+        if prerequisite not in bindings:
+            raise DomainError("invalid", "Reopen requires the unchanged final-base prerequisite bindings")
+        binding = _to_availability(bindings[prerequisite])
+        if binding.prerequisite != prerequisite:
+            raise DomainError("invalid", "Reopen input binding names another prerequisite")
+        _validate_binding(connection, plan, step.definition, execution, binding)
+    _, ended = reviews._submission(connection, plan, row, data, step, require_artifact=False)
+    previous = plans.project_plan(connection, plan.plan_id)
+    revision, version, ts = plan.revision + 1, row[4] + 1, plans._timestamp(plan.updated_at)
+    event = {"attempt_id": row[0], "step_id": step.step_id, "definition_version": row[5],
+             "definition": step.definition, "checkpoint_sequence": ended["checkpoint_sequence"],
+             "ended_cycle": ended, "before_version": row[4], "version": version, "reason": command.payload["reason"]}
+    plans._insert_event(connection, plan.plan_id, revision, command.kind, command.actor, ts, event)
+    sequence = plans._store_sequence(connection)
+    event["execution_transitions"] = [resources.writer_transition(namespace, "implementation", None, "active",
+                                                                  command, plan, sequence, command.payload["reason"])]
+    connection.execute("UPDATE events SET payload=? WHERE plan_id=? AND sequence=?",
+                       (json.dumps(event, sort_keys=True, ensure_ascii=False), plan.plan_id, sequence))
+    connection.execute("UPDATE attempts SET state='active',version=? WHERE plan_id=? AND attempt_id=?", (version, plan.plan_id, row[0]))
+    resources.save_execution_uses(connection, plan.plan_id, row[0], namespace)
+    connection.execute("UPDATE steps SET state='in-progress' WHERE plan_id=? AND step_id=?", (plan.plan_id, step.step_id))
+    connection.execute("UPDATE plans SET revision=?,updated_at=? WHERE plan_id=?", (revision, ts, plan.plan_id))
+    view = plans._commit_projection(connection, plan.plan_id, previous)
+    return MutationReceipt({"attempt_id": row[0], "step_id": step.step_id, "version": version, "definition_version": row[5]},
+                           view.metadata, view.metadata, False, None)
 
 
 def cancel_attempt(connection: sqlite3.Connection, plan_id: PlanId, attempt_id: AttemptId, reason: str) -> None:

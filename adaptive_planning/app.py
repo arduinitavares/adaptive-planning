@@ -15,7 +15,7 @@ from starlette.routing import Mount
 from adaptive_planning.admin import load_service_token
 from adaptive_planning.config import Config, DEFAULT_STALE_SECONDS, RequestBoundary, http_allowlist
 
-from adaptive_planning import attempts, checkpoints, plans, resources
+from adaptive_planning import attempts, checkpoints, plans, resources, reviews
 from adaptive_planning.ownership import command_relay, require_kind_capabilities, require_orchestrator
 from adaptive_planning.store import Store
 from adaptive_planning.types import (
@@ -46,6 +46,10 @@ HANDLERS: dict[str, Callable[[sqlite3.Connection, Command], MutationReceipt]] = 
     "resolve_reassessment": checkpoints.resolve_reassessment,
     "invalidate_result": checkpoints.invalidate_result,
     "resolve_invalidation": checkpoints.resolve_invalidation,
+    "record_review": reviews.record_review,
+    "reserve_verification": reviews.reserve_verification,
+    "release_resource_use": reviews.release_resource_use,
+    "reopen_attempt": attempts.reopen_attempt,
 }
 
 

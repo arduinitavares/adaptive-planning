@@ -251,6 +251,7 @@ class _Aggregates:
 
 
 def _aggregates(connection: sqlite3.Connection, plan_id: PlanId) -> _Aggregates:
+    from adaptive_planning.resources import reservation_projections
     def one(sql: str, *args: Any) -> int:
         return connection.execute(sql, args).fetchone()[0]
 
@@ -260,7 +261,7 @@ def _aggregates(connection: sqlite3.Connection, plan_id: PlanId) -> _Aggregates:
         "SELECT EXISTS(SELECT 1 FROM store_hold_reasons WHERE epoch = ? AND resolved = 0)", epoch)
     counts = {
         "attempts": one("SELECT COUNT(*) FROM attempts WHERE plan_id = ?", plan_id),
-        "reservations": one("SELECT COUNT(*) FROM resource_uses WHERE plan_id = ?", plan_id),
+        "reservations": sum(view.plan_id == plan_id for view in reservation_projections(connection, plan_id)[0].values()),
         "holds": one("SELECT COUNT(*) FROM holds WHERE plan_id = ? AND active = 1", plan_id),
         "reviews": one("SELECT COUNT(*) FROM reviews WHERE plan_id = ?", plan_id),
         "invalidations": one(
@@ -421,17 +422,11 @@ def _load_item(connection: sqlite3.Connection, plan_id: PlanId, kind: str, rid: 
             "FROM attempts WHERE rowid = ?", (rid,)).fetchone()
         return CoordinationItem("attempt", _attempt_view(row))
     if kind == "reservation":
-        from adaptive_planning.resources import resolve_resource_id
-        use_id, use_plan, attempt_id, absent_id, resource_id, scope, status, assignee, identity = connection.execute(
-            "SELECT u.use_id, u.plan_id, u.attempt_id, u.absent_work_id, u.resource_id, u.scope, u.status, "
-            "a.assignee, h.declared_identity FROM resource_uses u "
-            "LEFT JOIN attempts a ON a.plan_id = u.plan_id AND a.attempt_id = u.attempt_id "
-            "LEFT JOIN absent_host_work h ON h.absent_work_id = u.absent_work_id WHERE u.rowid = ?",
-            (rid,)).fetchone()
-        return CoordinationItem("reservation", ReservationView(
-            use_id=use_id, plan_id=use_plan, attempt_id=attempt_id, absent_work_id=absent_id,
-            resource_ids=(resolve_resource_id(connection, resource_id),), actor=assignee or identity or "", writer_active=status != "released",
-            unresolved=status == "unresolved", repository_exclusive=scope == "repository"))
+        from adaptive_planning.resources import reservation_projections
+        value = reservation_projections(connection, plan_id)[0].get(rid)
+        if value is None:
+            raise DomainError("invalid", "A verifier member is not a public reservation anchor")
+        return CoordinationItem("reservation", value)
     if kind == "hold":
         hold_id, reason = connection.execute("SELECT hold_id, reason FROM holds WHERE rowid = ?", (rid,)).fetchone()
         return CoordinationItem("hold", _hold_view(hold_id, reason))
@@ -493,8 +488,11 @@ def _coordination_page(
     adds its own bytes, a separating comma when its array is already non-empty, and, when more rows follow, the
     growth of the cursor replacing `null`. Rows are never truncated.
     """
-    rows = connection.execute(_PAGE_SQL, {
-        "p": plan.plan_id, "a": key[0], "b": key[1], "c": key[2], "n": limit + 1}).fetchall()
+    from adaptive_planning.resources import reservation_projections
+    reservations, hidden = reservation_projections(connection, plan.plan_id)
+    physical = connection.execute(_PAGE_SQL, {
+        "p": plan.plan_id, "a": key[0], "b": key[1], "c": key[2], "n": limit + 1 + hidden}).fetchall()
+    rows = [row for row in physical if row[3] != "reservation" or row[2] in reservations]
     epoch, sequence = _installation_epoch(connection), _store_sequence(connection)
 
     def cursor_for(position: tuple[int, int, int]) -> str:
@@ -506,7 +504,8 @@ def _coordination_page(
     last = key
     fits = True
     for index, (prio, kind_rank, rid, kind) in enumerate(rows[:limit]):
-        item = _load_item(connection, plan.plan_id, kind, rid)
+        item = (CoordinationItem("reservation", reservations[rid]) if kind == "reservation"
+                else _load_item(connection, plan.plan_id, kind, rid))
         array = kind if per_kind_arrays else None
         if per_kind_arrays and kind == "invalidation":
             delta = 0  # the plan view carries no invalidation array

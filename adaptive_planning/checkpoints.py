@@ -205,6 +205,19 @@ def install_holds(connection: sqlite3.Connection, plan_id: PlanId, checkpoint_id
                            (str(uuid.uuid4()), plan_id, json.dumps(reason, sort_keys=True, ensure_ascii=False), ts))
 
 
+def _require_new_artifact_version(connection, plan_id, attempt_id, artifact):
+    """NEW publication changes the latest explicit version, looking past artifact-less cycles."""
+    if artifact is None:
+        return
+    from adaptive_planning.reviews import _checkpoint_sequences
+    for sequence in reversed(_checkpoint_sequences(connection, plan_id, attempt_id)):
+        previous, _ = _linked_checkpoint(connection, plan_id, str(sequence))
+        if previous.artifact is not None:
+            if attempts._artifact(previous.artifact).version == artifact.version:
+                raise DomainError("invalid", "A new explicit checkpoint artifact must change its previous explicit version")
+            return
+
+
 def record_checkpoint(connection: sqlite3.Connection, command: Command) -> MutationReceipt:
     """Submit one current active worker, its complete findings and provisional holds in the service transaction."""
     if command.kind != "record_checkpoint":
@@ -213,6 +226,7 @@ def record_checkpoint(connection: sqlite3.Connection, command: Command) -> Mutat
     previous = plans.project_plan(connection, plan.plan_id)
     value = _to_checkpoint(command.payload["checkpoint"])
     evidence = _validate_checkpoint(value, previous.legacy_snapshot, step.evidence)
+    _require_new_artifact_version(connection, plan.plan_id, row[0], value.artifact)
     version, revision = row[4] + 1, plan.revision + 1
     activity_ts, ts = plans._timestamp(data["last_activity"]), plans._timestamp(plan.updated_at)
     checkpoint_json = plans.to_jsonable(value)

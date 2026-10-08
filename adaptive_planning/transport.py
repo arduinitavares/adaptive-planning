@@ -36,6 +36,8 @@ _ARGUMENTS = {
     "record_checkpoint": frozenset({"command"}),
     "resolve_reassessment": frozenset({"command"}), "invalidate_result": frozenset({"command"}),
     "resolve_invalidation": frozenset({"command"}),
+    "record_review": frozenset({"command"}), "reserve_verification": frozenset({"command"}),
+    "release_resource_use": frozenset({"command"}), "reopen_attempt": frozenset({"command"}),
 }
 _MESSAGES = {
     "invalid": "Tool arguments are invalid.", "not_found": "The requested planning record was not found.",
@@ -315,6 +317,39 @@ class _ResolveInvalidationPayload(_InputModel):
     reason: str
 
 
+class _ReviewInput(_InputModel):
+    reviewer: str
+    artifact: _ArtifactInput
+    verdict: Literal["passed", "failed"]
+    findings: list[str]
+    evidence: list[_EvidenceInput]
+    verification_use_id: str | None
+
+
+class _RecordReviewPayload(_InputModel):
+    step_id: str
+    review: _ReviewInput
+
+
+class _ReserveVerificationPayload(_InputModel):
+    step_id: str
+    verifier: str
+    context: _ExecutionContextInput
+    handoff_from: str | None
+    stopped_reason: str | None
+
+
+class _ReleaseResourceUsePayload(_InputModel):
+    use_id: str
+    resource_ids: list[str]
+    reason: str
+    stopped: StrictBool
+
+
+class _ReopenAttemptPayload(_InputModel):
+    reason: str
+
+
 class _Envelope(_InputModel):
     epoch: str
     key: str
@@ -395,9 +430,30 @@ class ResolveInvalidationInput(_Envelope):
     payload: _ResolveInvalidationPayload
 
 
+class RecordReviewInput(_Envelope):
+    kind: Literal["record_review"]
+    payload: _RecordReviewPayload
+
+
+class ReserveVerificationInput(_Envelope):
+    kind: Literal["reserve_verification"]
+    payload: _ReserveVerificationPayload
+
+
+class ReleaseResourceUseInput(_Envelope):
+    kind: Literal["release_resource_use"]
+    payload: _ReleaseResourceUsePayload
+
+
+class ReopenAttemptInput(_Envelope):
+    kind: Literal["reopen_attempt"]
+    payload: _ReopenAttemptPayload
+
+
 CommandInput = Annotated[CreatePlanInput | RevisePlanInput | TakeoverInput | RegisterResourceInput | ReconcileResourcesInput | AssignStepInput
                          | BindAvailabilityInput | StartStepInput | ReportActivityInput | RecordCheckpointInput
-                         | ResolveReassessmentInput | InvalidateResultInput | ResolveInvalidationInput,
+                         | ResolveReassessmentInput | InvalidateResultInput | ResolveInvalidationInput
+                         | RecordReviewInput | ReserveVerificationInput | ReleaseResourceUseInput | ReopenAttemptInput,
                          Field(discriminator="kind")]
 _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_fields,
                            *_CreatePayload.model_fields, *_RevisePayload.model_fields, *_TakeoverPayload.model_fields,
@@ -409,6 +465,9 @@ _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_field
                            *_ReassessmentInput.model_fields, *_CheckpointInput.model_fields, *_RecordCheckpointPayload.model_fields,
                            *_ResolveReassessmentPayload.model_fields, *_InvalidateResultPayload.model_fields,
                            *_ResolveInvalidationPayload.model_fields,
+                           *_ReviewInput.model_fields, *_RecordReviewPayload.model_fields,
+                           *_ReserveVerificationPayload.model_fields, *_ReleaseResourceUsePayload.model_fields,
+                           *_ReopenAttemptPayload.model_fields,
                            "plan_id", "include_terminal", "after", "limit", *_ARGUMENTS})
 
 
@@ -589,5 +648,25 @@ def build_mcp(service: PlanningService) -> MCPServer:
     def resolve_invalidation(command: CommandInput) -> dict[str, Any]:
         """Resolve one affected hold with exact artifact proof or an actual revised consumer route."""
         return execute("resolve_invalidation", command)
+
+    @server.tool(annotations=write)
+    def record_review(command: CommandInput) -> dict[str, Any]:
+        """Record an immutable verdict for the exact submitted or invalidated accepted artifact."""
+        return execute("record_review", command)
+
+    @server.tool(annotations=write)
+    def reserve_verification(command: CommandInput) -> dict[str, Any]:
+        """Reserve an attributable writable verifier group without freeing retained implementation use."""
+        return execute("reserve_verification", command)
+
+    @server.tool(annotations=write)
+    def release_resource_use(command: CommandInput) -> dict[str, Any]:
+        """Record an exact stopped-use observation and release the complete named use only when confirmed."""
+        return execute("release_resource_use", command)
+
+    @server.tool(annotations=write)
+    def reopen_attempt(command: CommandInput) -> dict[str, Any]:
+        """Reopen the same current submitted attempt after scope, hold and retained-use checks."""
+        return execute("reopen_attempt", command)
 
     return server

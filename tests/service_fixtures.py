@@ -5,7 +5,7 @@ Standard-library only (Python 3.10+ compatible). Does not require external SDK d
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -494,7 +494,7 @@ class ServiceFixture:
             receipt=receipt,
             attempt=attempt,
         )
-        return self.service.execute(cmd)
+        return self.service.execute(replace(cmd, expected_revision=None, ownership_version=None))
 
     def submit(
         self,
@@ -510,6 +510,8 @@ class ServiceFixture:
             receipt=receipt,
             attempt=attempt,
         )
+        if cp.relay is None:
+            cmd = replace(cmd, expected_revision=None, ownership_version=None)
         return self.service.execute(cmd)
 
     def accept(
@@ -579,6 +581,52 @@ class SeededResult:
     attempt_id: AttemptId
     result_version: ResultVersion
     artifact: ArtifactRef
+
+
+def seed_store_hold(fixture: ServiceFixture, reason: str) -> None:
+    """TEST-ONLY unresolved restore inventory in the same owned temporary store."""
+    import json
+    from tempfile import TemporaryDirectory
+    from adaptive_planning.store import Store
+    from adaptive_planning.types import DomainError
+
+    def owned_database():
+        if (not isinstance(fixture, ServiceFixture)
+                or not isinstance(fixture._temporary_owner, TemporaryDirectory)
+                or fixture._temporary_closed or fixture._temporary_identity is None
+                or not isinstance(fixture.store, Store)
+                or getattr(fixture.service, "_store", None) is not fixture.store
+                or fixture.store.host_id != "synthetic-host"):
+            raise DomainError("invalid", "Synthetic inventory needs a live owned temporary fixture")
+        try:
+            owned = Path(fixture._temporary_owner.name).resolve(strict=True)
+            identity = owned.stat()
+            database = fixture.store.path.resolve(strict=True)
+            directory = fixture.directory.resolve(strict=True)
+        except (OSError, TypeError, AttributeError) as error:
+            raise DomainError("invalid", "The synthetic temporary fixture is no longer valid") from error
+        if (not owned.is_dir() or directory != owned or database != owned / "planning.sqlite"
+                or (identity.st_dev, identity.st_ino) != fixture._temporary_identity):
+            raise DomainError("invalid", "Synthetic inventory must stay in its original temporary store")
+        return database
+
+    database = owned_database()
+    if not isinstance(reason, str) or not reason.strip():
+        raise DomainError("invalid", "Synthetic inventory requires a meaningful reason")
+
+    def insert(db):
+        if owned_database() != database or not any(
+                name == "main" and Path(path).resolve() == database
+                for _, name, path in db.execute("PRAGMA database_list")):
+            raise DomainError("invalid", "Synthetic inventory connection is outside the owned fixture")
+        epoch = db.execute("SELECT epoch FROM installation WHERE id=1").fetchone()[0]
+        db.execute("INSERT INTO store_hold_reasons(reason_id,epoch,kind,details,resolved,created_at) "
+                   "VALUES(?,?,'restore-inventory',?,0,?)",
+                   (str(uuid.uuid4()), epoch,
+                    json.dumps({"reason": reason, "inventory_complete": False, "synthetic": True}, sort_keys=True),
+                    fixture.clock().isoformat()))
+
+    fixture.store.write(insert)
 
 
 def seed_accepted_result(
