@@ -952,6 +952,28 @@ def _apply_steps(connection: sqlite3.Connection, plan: _Plan, draft: PlanDraft) 
         connection.execute("DELETE FROM steps WHERE plan_id = ? AND step_id = ?", (plan.plan_id, step.step_id))
 
 
+def _apply_revision_draft(connection: sqlite3.Connection, plan: _Plan, draft: PlanDraft) -> None:
+    """Apply the shared graph rules without publishing an extra owner command or revision."""
+    _check_draft_limits(draft)
+    if draft.authorization != plan.authorization:
+        raise DomainError("invalid", "The draft must echo the stored authorization unchanged; "
+                                     "use authorization_change to renew it")
+    if draft.objective != plan.draft_json["objective"]:
+        raise DomainError("invalid", "The plan objective cannot change")
+    _apply_steps(connection, plan, draft)
+
+
+def _definition_changes(connection: sqlite3.Connection, plan_id: PlanId, before: dict[str, dict]) -> dict[str, Any]:
+    """Bind each actual definition change to its preceding edges, without copying unchanged work."""
+    current = _load_plan(connection, plan_id)
+    changed = {s.step_id: s.definition for s in current.steps if before.get(s.step_id) != s.definition}
+    value = {"changed_definitions": changed,
+             "prior_dependencies": {sid: None if sid not in before else before[sid]["dependencies"] for sid in changed}}
+    if len(canonical_bytes(value)) > MAX_FILE_BYTES:
+        raise DomainError("limit_exceeded", "Graph revision proof exceeds the 10MB limit")
+    return value
+
+
 def revise_plan(connection: sqlite3.Connection, command: Command) -> MutationReceipt:
     payload = command.payload
     draft: PlanDraft = payload["draft"]
@@ -961,14 +983,8 @@ def revise_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
 
     plan = _load_plan(connection, command.plan_id)
     _check_preconditions(plan, command)
-    _check_draft_limits(draft)
     if len(reason) > MAX_TEXT_LEN:
         raise DomainError("invalid", "reason exceeds maximum length")
-    if draft.authorization != plan.authorization:
-        raise DomainError("invalid", "The draft must echo the stored authorization unchanged; "
-                                     "use authorization_change to renew it")
-    if draft.objective != plan.draft_json["objective"]:
-        raise DomainError("invalid", "The plan objective cannot change")
     retired_ids = [r.step_id for r in retirements]
     if len(retired_ids) != len(set(retired_ids)):
         raise DomainError("invalid", "Duplicate retirement requests")
@@ -977,7 +993,8 @@ def revise_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
     revision = plan.revision + 1
     ts = _timestamp(plan.updated_at)
 
-    _apply_steps(connection, plan, draft)
+    before_definitions = {s.step_id: s.definition for s in plan.steps}
+    _apply_revision_draft(connection, plan, draft)
     if retirements:
         # A prerequisite and all its dependents may retire together. Cancel all
         # claims first and validate the real intermediate blocked graph, then
@@ -1009,9 +1026,12 @@ def revise_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
          plan.plan_id))
     event: dict[str, Any] = {
         "summary": reason, "authorization_renewed": change is not None,
-        "retired_steps": [{"step_id": r.step_id, "reason": r.reason.strip()} for r in retirements]}
+        "retired_steps": [{"step_id": r.step_id, "reason": r.reason.strip()} for r in retirements],
+        **_definition_changes(connection, plan.plan_id, before_definitions)}
     if change is not None:
         event["authorization_note"] = authorization.note
+    if len(canonical_bytes(event)) > MAX_FILE_BYTES:
+        raise DomainError("limit_exceeded", "Graph revision audit exceeds the 10MB limit")
     _insert_event(connection, plan.plan_id, revision, "revise_plan", command.actor, ts, event)
 
     view = _commit_projection(connection, plan.plan_id, previous)

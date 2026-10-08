@@ -34,6 +34,8 @@ _ARGUMENTS = {
     "bind_availability": frozenset({"command"}), "start_step": frozenset({"command"}),
     "report_activity": frozenset({"command"}),
     "record_checkpoint": frozenset({"command"}),
+    "resolve_reassessment": frozenset({"command"}), "invalidate_result": frozenset({"command"}),
+    "resolve_invalidation": frozenset({"command"}),
 }
 _MESSAGES = {
     "invalid": "Tool arguments are invalid.", "not_found": "The requested planning record was not found.",
@@ -287,6 +289,32 @@ class _RecordCheckpointPayload(_InputModel):
     checkpoint: _CheckpointInput
 
 
+class _ResolveReassessmentPayload(_InputModel):
+    checkpoint_id: str
+    decision: Literal["apply", "reject", "hold"]
+    reason: str
+    draft: dict[str, Any] | None
+    affected_steps: list[str]
+    unbounded: StrictBool
+
+
+class _InvalidateResultPayload(_InputModel):
+    step_id: str
+    result_version: str
+    reason: str
+    evidence: list[_EvidenceInput]
+
+
+class _ResolveInvalidationPayload(_InputModel):
+    invalidation_id: str
+    affected_step_id: str
+    disposition: Literal["revalidated", "superseded", "replanned"]
+    corrective_step_id: str | None
+    corrected_result_version: str | None
+    evidence: list[_EvidenceInput]
+    reason: str
+
+
 class _Envelope(_InputModel):
     epoch: str
     key: str
@@ -352,8 +380,24 @@ class RecordCheckpointInput(_Envelope):
     payload: _RecordCheckpointPayload
 
 
+class ResolveReassessmentInput(_Envelope):
+    kind: Literal["resolve_reassessment"]
+    payload: _ResolveReassessmentPayload
+
+
+class InvalidateResultInput(_Envelope):
+    kind: Literal["invalidate_result"]
+    payload: _InvalidateResultPayload
+
+
+class ResolveInvalidationInput(_Envelope):
+    kind: Literal["resolve_invalidation"]
+    payload: _ResolveInvalidationPayload
+
+
 CommandInput = Annotated[CreatePlanInput | RevisePlanInput | TakeoverInput | RegisterResourceInput | ReconcileResourcesInput | AssignStepInput
-                         | BindAvailabilityInput | StartStepInput | ReportActivityInput | RecordCheckpointInput,
+                         | BindAvailabilityInput | StartStepInput | ReportActivityInput | RecordCheckpointInput
+                         | ResolveReassessmentInput | InvalidateResultInput | ResolveInvalidationInput,
                          Field(discriminator="kind")]
 _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_fields,
                            *_CreatePayload.model_fields, *_RevisePayload.model_fields, *_TakeoverPayload.model_fields,
@@ -363,6 +407,8 @@ _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_field
                            *_ArtifactInput.model_fields, *_EvidenceInput.model_fields, *_AvailabilityInput.model_fields,
                            *_BindAvailabilityPayload.model_fields, *_ActivityPayload.model_fields,
                            *_ReassessmentInput.model_fields, *_CheckpointInput.model_fields, *_RecordCheckpointPayload.model_fields,
+                           *_ResolveReassessmentPayload.model_fields, *_InvalidateResultPayload.model_fields,
+                           *_ResolveInvalidationPayload.model_fields,
                            "plan_id", "include_terminal", "after", "limit", *_ARGUMENTS})
 
 
@@ -528,5 +574,20 @@ def build_mcp(service: PlanningService) -> MCPServer:
     def record_checkpoint(command: CommandInput) -> dict[str, Any]:
         """Submit attributed worker findings and provisional reassessment holds atomically."""
         return execute("record_checkpoint", command)
+
+    @server.tool(annotations=write)
+    def resolve_reassessment(command: CommandInput) -> dict[str, Any]:
+        """Classify one checkpoint and its residual holds; relay affected workers at a safe boundary."""
+        return execute("resolve_reassessment", command)
+
+    @server.tool(annotations=write)
+    def invalidate_result(command: CommandInput) -> dict[str, Any]:
+        """Invalidate an accepted output and hold its producer and transitive consumers without deleting history."""
+        return execute("invalidate_result", command)
+
+    @server.tool(annotations=write)
+    def resolve_invalidation(command: CommandInput) -> dict[str, Any]:
+        """Resolve one affected hold with exact artifact proof or an actual revised consumer route."""
+        return execute("resolve_invalidation", command)
 
     return server
