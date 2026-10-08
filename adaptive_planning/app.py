@@ -13,7 +13,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Mount
 
 from adaptive_planning.admin import load_service_token
-from adaptive_planning.config import Config, RequestBoundary, http_allowlist
+from adaptive_planning.config import Config, DEFAULT_STALE_SECONDS, RequestBoundary, http_allowlist
 
 from adaptive_planning import attempts, plans, resources
 from adaptive_planning.ownership import command_relay, require_kind_capabilities, require_orchestrator
@@ -28,9 +28,10 @@ from adaptive_planning.types import (
     PlanId,
     PlanView,
     ReadyStep,
+    WORKER_KINDS,
 )
 
-# Bounded assignment is enabled; worker execution remains disabled until the start gates exist.
+# Mutations share one transaction and the same domain authentication/replay authority.
 HANDLERS: dict[str, Callable[[sqlite3.Connection, Command], MutationReceipt]] = {
     "create_plan": plans.create_plan,
     "revise_plan": plans.revise_plan,
@@ -38,17 +39,24 @@ HANDLERS: dict[str, Callable[[sqlite3.Connection, Command], MutationReceipt]] = 
     "register_resource": resources.register_resource,
     "reconcile_resources": resources.reconcile_resources,
     "assign_step": attempts.assign_step,
+    "bind_availability": attempts.bind_availability,
+    "start_step": attempts.start_step,
+    "report_activity": attempts.report_activity,
 }
 
 
 class PlanningService:
-    def __init__(self, store: Store, *, base_url: str, clock: Callable[[], datetime]) -> None:
+    def __init__(self, store: Store, *, base_url: str, clock: Callable[[], datetime],
+                 stale_seconds: int = DEFAULT_STALE_SECONDS) -> None:
+        if isinstance(stale_seconds, bool) or not isinstance(stale_seconds, int) or stale_seconds < 1:
+            raise DomainError("invalid", "stale_seconds must be a positive integer")
         self._store = store
         self._base_url = base_url.rstrip("/")
         self._clock = clock
+        self._stale_seconds = stale_seconds
 
     def _run_write(self, operation: Callable[[sqlite3.Connection], object]) -> object:
-        with plans.service_context(self._base_url, self._clock):
+        with plans.service_context(self._base_url, self._clock), attempts.activity_policy(self._stale_seconds):
             return self._store.write(operation)
 
     def _run_read(self, operation: Callable[[sqlite3.Connection], object]) -> object:
@@ -70,7 +78,9 @@ class PlanningService:
         # The matrix leaves the orchestrator token only on orchestrator and relayed commands. Authentication
         # of the current owner, epoch and generation precedes exact replay, which precedes new-command checks.
         try:
-            if command.orchestrator_token is not None:
+            if command.kind in WORKER_KINDS:
+                attempts.require_attempt(db, command)
+            elif command.orchestrator_token is not None:
                 require_orchestrator(db, command)
             replayed = plans.replay_request(db, command)
             if replayed is not None:
@@ -130,7 +140,8 @@ def build_app(config: Config) -> Starlette:
     # Credential loading precedes even Store construction: ordinary startup never initializes it.
     token = load_service_token(config)
     clock = lambda: datetime.now(timezone.utc)
-    service = PlanningService(Store(config.data_dir / "planning.sqlite", clock), base_url=config.base_url, clock=clock)
+    service = PlanningService(Store(config.data_dir / "planning.sqlite", clock), base_url=config.base_url, clock=clock,
+                              stale_seconds=config.stale_seconds)
     from adaptive_planning.transport import MCPHttpErrors, MCPServerDiagnostics, build_mcp, mcp_server_diagnostics
     from adaptive_planning.dashboard import dashboard_routes
     server = build_mcp(service)

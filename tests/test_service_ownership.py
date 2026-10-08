@@ -210,7 +210,7 @@ class TestService(unittest.TestCase):
             self.assertEqual(code(kind, None, None, "a"), "invalid", kind)
         self.assertEqual(code("unknown_kind", None, "o", None), "invalid")
 
-    def test_relay_is_read_from_worker_payloads_without_enabling_worker_routes(self):
+    def test_relay_is_read_from_worker_payloads_and_missing_attempt_grant_is_forbidden(self):
         direct = {"origin_worker": "worker-a", "relay": None, "observed_activity": "synthetic"}
         relayed = dict(direct, relay="relay-1")
         for kind in ("start_step", "report_activity"):
@@ -221,7 +221,7 @@ class TestService(unittest.TestCase):
             self.assertEqual(ownership.command_relay(command), relay)
         self.assertIsNone(ownership.command_relay(self.revise(self.p)))
         before = dump(self.f.store)
-        self.assertEqual(self.raises(self.f.command("start_step", relayed, receipt=self.p)).code, "unsupported")
+        self.assertEqual(self.raises(self.f.command("start_step", relayed, receipt=self.p)).code, "forbidden")
         self.assertEqual(dump(self.f.store), before)
 
     def test_service_rejects_matrix_violations_before_any_state_change(self):

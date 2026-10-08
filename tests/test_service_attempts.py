@@ -688,7 +688,7 @@ class TestService(unittest.TestCase):
         self.assertEqual(caught.exception.code, "invalid")
         self.assertEqual(self.snapshot(), before)
 
-    def test_current_attempt_is_scoped_public_lookup_and_start_stays_disabled(self):
+    def test_current_attempt_is_scoped_public_lookup(self):
         from adaptive_planning.attempts import current_attempt, ready_steps
         assigned = self.assign()
         view = self.f.service._run_read(lambda db: current_attempt(db, self.plan_id, "a"))
@@ -699,11 +699,6 @@ class TestService(unittest.TestCase):
         with self.assertRaises(DomainError) as caught:
             self.f.service._run_read(lambda db: current_attempt(db, self.plan_id, "b"))
         self.assertEqual(caught.exception.code, "not_found")
-        before = self.snapshot()
-        with self.assertRaises(DomainError) as caught:
-            self.f.service.execute(self.worker(assigned))
-        self.assertEqual(caught.exception.code, "unsupported")
-        self.assertEqual(self.snapshot(), before)
 
     def test_sdk_assignment_returns_private_grant_and_secret_free_reads(self):
         from adaptive_planning.transport import build_mcp

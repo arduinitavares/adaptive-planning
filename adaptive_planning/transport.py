@@ -31,6 +31,8 @@ _ARGUMENTS = {
     "create_plan": frozenset({"command"}), "revise_plan": frozenset({"command"}), "takeover": frozenset({"command"}),
     "register_resource": frozenset({"command"}), "reconcile_resources": frozenset({"command"}),
     "assign_step": frozenset({"command"}),
+    "bind_availability": frozenset({"command"}), "start_step": frozenset({"command"}),
+    "report_activity": frozenset({"command"}),
 }
 _MESSAGES = {
     "invalid": "Tool arguments are invalid.", "not_found": "The requested planning record was not found.",
@@ -221,6 +223,44 @@ class _AssignStepPayload(_InputModel):
     context: _ExecutionContextInput
 
 
+class _ArtifactInput(_InputModel):
+    kind: Literal["code", "document", "data", "observation"]
+    identity: str
+    version: str
+    digest: str | None
+    summary: str
+
+
+class _EvidenceInput(_InputModel):
+    summary: str
+    artifact: _ArtifactInput | None
+    workspace_id: str | None
+    check: str
+    result: Literal["passed", "failed", "blocked", "observation"]
+    limitations: list[str]
+    blockers: list[str]
+
+
+class _AvailabilityInput(_InputModel):
+    prerequisite: str
+    result_version: str
+    method: Literal["ancestor", "merge", "cherry-pick", "equivalent", "observation"]
+    checked_base: str
+    artifact_digest: str | None
+    evidence: _EvidenceInput
+
+
+class _BindAvailabilityPayload(_InputModel):
+    bindings: list[_AvailabilityInput]
+    checked_base: str
+
+
+class _ActivityPayload(_InputModel):
+    origin_worker: str
+    relay: str | None
+    observed_activity: str
+
+
 class _Envelope(_InputModel):
     epoch: str
     key: str
@@ -266,13 +306,31 @@ class AssignStepInput(_Envelope):
     payload: _AssignStepPayload
 
 
-CommandInput = Annotated[CreatePlanInput | RevisePlanInput | TakeoverInput | RegisterResourceInput | ReconcileResourcesInput | AssignStepInput,
+class BindAvailabilityInput(_Envelope):
+    kind: Literal["bind_availability"]
+    payload: _BindAvailabilityPayload
+
+
+class StartStepInput(_Envelope):
+    kind: Literal["start_step"]
+    payload: _ActivityPayload
+
+
+class ReportActivityInput(_Envelope):
+    kind: Literal["report_activity"]
+    payload: _ActivityPayload
+
+
+CommandInput = Annotated[CreatePlanInput | RevisePlanInput | TakeoverInput | RegisterResourceInput | ReconcileResourcesInput | AssignStepInput
+                         | BindAvailabilityInput | StartStepInput | ReportActivityInput,
                          Field(discriminator="kind")]
 _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_fields,
                            *_CreatePayload.model_fields, *_RevisePayload.model_fields, *_TakeoverPayload.model_fields,
                            *_ResourceClaimInput.model_fields, *_RegisterResourcePayload.model_fields,
                            *_ReconcileResourcesPayload.model_fields,
                            *_ExecutionContextInput.model_fields, *_AssignStepPayload.model_fields,
+                           *_ArtifactInput.model_fields, *_EvidenceInput.model_fields, *_AvailabilityInput.model_fields,
+                           *_BindAvailabilityPayload.model_fields, *_ActivityPayload.model_fields,
                            "plan_id", "include_terminal", "after", "limit", *_ARGUMENTS})
 
 
@@ -418,5 +476,20 @@ def build_mcp(service: PlanningService) -> MCPServer:
     def assign_step(command: CommandInput) -> dict[str, Any]:
         """Assign one frozen authorized step after atomic scope, ownership and resource checks."""
         return execute("assign_step", command)
+
+    @server.tool(annotations=write)
+    def bind_availability(command: CommandInput) -> dict[str, Any]:
+        """Bind accepted prerequisite outputs to one assigned consumer's final checked base."""
+        return execute("bind_availability", command)
+
+    @server.tool(annotations=write)
+    def start_step(command: CommandInput) -> dict[str, Any]:
+        """Start an authenticated worker after final-base input and current execution guards."""
+        return execute("start_step", command)
+
+    @server.tool(annotations=write)
+    def report_activity(command: CommandInput) -> dict[str, Any]:
+        """Record actual authenticated worker observation without changing execution lifecycle."""
+        return execute("report_activity", command)
 
     return server

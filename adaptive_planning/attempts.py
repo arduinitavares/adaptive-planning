@@ -1,21 +1,39 @@
-"""Transaction-local bounded assignment and frozen worker capability authentication."""
+"""Transaction-local assignment, accepted input availability and semantic worker progress."""
 from __future__ import annotations
 
 from dataclasses import replace
+from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import datetime
 import json
 import secrets
 import sqlite3
 import uuid
 
 from adaptive_planning import plans, resources
+from adaptive_planning.config import DEFAULT_STALE_SECONDS
 from adaptive_planning.core import MAX_TEXT_LEN, PlanValidationError, validate_execution_scope, validate_service_graph
 from adaptive_planning.ownership import (
     _require_attempt_capability, command_relay, hash_token, require_kind_capabilities, require_orchestrator,
 )
 from adaptive_planning.types import (
-    AttemptId, AttemptView, Command, DomainError, MutationReceipt, PlanId, PrivateGrant, ReadyStep, StepId,
-    WORKER_KINDS,
+    ArtifactRef, AttemptId, AttemptView, Availability, Command, DomainError, MutationReceipt, PlanId,
+    PrivateGrant, ReadyStep, StepId, WORKER_KINDS, _to_artifact_ref, _to_availability, _to_evidence,
+    _to_execution_context,
 )
+
+
+_STALE_SECONDS: ContextVar[int] = ContextVar("adaptive_planning_attempt_stale_seconds", default=DEFAULT_STALE_SECONDS)
+
+
+@contextmanager
+def activity_policy(stale_seconds: int):
+    """Keep each service's inactivity policy local to its write operation."""
+    token = _STALE_SECONDS.set(stale_seconds)
+    try:
+        yield
+    finally:
+        _STALE_SECONDS.reset(token)
 
 
 def ready_steps(connection: sqlite3.Connection, plan_id: PlanId) -> tuple[ReadyStep, ...]:
@@ -57,7 +75,7 @@ def require_attempt(connection: sqlite3.Connection, command: Command) -> Attempt
         connection, command.plan_id, command.generation, command.attempt_id, command.attempt_token)
     origin = (command.payload["checkpoint"].origin_worker if command.kind == "record_checkpoint"
               else command.payload["origin_worker"])
-    if origin != row[2] or (relay is None and command.actor != row[2]):
+    if origin != row[2] or (relay is None and command.actor != row[2]) or (relay is not None and relay != command.actor):
         raise DomainError("forbidden", "Worker identity does not match the assigned attempt")
     return plans._attempt_view(row)
 
@@ -151,6 +169,397 @@ def assign_step(connection: sqlite3.Connection, command: Command) -> MutationRec
                         {**committed, "step_id": step_id, "assignee": command.payload["assignee"]})
     view = plans._commit_projection(connection, plan.plan_id, previous)
     return MutationReceipt(committed, view.metadata, view.metadata, False, PrivateGrant(None, token))
+
+
+def _object(raw: str, description: str) -> dict:
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        raise DomainError("invalid", f"The {description} is malformed") from None
+    if not isinstance(value, dict):
+        raise DomainError("invalid", f"The {description} is malformed")
+    return value
+
+
+def _nonblank(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _artifact(value) -> ArtifactRef:
+    artifact = _to_artifact_ref(value)
+    if (not all(_nonblank(field) for field in (artifact.identity, artifact.version, artifact.summary))
+            or (artifact.digest is not None and not _nonblank(artifact.digest))):
+        raise DomainError("invalid", "Accepted output requires a complete artifact reference")
+    return artifact
+
+
+def _passing_evidence(value, artifact: ArtifactRef) -> bool:
+    """Require meaningful, blocker-free evidence explicitly bound to the full artifact."""
+    if not isinstance(value, (list, tuple)) or not value:
+        return False
+    try:
+        items = tuple(_to_evidence(item) for item in value)
+    except DomainError:
+        return False
+    return (all(_nonblank(item.summary) and _nonblank(item.check) and item.result == "passed"
+                and not item.blockers and (item.artifact is None or item.artifact == artifact) for item in items)
+            and any(item.artifact == artifact for item in items))
+
+
+def _audit_links(data: dict, *, step_id: str, attempt_id: str, result_version: str,
+                 artifact: ArtifactRef, definition: dict) -> bool:
+    """Optional declared links must agree; event names and fixture labels supply no authority."""
+    expected = {"step_id": step_id, "producer_step_id": step_id, "attempt_id": attempt_id,
+                "result_version": result_version, "definition_version": definition["definition_version"],
+                "definition": definition, "artifact": plans.to_jsonable(artifact)}
+    return all(key not in data or data[key] == value for key, value in expected.items())
+
+
+def _audit_event(connection, plan_id, sequence, **links):
+    if type(sequence) is not int or sequence < 1:
+        raise DomainError("invalid", "Accepted output has an invalid audit pointer")
+    row = connection.execute("SELECT payload FROM events WHERE plan_id=? AND sequence=?", (plan_id, sequence)).fetchone()
+    if row is None:
+        raise DomainError("invalid", "Accepted output has a missing scoped audit event")
+    data = _object(row[0], "accepted output audit event")
+    if not _audit_links(data, **links):
+        raise DomainError("invalid", "Accepted output audit links contradict its retained history")
+    return data
+
+
+def _matching_reviews(connection, plan_id, producer, artifact):
+    matched = {}
+    for review_id, reviewer, verdict, raw_evidence, raw_artifact in connection.execute(
+            "SELECT review_id,reviewer,verdict,evidence,artifact FROM reviews "
+            "WHERE plan_id=? AND attempt_id=? AND step_id=?", (plan_id, producer[0], producer[1])):
+        try:
+            evidence, supplied = json.loads(raw_evidence), _artifact(json.loads(raw_artifact))
+        except (ValueError, TypeError, DomainError):
+            continue
+        if (verdict == "passed" and _nonblank(reviewer) and reviewer != producer[2]
+                and supplied == artifact and _passing_evidence(evidence, artifact)):
+            matched[review_id] = reviewer
+    return matched
+
+
+def _review_after_invalidation(connection, plan_id, invalidation_sequence, reviews, links) -> bool:
+    """Only the first exact-ID link records a review; later references cannot refresh it."""
+    seen = set()
+    for sequence, raw in connection.execute(
+            "SELECT sequence,payload FROM events WHERE plan_id=? ORDER BY sequence", (plan_id,)):
+        try:
+            data = _object(raw, "review audit event")
+        except DomainError:
+            continue
+        review_id = data.get("review_id")
+        if not _nonblank(review_id) or review_id not in reviews or review_id in seen:
+            continue
+        seen.add(review_id)
+        if sequence > invalidation_sequence and _audit_links(data, **links):
+            return True
+    return False
+
+
+def _require_valid_result(connection, plan_id, prerequisite, result_version, artifact, reviews, definition, producer_id):
+    """Each exact invalidation needs its own later producer disposition; consumer holds are independent."""
+    invalidations = []
+    for sequence, raw in connection.execute(
+            "SELECT sequence,payload FROM events WHERE plan_id=? AND kind='invalidate_result' ORDER BY sequence", (plan_id,)):
+        data = _object(raw, "invalidation history")
+        if (data.get("result_version") == result_version
+                and data.get("producer_step_id", data.get("step_id")) == prerequisite):
+            invalidations.append((sequence, data.get("invalidation_id")))
+    ids = [identity for _, identity in invalidations]
+    if any(not _nonblank(identity) for identity in ids) or len(ids) != len(set(ids)):
+        raise DomainError("held", "The accepted result has ambiguous invalidation history")
+    links = dict(step_id=prerequisite, attempt_id=producer_id, result_version=result_version,
+                 artifact=artifact, definition=definition)
+    for sequence, invalidation_id in invalidations:
+        resolution = None
+        for (raw,) in connection.execute(
+                "SELECT payload FROM events WHERE plan_id=? AND kind='resolve_invalidation' AND sequence>? ORDER BY sequence",
+                (plan_id, sequence)):
+            candidate = _object(raw, "invalidation resolution")
+            if candidate.get("invalidation_id") == invalidation_id and candidate.get("affected_step_id") == prerequisite:
+                resolution = candidate
+        if (resolution is None or resolution.get("disposition") != "revalidated"
+                or resolution.get("corrected_result_version") != result_version
+                or not _audit_links(resolution, **links)
+                or not _passing_evidence(resolution.get("evidence"), artifact)
+                or (definition["review_required"]
+                    and not _review_after_invalidation(connection, plan_id, sequence, reviews, links))):
+            raise DomainError("held", "The original accepted result requires explicit producer revalidation")
+
+
+def _accepted_history(connection: sqlite3.Connection, plan, prerequisite: str, result_version: str):
+    """Inspect exact coherent accepted history, including history needing explicit revalidation.
+
+    ResultVersion is the durable result identity, not ArtifactRef.version. Future acceptance/revalidation
+    writers must retain that full relationship and coherent checkpoint/review audit links. This private
+    read seam supplies remediation proof; it does not authorize consumption of an invalidated output.
+    """
+    step = next((node for node in plan.steps if node.step_id == prerequisite), None)
+    if (step is None or step.state != "complete" or not step.evidence
+            or not all(_nonblank(item) for item in step.evidence)):
+        raise DomainError("invalid", "Availability requires a completed prerequisite with retained evidence")
+    if connection.execute(f"SELECT 1 FROM attempts WHERE plan_id=? AND step_id=? AND state IN ({plans._LIVE_SQL})",
+                          (plan.plan_id, prerequisite)).fetchone():
+        raise DomainError("invalid", "A live prerequisite claim contradicts accepted output")
+    result = connection.execute(
+        "SELECT artifact_kind,identity,summary,digest FROM result_versions WHERE plan_id=? AND step_id=? AND result_version=?",
+        (plan.plan_id, prerequisite, result_version)).fetchone()
+    producers = []
+    for row in connection.execute(
+            "SELECT attempt_id,step_id,assignee,state,version,definition_version,started_at,payload "
+            "FROM attempts WHERE plan_id=? AND step_id=? AND state='accepted'", (plan.plan_id, prerequisite)):
+        data = _object(row[7], "accepted attempt")
+        if data.get("result_version") == result_version:
+            producers.append((row, data))
+    if result is None or len(producers) != 1:
+        raise DomainError("invalid", "The exact accepted output has no unique coherent producer")
+    producer, data = producers[0]
+    if data.get("definition") != step.definition or producer[5] != step.definition["definition_version"]:
+        raise DomainError("invalid", "Accepted output does not match its frozen prerequisite definition")
+    artifact = _artifact(data.get("artifact"))
+    if tuple(result) != (artifact.kind, artifact.identity, artifact.summary, artifact.digest):
+        raise DomainError("invalid", "Accepted output metadata contradicts its full artifact")
+    links = dict(step_id=prerequisite, attempt_id=producer[0], result_version=result_version,
+                 artifact=artifact, definition=step.definition)
+    checkpoints = set()
+    for sequence, outcome, check, raw_evidence, origin, raw_artifact in connection.execute(
+            "SELECT sequence,outcome,check_name,evidence,origin_worker,artifact FROM checkpoints WHERE plan_id=? AND attempt_id=?",
+            (plan.plan_id, producer[0])):
+        try:
+            supplied = _artifact(json.loads(raw_artifact))
+            evidence = json.loads(raw_evidence)
+        except (ValueError, TypeError, DomainError):
+            continue
+        if (outcome == "passed" and _nonblank(check) and origin == producer[2]
+                and supplied == artifact and _passing_evidence(evidence, artifact)):
+            _audit_event(connection, plan.plan_id, sequence, **links)
+            checkpoints.add(sequence)
+    if "checkpoint_sequence" in data:
+        _audit_event(connection, plan.plan_id, data["checkpoint_sequence"], **links)
+    if not checkpoints or ("checkpoint_sequence" in data and data["checkpoint_sequence"] not in checkpoints):
+        raise DomainError("invalid", "Accepted output requires its artifact-bound passing checkpoint")
+    reviews = _matching_reviews(connection, plan.plan_id, producer, artifact)
+    if step.definition["review_required"] and not reviews:
+        raise DomainError("invalid", "Accepted output requires a distinct matching passing review")
+    if "review_sequence" in data:
+        review_event = _audit_event(connection, plan.plan_id, data["review_sequence"], **links)
+        review_id = review_event.get("review_id")
+        if not _nonblank(review_id) or review_id not in reviews:
+            raise DomainError("invalid", "Accepted output review pointer does not identify a matching passing review")
+    if "accepted_sequence" in data:
+        accepted_event = _audit_event(connection, plan.plan_id, data["accepted_sequence"], **links)
+        for name in ("checkpoint_sequence", "review_sequence"):
+            if name in accepted_event and name in data and accepted_event[name] != data[name]:
+                raise DomainError("invalid", "Accepted output contains contradictory audit pointers")
+        if "review_id" in accepted_event and (not _nonblank(accepted_event["review_id"])
+                                              or accepted_event["review_id"] not in reviews):
+            raise DomainError("invalid", "Accepted output contains a contradictory review link")
+    return artifact, producer[0], step.definition, reviews
+
+
+def _accepted_output(connection: sqlite3.Connection, plan, prerequisite: str, result_version: str) -> ArtifactRef:
+    """Grant output availability only after coherent history AND current producer-specific validity."""
+    artifact, producer_id, definition, reviews = _accepted_history(connection, plan, prerequisite, result_version)
+    _require_valid_result(connection, plan.plan_id, prerequisite, result_version, artifact, reviews, definition, producer_id)
+    return artifact
+
+
+def _validate_binding(connection, plan, definition, execution, binding: Availability):
+    if (not all(_nonblank(value) for value in (binding.prerequisite, binding.result_version, binding.checked_base))
+            or binding.prerequisite not in definition["dependencies"]
+            or binding.checked_base != execution.checked_base):
+        raise DomainError("invalid", "Availability must name a dependency at this consumer's exact final base")
+    accepted = _accepted_output(connection, plan, binding.prerequisite, binding.result_version)
+    evidence = binding.evidence
+    if not _nonblank(evidence.summary) or not _nonblank(evidence.check) or evidence.blockers:
+        raise DomainError("invalid", "Availability requires meaningful successful evidence without unresolved blockers")
+    if evidence.workspace_id is not None:
+        if (execution.workspace_id is None or resources.resolve_resource_id(connection, evidence.workspace_id)
+                != resources.resolve_resource_id(connection, execution.workspace_id)):
+            raise DomainError("invalid", "Availability evidence refers to an unrelated consumer workspace")
+    supplied = _artifact(evidence.artifact)
+    if binding.method in ("ancestor", "merge", "cherry-pick"):
+        valid = accepted.kind == "code" and supplied == accepted and evidence.result == "passed"
+    elif binding.method == "equivalent":
+        valid = (supplied.kind == accepted.kind and _nonblank(supplied.digest)
+                 and binding.artifact_digest == supplied.digest and evidence.result == "passed")
+    elif binding.method == "observation":
+        valid = accepted.kind != "code" and supplied == accepted and evidence.result in ("passed", "observation")
+    else:
+        valid = False
+    if not valid:
+        raise DomainError("invalid", "Availability method does not attest the exact accepted output at the final base")
+
+
+def _new_target(connection, command, *, binding=False):
+    if command.epoch != plans._installation_epoch(connection):
+        raise DomainError("stale_epoch", "The installation epoch has changed")
+    plan = plans._load_plan(connection, command.plan_id)
+    if binding or command_relay(command) is not None:
+        plans._check_preconditions(plan, command)
+    if not _nonblank(command.attempt_id):
+        raise DomainError("invalid", "An exact consumer attempt is required")
+    row = _attempt_row(connection, plan.plan_id, command.attempt_id)
+    if row is None:
+        raise DomainError("not_found", "The attempt does not exist in this plan")
+    data = _object(row[7], "attempt")
+    step = next((node for node in plan.steps if node.step_id == row[1]), None)
+    if (command.attempt_version != row[4] or command.definition_version != row[5] or step is None
+            or data.get("definition") != step.definition or row[5] != step.definition["definition_version"]):
+        raise DomainError("stale", "The attempt version or complete frozen definition has changed")
+    if data.get("epoch") != plans._installation_epoch(connection) or data.get("generation") != plan.generation:
+        raise DomainError("fenced", "The attempt is not current in this installation and plan generation")
+    if "cancelled_from" in data:
+        raise DomainError("fenced", "The attempt has been cancelled")
+    if row[3] == "stale":
+        raise DomainError("stale", "The attempt requires explicit recovery")
+    if row[3] not in ("assigned", "active", "submitted"):
+        raise DomainError("invalid", "Terminal attempts cannot report new progress")
+    if data.get("recovery_required"):
+        raise DomainError("held", "The attempt requires explicit recovery")
+    if command.kind != "report_activity" and (row[3] != "assigned" or step.state != "pending"):
+        raise DomainError("invalid", "Only an assigned pending attempt may be prepared or started")
+    if binding:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM capabilities WHERE epoch=? AND plan_id=? AND role='attempt' AND revoked=0 "
+            "AND valid_until IS NULL AND json_valid(payload) AND json_extract(payload,'$.attempt_id')=? "
+            "AND json_extract(payload,'$.generation')=?",
+            (plans._installation_epoch(connection), plan.plan_id, row[0], plan.generation)).fetchone()[0]
+        if count != 1:
+            raise DomainError("fenced", "The target attempt has no current bound capability")
+    try:
+        timestamp = datetime.fromisoformat(data["last_activity"])
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise DomainError("invalid", "The attempt has no valid activity timestamp") from None
+    if (plans._now() - timestamp).total_seconds() >= _STALE_SECONDS.get():
+        raise DomainError("stale", "The attempt exceeded its configured inactivity threshold")
+    if data.get("context") is None:
+        raise DomainError("invalid", "The attempt has no recorded execution context")
+    return plan, row, data, step, _to_execution_context(data["context"])
+
+
+def _require_start_scope(connection, plan, step):
+    try:
+        validate_execution_scope(plan.authorization, step.step_id)
+    except PlanValidationError as error:
+        raise DomainError("forbidden", str(error)) from error
+    coordination = plans._validation_coordination(connection, plan.plan_id)
+    relevant = {step.step_id, *step.definition["dependencies"]}
+    if (coordination.store_hold or any(hold.step_id is None or hold.step_id in relevant for hold in coordination.holds)
+            or any(attempt.state == "stale" for attempt in coordination.attempts)
+            or plan.draft_json.get("stop_reason") or plan.draft_json.get("block_reason")):
+        raise DomainError("held", "Execution is held pending explicit resolution")
+
+
+def _require_execution_resources(connection, plan_id, attempt_id, execution):
+    resource_ids = resources.resolve_context(connection, execution)
+    if not execution.writes:
+        return
+    retained = set()
+    covered = set()
+    for use_id, resource_id, absent_id, scope, status in connection.execute(
+            "SELECT use_id,resource_id,absent_work_id,scope,status FROM resource_uses "
+            "WHERE plan_id=? AND attempt_id=? AND status!='released'", (plan_id, attempt_id)):
+        canonical = resources.resolve_resource_id(connection, resource_id)
+        kind = connection.execute("SELECT kind FROM resources WHERE resource_id=?", (canonical,)).fetchone()[0]
+        if absent_id is not None or status != "active" or canonical not in resource_ids or scope != kind:
+            raise DomainError("resource_conflict", "The attempt has an unresolved or inappropriate retained resource use")
+        retained.add(use_id)
+        covered.add(canonical)
+    if covered != set(resource_ids):
+        raise DomainError("resource_conflict", "The attempt is missing its retained active writable reservation")
+    if set(resources.conflicting_uses(connection, resource_ids, execution.repository_exclusive)) - retained:
+        raise DomainError("resource_conflict", "Writable execution overlaps another unresolved resource use")
+
+
+def bind_availability(connection: sqlite3.Connection, command: Command) -> MutationReceipt:
+    """Prepare one exact assigned consumer; rebasing discards its previous input attestations."""
+    if command.kind != "bind_availability":
+        raise DomainError("invalid", "The command kind does not match availability binding")
+    require_kind_capabilities(command.kind, None, command.orchestrator_token, command.attempt_token)
+    require_orchestrator(connection, command)
+    plan, row, data, step, execution = _new_target(connection, command, binding=True)
+    _require_start_scope(connection, plan, step)
+    _require_execution_resources(connection, plan.plan_id, row[0], execution)
+    bindings, checked_base = command.payload["bindings"], command.payload["checked_base"]
+    if not bindings or not _nonblank(checked_base) or len({binding.prerequisite for binding in bindings}) != len(bindings):
+        raise DomainError("invalid", "Binding requires a nonempty set of distinct prerequisite attestations")
+    prepared = replace(execution, checked_base=checked_base)
+    for binding in bindings:
+        _validate_binding(connection, plan, step.definition, prepared, binding)
+    existing = data.get("availability_bindings", {}) if execution.checked_base == checked_base else {}
+    if not isinstance(existing, dict):
+        raise DomainError("invalid", "The consumer has malformed retained input bindings")
+    data["availability_bindings"] = {**existing, **{binding.prerequisite: plans.to_jsonable(binding) for binding in bindings}}
+    data["context"] = plans.to_jsonable(prepared)
+    previous = plans.project_plan(connection, plan.plan_id)
+    version, revision, ts = row[4] + 1, plan.revision + 1, plans._timestamp(plan.updated_at)
+    connection.execute("UPDATE attempts SET version=?,payload=? WHERE plan_id=? AND attempt_id=?",
+                       (version, json.dumps(data, sort_keys=True, ensure_ascii=False), plan.plan_id, row[0]))
+    connection.execute("UPDATE plans SET revision=?,updated_at=? WHERE plan_id=?", (revision, ts, plan.plan_id))
+    committed = {"attempt_id": row[0], "version": version, "definition_version": row[5], "checked_base": checked_base}
+    plans._insert_event(connection, plan.plan_id, revision, command.kind, command.actor, ts,
+                        {**committed, "step_id": step.step_id, "bindings": plans.to_jsonable(bindings)})
+    view = plans._commit_projection(connection, plan.plan_id, previous)
+    return MutationReceipt(committed, view.metadata, view.metadata, False, None)
+
+
+def _insert_activity_event(connection, command, revision, ts, committed):
+    connection.execute(
+        "INSERT INTO events(plan_id,plan_revision,kind,actor,origin_worker,relay,published_at,payload) VALUES(?,?,?,?,?,?,?,?)",
+        (command.plan_id, revision, command.kind, command.actor, command.payload["origin_worker"], command.payload["relay"],
+         ts, json.dumps({**committed, "observed_activity": command.payload["observed_activity"]}, sort_keys=True, ensure_ascii=False)))
+
+
+def _worker_progress(connection, command, *, start):
+    require_attempt(connection, command)
+    plan, row, data, step, execution = _new_target(connection, command)
+    if start:
+        _require_start_scope(connection, plan, step)
+        _require_execution_resources(connection, plan.plan_id, row[0], execution)
+        bindings = data.get("availability_bindings", {})
+        if not isinstance(bindings, dict):
+            raise DomainError("invalid", "The consumer has malformed retained input bindings")
+        for prerequisite in step.definition["dependencies"]:
+            if prerequisite not in bindings:
+                raise DomainError("invalid", "Every accepted prerequisite needs this consumer's final-base binding")
+            binding = _to_availability(bindings[prerequisite])
+            if binding.prerequisite != prerequisite:
+                raise DomainError("invalid", "The consumer binding names a different prerequisite")
+            _validate_binding(connection, plan, step.definition, execution, binding)
+    previous = plans.project_plan(connection, plan.plan_id)
+    activity_ts = plans._timestamp(data["last_activity"])
+    version, revision, ts = row[4] + 1, plan.revision + 1, plans._timestamp(plan.updated_at)
+    data.update(last_activity=activity_ts, observed_activity=command.payload["observed_activity"])
+    if start:
+        connection.execute("UPDATE attempts SET state='active',started_at=? WHERE plan_id=? AND attempt_id=?",
+                           (activity_ts, plan.plan_id, row[0]))
+        connection.execute("UPDATE steps SET state='in-progress' WHERE plan_id=? AND step_id=?", (plan.plan_id, step.step_id))
+    connection.execute("UPDATE attempts SET version=?,payload=? WHERE plan_id=? AND attempt_id=?",
+                       (version, json.dumps(data, sort_keys=True, ensure_ascii=False), plan.plan_id, row[0]))
+    connection.execute("UPDATE plans SET revision=?,updated_at=? WHERE plan_id=?", (revision, ts, plan.plan_id))
+    committed = {"attempt_id": row[0], "step_id": step.step_id, "version": version, "definition_version": row[5]}
+    _insert_activity_event(connection, command, revision, ts, committed)
+    view = plans._commit_projection(connection, plan.plan_id, previous)
+    return MutationReceipt(committed, view.metadata, view.metadata, False, None)
+
+
+def start_step(connection: sqlite3.Connection, command: Command) -> MutationReceipt:
+    if command.kind != "start_step":
+        raise DomainError("invalid", "The command kind does not match worker start")
+    return _worker_progress(connection, command, start=True)
+
+
+def report_activity(connection: sqlite3.Connection, command: Command) -> MutationReceipt:
+    if command.kind != "report_activity":
+        raise DomainError("invalid", "The command kind does not match worker activity")
+    return _worker_progress(connection, command, start=False)
 
 
 def cancel_attempt(connection: sqlite3.Connection, plan_id: PlanId, attempt_id: AttemptId, reason: str) -> None:
