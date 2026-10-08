@@ -1,0 +1,16 @@
+# Admit only build metadata, Python package source, and the dashboard assets.
+**
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!uv.lock
+!adaptive_planning/
+adaptive_planning/**
+!adaptive_planning/*.py
+!assets/
+assets/**
+!assets/dashboard/
+assets/dashboard/**
+!assets/dashboard/index.html
+!assets/dashboard/app.js
+!assets/dashboard/style.css
