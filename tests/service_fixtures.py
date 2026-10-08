@@ -5,6 +5,7 @@ Standard-library only (Python 3.10+ compatible). Does not require external SDK d
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -12,6 +13,7 @@ import uuid
 
 from adaptive_planning.types import (
     ArtifactRef,
+    AttemptId,
     AttemptView,
     Authorization,
     Checkpoint,
@@ -32,6 +34,7 @@ from adaptive_planning.types import (
     ReservationView,
     ResourceClaim,
     ResourceId,
+    ResultVersion,
     Review,
     ReviewView,
     StepDefinition,
@@ -292,6 +295,15 @@ class ServiceFixture:
         self.epoch = epoch
         self._cached_grants: dict[str, PrivateGrant] = {}
         self._cached_attempt_grants: dict[str, PrivateGrant] = {}
+        self._temporary_owner: Any = None
+        self._temporary_identity: tuple[int, int] | None = None
+        self._temporary_closed = False
+
+    def cleanup(self) -> None:
+        """Close only the temporary directory created and owned by this fixture."""
+        if self._temporary_owner is not None and not self._temporary_closed:
+            self._temporary_closed = True
+            self._temporary_owner.cleanup()
 
     def command(
         self,
@@ -558,8 +570,180 @@ def seed_orphan_use(fixture: ServiceFixture, resource_id: ResourceId) -> Reserva
         return fixture.store.write(insert)
 
 
-def make_service(directory: Path, clock: FakeClock | None = None) -> ServiceFixture:
-    """Lazy-import and initialize PlanningService for testing."""
+@dataclass(frozen=True)
+class SeededResult:
+    """TEST-ONLY reference to synthetic accepted history; grants no command authority."""
+
+    plan_id: PlanId
+    step_id: StepId
+    attempt_id: AttemptId
+    result_version: ResultVersion
+    artifact: ArtifactRef
+
+
+def seed_accepted_result(
+    fixture: ServiceFixture, plan_id: PlanId, step_id: StepId, artifact: ArtifactRef,
+) -> SeededResult:
+    """TEST-ONLY historical seed in a live, owned temporary complete-task store.
+
+    No service acceptance/checkpoint/review operation is invoked, no capability is
+    issued, and no command execution or human approval is asserted.
+    """
+    import json
+    from tempfile import TemporaryDirectory
+
+    from adaptive_planning import core, plans
+    from adaptive_planning.store import Store
+    from adaptive_planning.types import DomainError, _to_artifact_ref, _to_checkpoint, _to_review
+
+    def require_owned_store():
+        if (not isinstance(fixture, ServiceFixture)
+                or not isinstance(fixture._temporary_owner, TemporaryDirectory)
+                or fixture._temporary_closed or fixture._temporary_identity is None):
+            raise DomainError("invalid", "Synthetic history requires a live fixture-owned temporary directory")
+        try:
+            owned = Path(fixture._temporary_owner.name).resolve(strict=True)
+            current_identity = owned.stat()
+            directory = fixture.directory.resolve(strict=True)
+            if not isinstance(fixture.store, Store):
+                raise DomainError("invalid", "Synthetic history requires the fixture's actual Store")
+            database = fixture.store.path.resolve(strict=True)
+        except (OSError, TypeError, AttributeError) as error:
+            raise DomainError("invalid", "The owned temporary fixture is no longer valid") from error
+        if ((current_identity.st_dev, current_identity.st_ino) != fixture._temporary_identity
+                or not owned.is_dir() or directory != owned or database != owned / "planning.sqlite"
+                or getattr(fixture.service, "_store", None) is not fixture.store
+                or fixture.store.host_id != "synthetic-host"):
+            raise DomainError("invalid", "Synthetic history must use the same owned temporary fixture and database")
+        return database
+
+    database = require_owned_store()
+    artifact = _to_artifact_ref(plans.to_jsonable(artifact))
+
+    def insert(db):
+        # Recheck ownership before any SQL mutation and bind the actual connection.
+        if require_owned_store() != database or not any(
+                name == "main" and Path(path).resolve() == database
+                for _, name, path in db.execute("PRAGMA database_list")):
+            raise DomainError("invalid", "The seed connection does not belong to the temporary fixture")
+        plan = plans._load_plan(db, plan_id)
+        if plan.authorization.mode != "complete-task":
+            raise DomainError("forbidden", "Synthetic accepted history requires complete-task scope")
+        previous = plans.project_plan(db, plan_id)
+        try:
+            core.validate_published_snapshot(previous.legacy_snapshot)
+        except core.PlanValidationError as error:
+            raise DomainError("invalid", "Synthetic seed requires strictly valid existing history") from error
+        target = next((node for node in plan.steps if node.step_id == step_id), None)
+        if target is None:
+            raise DomainError("not_found", "The synthetic seed step does not belong to this plan")
+        if target.state != "pending" or db.execute(
+                f"SELECT 1 FROM attempts WHERE plan_id=? AND step_id=? AND state IN ({plans._LIVE_SQL})",
+                (plan_id, step_id)).fetchone():
+            raise DomainError("invalid", "Synthetic history requires a pending step without a live attempt")
+        steps = {node.step_id: node for node in plan.steps}
+        if any(steps[dependency].state != "complete" or not steps[dependency].evidence
+               for dependency in target.definition["dependencies"]):
+            raise DomainError("invalid", "Synthetic accepted history requires completed prerequisites with evidence")
+
+        worker, reviewer = "synthetic-history-worker", "synthetic-history-reviewer"
+        check = target.definition["completion_check"]
+        limitation = ("Synthetic test history; no command execution or human approval is asserted.",)
+        evidence = Evidence("Synthetic passing historical checkpoint", artifact, None, check, "passed", limitation, ())
+        review_evidence = Evidence("Synthetic passing distinct-reviewer history", artifact, None, check,
+                                   "passed", limitation, ())
+        checkpoint_value = _to_checkpoint(plans.to_jsonable(Checkpoint(
+            "passed", check, (evidence,), Reassessment("Synthetic unchanged reassessment", (), (), "unchanged",
+                                                      "Synthetic historical result", (), False, None),
+            worker, None, artifact)))
+        review_value = _to_review(plans.to_jsonable(Review(reviewer, artifact, "passed", (), (review_evidence,), None)))
+        attempt_id, result_version, review_id = (str(uuid.uuid4()) for _ in range(3))
+        ts, revision = plans._timestamp(plan.updated_at), plan.revision + 1
+        artifact_json = plans.to_jsonable(artifact)
+        links = {"synthetic_history": True, "step_id": step_id, "attempt_id": attempt_id,
+                 "result_version": result_version, "artifact": artifact_json}
+        attempt_payload = {
+            "epoch": plans._installation_epoch(db), "generation": plan.generation,
+            "definition": copy.deepcopy(target.definition), "context": plans.to_jsonable(context(None, writes=False)),
+            "last_activity": ts, "recovery_required": False, "prior_state": "submitted",
+            "result_version": result_version, "artifact": artifact_json, "synthetic_history": True,
+        }
+
+        def encoded(value):
+            return json.dumps(plans.to_jsonable(value), sort_keys=True, ensure_ascii=False)
+
+        db.execute("INSERT INTO attempts(plan_id,attempt_id,step_id,assignee,state,version,definition_version,"
+                   "started_at,stopped_at,payload) VALUES(?,?,?,?,'accepted',4,?,?,?,?)",
+                   (plan_id, attempt_id, step_id, worker, target.definition["definition_version"], ts, ts,
+                    encoded(attempt_payload)))
+        plans._insert_event(db, plan_id, None, "synthetic_history_checkpoint", worker, ts,
+                            {**links, "summary": "Synthetic passing historical checkpoint"})
+        checkpoint_sequence = plans._store_sequence(db)
+        db.execute("UPDATE events SET origin_worker=? WHERE sequence=?", (worker, checkpoint_sequence))
+        db.execute("INSERT INTO checkpoints(plan_id,attempt_id,sequence,outcome,check_name,evidence,origin_worker,"
+                   "relay,artifact,reassessment,created_at) VALUES(?,?,?,'passed',?,?,?,NULL,?,?,?)",
+                   (plan_id, attempt_id, checkpoint_sequence, check, encoded(checkpoint_value.evidence), worker,
+                    encoded(artifact), encoded(checkpoint_value.reassessment), ts))
+        db.execute("INSERT INTO reviews(review_id,plan_id,attempt_id,step_id,reviewer,verdict,findings,evidence,"
+                   "artifact,verification_use_id,created_at) VALUES(?,?,?,?,?,'passed','[]',?,?,NULL,?)",
+                   (review_id, plan_id, attempt_id, step_id, reviewer, encoded(review_value.evidence), encoded(artifact), ts))
+        plans._insert_event(db, plan_id, None, "synthetic_history_review", reviewer, ts,
+                            {**links, "review_id": review_id, "summary": "Synthetic matching distinct-reviewer history"})
+        review_sequence = plans._store_sequence(db)
+        db.execute("INSERT INTO result_versions(plan_id,result_version,step_id,artifact_kind,identity,summary,digest,"
+                   "created_at) VALUES(?,?,?,?,?,?,?,?)",
+                   (plan_id, result_version, step_id, artifact.kind, artifact.identity, artifact.summary, artifact.digest, ts))
+        raw = db.execute("SELECT payload FROM steps WHERE plan_id=? AND step_id=?", (plan_id, step_id)).fetchone()[0]
+        step_payload = json.loads(raw)
+        step_payload["evidence"] = list(target.evidence) + [plans.format_evidence(evidence), plans.format_evidence(review_evidence)]
+        db.execute("UPDATE steps SET state='complete',payload=? WHERE plan_id=? AND step_id=?",
+                   (encoded(step_payload), plan_id, step_id))
+        # The draft/Authorization bytes remain unchanged; only materialized revision/time/status advance.
+        db.execute("UPDATE plans SET revision=?,updated_at=? WHERE plan_id=?", (revision, ts, plan_id))
+        plans._insert_event(db, plan_id, revision, "synthetic_history_accepted_result", "synthetic-history-fixture", ts,
+                            {**links, "checkpoint_sequence": checkpoint_sequence, "review_sequence": review_sequence,
+                             "review_id": review_id, "summary": "Synthetic accepted-result history"})
+        accepted_sequence = plans._store_sequence(db)
+        attempt_payload.update(checkpoint_sequence=checkpoint_sequence, review_sequence=review_sequence,
+                               accepted_sequence=accepted_sequence)
+        db.execute("UPDATE attempts SET payload=? WHERE plan_id=? AND attempt_id=?",
+                   (encoded(attempt_payload), plan_id, attempt_id))
+
+        # Validate the assembled relational links, not just renderer projection.
+        rows = db.execute(
+            "SELECT a.step_id,a.state,a.definition_version,a.payload,c.sequence,c.outcome,c.check_name,c.evidence,"
+            "c.origin_worker,c.artifact,r.reviewer,r.verdict,r.artifact,r.evidence,v.step_id "
+            "FROM attempts a JOIN checkpoints c ON c.plan_id=a.plan_id AND c.attempt_id=a.attempt_id "
+            "JOIN reviews r ON r.plan_id=a.plan_id AND r.attempt_id=a.attempt_id AND r.step_id=a.step_id "
+            "JOIN result_versions v ON v.plan_id=a.plan_id AND v.step_id=a.step_id AND v.result_version=? "
+            "WHERE a.plan_id=? AND a.attempt_id=? AND r.review_id=?",
+            (result_version, plan_id, attempt_id, review_id)).fetchall()
+        expected = (step_id, "accepted", target.definition["definition_version"], encoded(attempt_payload),
+                    checkpoint_sequence, "passed", check, encoded(checkpoint_value.evidence), worker, encoded(artifact),
+                    reviewer, "passed", encoded(artifact), encoded(review_value.evidence), step_id)
+        events = db.execute("SELECT sequence,plan_revision,payload FROM events WHERE plan_id=? "
+                            "AND sequence IN (?,?,?) ORDER BY sequence",
+                            (plan_id, checkpoint_sequence, review_sequence, accepted_sequence)).fetchall()
+        if (rows != [expected] or reviewer == worker or len(events) != 3
+                or [row[1] for row in events] != [None, None, revision]
+                or any(any(json.loads(row[2]).get(key) != value for key, value in links.items()) for row in events)
+                or db.execute("PRAGMA foreign_key_check").fetchall()):
+            raise DomainError("invalid", "The synthetic accepted history is not coherent")
+        view = plans._commit_projection(db, plan_id, previous)
+        try:
+            core.validate_published_snapshot(view.legacy_snapshot)
+        except core.PlanValidationError as error:
+            raise DomainError("invalid", "Synthetic accepted history is not a strict published snapshot") from error
+        if view.draft.authorization != plan.authorization:
+            raise DomainError("invalid", "Synthetic history changed execution authorization")
+        return SeededResult(plan_id, step_id, attempt_id, result_version, artifact)
+
+    with plans.service_context("http://127.0.0.1:8790", fixture.clock):
+        return fixture.store.write(insert)
+
+
+def make_service(directory: Path | None = None, clock: FakeClock | None = None) -> ServiceFixture:
+    """Lazy-import the service; omitted directory creates an owned synthetic temporary store."""
     if clock is None:
         clock = FakeClock()
 
@@ -567,7 +751,22 @@ def make_service(directory: Path, clock: FakeClock | None = None) -> ServiceFixt
     from adaptive_planning.app import PlanningService
     from adaptive_planning.store import Store
 
-    store = Store(directory / "planning.sqlite", clock, host_id="synthetic-host")
-    service = PlanningService(store, base_url="http://127.0.0.1:8790", clock=clock)
-    epoch = store.installation_epoch()
-    return ServiceFixture(service=service, store=store, directory=directory, clock=clock, epoch=epoch)
+    owner = None
+    if directory is None:
+        from tempfile import TemporaryDirectory
+        owner = TemporaryDirectory(prefix="adaptive-planning-synthetic-")
+        directory = Path(owner.name).resolve()
+    try:
+        store = Store(directory / "planning.sqlite", clock, host_id="synthetic-host")
+        service = PlanningService(store, base_url="http://127.0.0.1:8790", clock=clock)
+        epoch = store.installation_epoch()
+        fixture = ServiceFixture(service=service, store=store, directory=directory, clock=clock, epoch=epoch)
+        if owner is not None:
+            identity = directory.stat()
+            fixture._temporary_owner = owner
+            fixture._temporary_identity = (identity.st_dev, identity.st_ino)
+        return fixture
+    except BaseException:
+        if owner is not None:
+            owner.cleanup()
+        raise
