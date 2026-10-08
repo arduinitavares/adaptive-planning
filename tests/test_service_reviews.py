@@ -614,6 +614,169 @@ class TestService(unittest.TestCase):
         self.f.store.write(lambda db: db.execute("UPDATE attempts SET payload=? WHERE attempt_id=?", (original, aid)))
         self.assertEqual(len(self.view().coordination.reservations), 1)
 
+    def creation_case(self, *, accepted=False, handoff=False, later_writer=False):
+        # Each corruption starts from its own coherent history, so a broken RED refusal
+        # cannot mutate a subsequent case's group, rows or writer state.
+        self.f = make_service()
+        self.addCleanup(self.f.cleanup)
+        self.p = self.f.create(steps=(step("a", review_required=True),))
+        self.plan_id, self.value = self.p.current_metadata.plan_id, checkpoint()
+        for attribute in ("a", "accepted"):
+            if hasattr(self, attribute):
+                delattr(self, attribute)
+        rid = self.f.register(workspace("/synthetic/original-creation", 940), self.p)
+        ext = self.f.register(ResourceClaim("synthetic-host", "external", None, None, None, False, None, "creation-verifier"), self.p)
+        parent = self.f.register(ResourceClaim("synthetic-host", "external", None, None, None, False, None, "creation-implementation"), self.p) if handoff else None
+        if accepted:
+            self.accepted_invalidation()
+        else:
+            self.live(context(rid, external_ids=(parent,)) if handoff else None)
+        handle = self.original().use_id if handoff else None
+        group = self.reserve(context(rid, external_ids=(ext,)), handoff=handle,
+                             reason="Implementation stopped across its original cohort" if handoff else None)
+        anchor = group.committed["use_id"]
+        self.review(use_id=anchor)
+        self.release(anchor, (rid, ext))
+        review_anchor = anchor
+        if later_writer:
+            self.reopen()
+            self.value = checkpoint(artifact_version="v2")
+            self.f.submit(self.p, self.a, self.value)
+            latest = self.reserve(context(rid, external_ids=(ext,)), handoff=handle,
+                                  reason="Implementation stopped again after explicit reacquisition")
+            review_anchor = latest.committed["use_id"]
+            self.review(use_id=review_anchor)
+        self.assertTrue(self.satisfied())
+        sequence, raw = self.f.store.read(lambda db: next(
+            (sequence, raw) for sequence, raw in db.execute(
+                "SELECT sequence,payload FROM events WHERE plan_id=? AND kind='reserve_verification' ORDER BY sequence", (self.plan_id,))
+            if json.loads(raw).get("use_id") == anchor))
+        return anchor, review_anchor, (rid, ext), sequence, raw
+
+    def corrupt_original_creation(self, sequence, original, change):
+        aid = self.a.committed["attempt_id"] if hasattr(self, "a") else self.accepted.attempt_id
+        retained = self.f.store.read(lambda db: (
+            db.execute("SELECT payload FROM attempts WHERE attempt_id=?", (aid,)).fetchone()[0],
+            tuple(db.execute("SELECT * FROM resource_uses WHERE attempt_id=? ORDER BY rowid", (aid,)))))
+        def corrupt(db):
+            event = json.loads(original)
+            change(event)
+            db.execute("UPDATE events SET payload=? WHERE sequence=?", (json.dumps(event), sequence))
+            plans._insert_event(db, self.plan_id, None, "later_clean_anchor_reference", "owner",
+                                self.f.clock().isoformat(), json.loads(original))
+        self.f.store.write(corrupt)
+        after = self.f.store.read(lambda db: (
+            db.execute("SELECT payload FROM attempts WHERE attempt_id=?", (aid,)).fetchone()[0],
+            tuple(db.execute("SELECT * FROM resource_uses WHERE attempt_id=? ORDER BY rowid", (aid,)))))
+        self.assertEqual(after, retained)  # No nested group/namespace/physical-row alteration supplies this attack.
+
+    def creation_refused(self, anchor, review_anchor, selected, physical_count):
+        with self.subTest(probe="existing-cited-review"):
+            self.assertFalse(self.satisfied())
+        with self.subTest(probe="physical-projection-count-page"):
+            rows = self.view().coordination.reservations
+            self.assertEqual(len(rows), physical_count)
+            self.assertTrue(all(row.actor == "" for row in rows))
+            self.assertEqual(self.view().coordination.total_counts["reservations"], physical_count)
+            page, paged = None, []
+            while True:
+                page = self.f.service.read_coordination(self.plan_id, after=None if page is None else page.next_cursor, limit=2)
+                self.assertEqual(page.total_counts["reservations"], physical_count)
+                paged.extend(item.value for item in page.items if item.kind == "reservation")
+                if page.next_cursor is None:
+                    break
+            self.assertEqual(paged, list(rows))
+        with self.subTest(probe="atomic-cited-review-refusal"):
+            self.refused(lambda: self.review(use_id=review_anchor))
+        with self.subTest(probe="atomic-group-release-refusal"):
+            self.refused(lambda: self.release(anchor, selected))
+
+    def test_original_submission_creation_links_cannot_be_repaired_by_later_reference(self):
+        variants = {
+            "artifact-version": lambda event: event["artifact"].update(version="contradictory"),
+            "artifact-digest": lambda event: event["artifact"].update(digest="contradictory"),
+            "cycle": lambda event: event["cycle"].update(checkpoint_sequence=1),
+            "definition-version": lambda event: event.update(definition_version="other-definition"),
+            "typed-frozen-definition": lambda event: event["definition"].update(review_required=1),
+            "verifier": lambda event: event.update(verifier="another-reviewer"),
+            "optional-plan": lambda event: event.update(plan_id="foreign-plan"),
+            "optional-result": lambda event: event.update(result_version="unaccepted-result"),
+            "optional-producer": lambda event: event.update(producer_step_id="foreign-producer"),
+            "missing-artifact": lambda event: event.pop("artifact"),
+            "missing-cycle": lambda event: event.pop("cycle"),
+            "missing-definition-version": lambda event: event.pop("definition_version"),
+            "missing-verifier": lambda event: event.pop("verifier"),
+            "separate-handoff": lambda event: event.update(handoff_from="unowned-source"),
+            "separate-stop": lambda event: event.update(stopped_reason="No source actor exists"),
+            "separate-stop-transition": lambda event: event["execution_transitions"].append({
+                **event["execution_transitions"][0], "role": "implementation", "anchor": None, "use_ids": [], "state": "stopped"}),
+        }
+        for label, change in variants.items():
+            with self.subTest(link=label):
+                anchor, review_anchor, selected, sequence, raw = self.creation_case()
+                self.corrupt_original_creation(sequence, raw, change)
+                self.creation_refused(anchor, review_anchor, selected, 2)
+
+    def test_original_accepted_creation_result_and_producer_links_are_exact(self):
+        for label, change in {
+            "accepted-result": lambda event: event.update(result_version="foreign-result"),
+            "accepted-producer": lambda event: event.update(producer_step_id="foreign-producer"),
+        }.items():
+            with self.subTest(link=label):
+                anchor, review_anchor, selected, sequence, raw = self.creation_case(accepted=True)
+                self.corrupt_original_creation(sequence, raw, change)
+                self.creation_refused(anchor, review_anchor, selected, 2)
+
+    def test_original_handoff_stop_proof_survives_later_writer_changes_without_repair(self):
+        def stop(event):
+            return next(item for item in event["execution_transitions"] if item["role"] == "implementation")
+        variants = {
+            "foreign-handle": lambda event: event.update(handoff_from="foreign-source"),
+            "nonoverlapping-original-handle": lambda event: event.update(handoff_from=event["verification_group"]["source_use_ids"][1]),
+            "missing-handle": lambda event: event.pop("handoff_from"),
+            "blank-stop-reason": lambda event: event.update(stopped_reason="   "),
+            "different-stop-reason": lambda event: event.update(stopped_reason="Contradicts original cohort stop"),
+            "missing-stop-reason": lambda event: event.pop("stopped_reason"),
+            "missing-original-stop": lambda event: event.update(execution_transitions=[item for item in event["execution_transitions"] if item["role"] != "implementation"]),
+            "partial-original-cohort": lambda event: stop(event).update(use_ids=stop(event)["use_ids"][:1]),
+            "original-stop-state": lambda event: stop(event).update(state="active"),
+            "original-stop-reason": lambda event: stop(event).update(reason="Another assertion"),
+            "original-stop-epoch": lambda event: stop(event).update(epoch="foreign-epoch"),
+            "original-stop-generation": lambda event: stop(event).update(generation="foreign-generation"),
+            "original-stop-ownership": lambda event: stop(event).update(ownership_version=999),
+            "original-stop-ownership-type": lambda event: stop(event).update(ownership_version=True),
+            "original-stop-actor": lambda event: stop(event).update(actor="foreign-owner"),
+        }
+        for label, change in variants.items():
+            with self.subTest(link=label):
+                anchor, review_anchor, selected, sequence, raw = self.creation_case(handoff=True, later_writer=True)
+                self.corrupt_original_creation(sequence, raw, change)
+                self.creation_refused(anchor, review_anchor, selected, 6)
+
+    def test_coherent_original_released_handoff_remains_attributable_after_new_cycle(self):
+        anchor, review_anchor, selected, sequence, raw = self.creation_case(handoff=True, later_writer=True)
+        self.assertNotEqual(anchor, review_anchor)
+        group = next(row for row in self.view().coordination.reservations if row.use_id == anchor)
+        self.assertEqual((group.actor, group.writer_active, set(group.resource_ids)), ("reviewer", False, set(selected)))
+        self.assertEqual(self.view().coordination.total_counts["reservations"], 4)
+        self.release(anchor, selected, stopped=False)
+        self.assertTrue(self.satisfied())
+        self.assertEqual(self.f.store.read(lambda db: db.execute("SELECT payload FROM events WHERE sequence=?", (sequence,)).fetchone()[0]), raw)
+
+    def test_coherent_optional_original_creation_links_preserve_delayed_observations(self):
+        for accepted in (False, True):
+            with self.subTest(accepted=accepted):
+                anchor, review_anchor, selected, sequence, raw = self.creation_case(accepted=accepted)
+                event = json.loads(raw)
+                event.update(plan_id=self.plan_id, producer_step_id="a",
+                             result_version=self.accepted.result_version if accepted else None,
+                             checkpoint_sequence=event["cycle"].get("checkpoint_sequence"))
+                self.f.store.write(lambda db: db.execute("UPDATE events SET payload=? WHERE sequence=?", (json.dumps(event), sequence)))
+                self.assertTrue(self.satisfied())
+                self.review(use_id=review_anchor)
+                self.release(anchor, selected, stopped=False)
+                self.assertTrue(self.satisfied())
+
     def test_missing_namespace_with_verification_history_is_not_legacy(self):
         self.live()
         rid = self.f.register(workspace("/synthetic/missing-group", 917), self.p)

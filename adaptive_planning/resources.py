@@ -453,34 +453,37 @@ def _path_overlap(left: tuple[str, bool | None], right: tuple[str, bool | None])
     return a == b or a.startswith(b.rstrip("/") + "/") or b.startswith(a.rstrip("/") + "/")
 
 
+def _resource_overlap(registry, left, right, repository_exclusive, scope):
+    """The same identity predicate serves active conflicts and retained handoff proof."""
+    if left == right:
+        return True
+    if not registry.supported_history(left) or not registry.supported_history(right):
+        return True
+    a, b = registry.rows[left], registry.rows[right]
+    ar = left if a.kind == "repository" else registry.parent(left)
+    br = right if b.kind == "repository" else registry.parent(right)
+    if ar is not None and ar == br and (a.kind == "repository" or b.kind == "repository"
+                                       or repository_exclusive or scope == "repository"):
+        return True
+    apaths, bpaths = registry.paths(left), registry.paths(right)
+    if any(_path_overlap(a, b) for a in apaths for b in bpaths):
+        return True
+    # Opaque external keys are distinct from filesystem identity. Unknown
+    # filesystem location cannot establish isolation from another writer.
+    if a.kind != "external" and b.kind != "external" and (not apaths or not bpaths):
+        return True
+    return False
+
+
 def conflicting_uses(connection: sqlite3.Connection, resource_ids: tuple[ResourceId, ...],
                      repository_exclusive: bool) -> tuple[str, ...]:
     registry = _Registry(connection)
     requested = tuple(dict.fromkeys(registry.resolve(rid) for rid in resource_ids))
-    def overlaps(left, right, scope):
-        if left == right:
-            return True
-        if not registry.supported_history(left) or not registry.supported_history(right):
-            return True
-        a, b = registry.rows[left], registry.rows[right]
-        ar = left if a.kind == "repository" else registry.parent(left)
-        br = right if b.kind == "repository" else registry.parent(right)
-        if ar is not None and ar == br and (a.kind == "repository" or b.kind == "repository"
-                                           or repository_exclusive or scope == "repository"):
-            return True
-        apaths, bpaths = registry.paths(left), registry.paths(right)
-        if any(_path_overlap(a, b) for a in apaths for b in bpaths):
-            return True
-        # Opaque external keys are distinct from filesystem identity. Unknown
-        # filesystem location cannot establish isolation from another writer.
-        if a.kind != "external" and b.kind != "external" and (not apaths or not bpaths):
-            return True
-        return False
     conflicts = []
     for use_id, rid, scope in connection.execute(
             "SELECT use_id, resource_id, scope FROM resource_uses WHERE status IN ('active', 'unresolved') ORDER BY use_id"):
         canonical = registry.resolve(rid)
-        if any(overlaps(request, canonical, scope) for request in requested):
+        if any(_resource_overlap(registry, request, canonical, repository_exclusive, scope) for request in requested):
             conflicts.append(use_id)
     return tuple(conflicts)
 
@@ -612,6 +615,53 @@ def _group_proof(connection, source, anchor, group, owned, original_ids):
         raise DomainError("invalid", "Verifier group lacks coherent original creation proof")
     from adaptive_planning.reviews import _validate_review_cycle
     _validate_review_cycle(connection, source, group["cycle"], group["artifact"], creation["sequence"])
+    original = first[4]
+    required = {"artifact": group["artifact"], "cycle": group["cycle"], "verification_group": immutable,
+                "attempt_id": source["attempt_id"], "step_id": source["step_id"], "definition": source["definition"],
+                "definition_version": source["definition_version"], "verifier": group["verifier"]}
+    optional = {"plan_id": source["plan_id"], "producer_step_id": source["step_id"],
+                "result_version": group["cycle"].get("result_version"),
+                "checkpoint_sequence": group["cycle"].get("checkpoint_sequence")}
+    try:
+        links_match = (all(key in original and plans.canonical_bytes(original[key]) == plans.canonical_bytes(value)
+                           for key, value in required.items())
+                       and all(key not in original or plans.canonical_bytes(original[key]) == plans.canonical_bytes(value)
+                               for key, value in optional.items()))
+    except (ValueError, TypeError, RecursionError):
+        links_match = False
+    if not links_match:
+        raise DomainError("invalid", "Original verifier creation links contradict its immutable group")
+    transitions = original.get("execution_transitions")
+    if not isinstance(transitions, list) or any(not isinstance(item, dict) for item in transitions):
+        raise DomainError("invalid", "Original verifier creation transitions are malformed")
+    verification = [item for item in transitions if item.get("role") == "verification"]
+    if (len(verification) != 1 or not isinstance(verification[0].get("reason"), str)
+            or not verification[0]["reason"].strip()):
+        raise DomainError("invalid", "Original verifier activation lacks exact creation proof")
+    authority = {key: creation[key] for key in ("epoch", "generation", "ownership_version", "actor")}
+    expected = [{"role": "verification", "anchor": anchor, "use_ids": ids, "state": "active",
+                 "reason": verification[0]["reason"], **authority}]
+    handle, reason = original.get("handoff_from"), original.get("stopped_reason")
+    if sources:
+        if (not isinstance(handle, str) or handle not in sources or not isinstance(reason, str) or not reason.strip()):
+            raise DomainError("invalid", "Original handoff lacks its source handle and meaningful stopped assertion")
+        registry = _Registry(connection)
+        handle_resource = registry.resolve(owned[handle][1])
+        if not any(_resource_overlap(registry, registry.resolve(rid), handle_resource,
+                                     execution.repository_exclusive, owned[handle][5]) for rid in resources):
+            raise DomainError("invalid", "Original handoff handle does not overlap its retained verification context")
+        expected.append({"role": "implementation", "anchor": None, "use_ids": original_ids, "state": "stopped",
+                         "reason": reason, **authority})
+    elif handle is not None or reason is not None:
+        raise DomainError("invalid", "Separate verification cannot assert an implementation handoff or stop")
+    try:
+        transitions_match = (len(transitions) == len(expected)
+                             and sorted(plans.canonical_bytes(item) for item in transitions)
+                             == sorted(plans.canonical_bytes(item) for item in expected))
+    except (ValueError, TypeError, RecursionError):
+        transitions_match = False
+    if not transitions_match:
+        raise DomainError("invalid", "Original verifier creation contradicts its complete cohort and creation authority")
     _writer_proof(connection, source, group["writer"], "verification", anchor, ids)
     return ids
 
