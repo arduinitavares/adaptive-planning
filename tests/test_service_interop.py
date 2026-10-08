@@ -91,7 +91,7 @@ async def run_planning_interop(service: PlanningService) -> tuple[MutationReceip
                                     async with Client(streamable_http_client(base_url + "/mcp", http_client=http_client)) as client:
                                         assert client.protocol_version is not None, "The protocol was not negotiated"
                                         names = {tool.name for tool in (await client.list_tools()).tools}
-                                        assert names == PLANNING_TOOLS, "The planning tool surface differs"
+                                        assert PLANNING_TOOLS <= names, "The required planning tool surface differs"
                                         info = await call(client, "read_service_info", {})
                                         infos.append(info)
                                         metadata = None

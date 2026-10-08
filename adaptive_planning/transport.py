@@ -29,6 +29,7 @@ _ARGUMENTS = {
     "read_plan": frozenset({"plan_id"}), "read_events": frozenset({"plan_id", "after", "limit"}),
     "list_ready": frozenset({"plan_id"}), "read_coordination": frozenset({"plan_id", "after", "limit"}),
     "create_plan": frozenset({"command"}), "revise_plan": frozenset({"command"}), "takeover": frozenset({"command"}),
+    "register_resource": frozenset({"command"}), "reconcile_resources": frozenset({"command"}),
 }
 _MESSAGES = {
     "invalid": "Tool arguments are invalid.", "not_found": "The requested planning record was not found.",
@@ -182,6 +183,27 @@ class _TakeoverPayload(_InputModel):
     reason: str
 
 
+class _ResourceClaimInput(_InputModel):
+    host_id: str
+    kind: Literal["repository", "workspace", "external"]
+    device: int | None
+    inode: int | None
+    canonical_path: str | None = Field(repr=False)
+    case_insensitive: bool
+    repository_id: str | None
+    external_identity: str | None = Field(repr=False)
+
+
+class _RegisterResourcePayload(_InputModel):
+    claim: _ResourceClaimInput
+
+
+class _ReconcileResourcesPayload(_InputModel):
+    resource_ids: list[str]
+    canonical_claim: _ResourceClaimInput
+    reason: str
+
+
 class _Envelope(_InputModel):
     epoch: str
     key: str
@@ -212,9 +234,22 @@ class TakeoverInput(_Envelope):
     payload: _TakeoverPayload
 
 
-CommandInput = Annotated[CreatePlanInput | RevisePlanInput | TakeoverInput, Field(discriminator="kind")]
+class RegisterResourceInput(_Envelope):
+    kind: Literal["register_resource"]
+    payload: _RegisterResourcePayload
+
+
+class ReconcileResourcesInput(_Envelope):
+    kind: Literal["reconcile_resources"]
+    payload: _ReconcileResourcesPayload
+
+
+CommandInput = Annotated[CreatePlanInput | RevisePlanInput | TakeoverInput | RegisterResourceInput | ReconcileResourcesInput,
+                         Field(discriminator="kind")]
 _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_fields,
                            *_CreatePayload.model_fields, *_RevisePayload.model_fields, *_TakeoverPayload.model_fields,
+                           *_ResourceClaimInput.model_fields, *_RegisterResourcePayload.model_fields,
+                           *_ReconcileResourcesPayload.model_fields,
                            "plan_id", "include_terminal", "after", "limit", *_ARGUMENTS})
 
 
@@ -345,5 +380,15 @@ def build_mcp(service: PlanningService) -> MCPServer:
     def takeover(command: CommandInput) -> dict[str, Any]:
         """Take over a plan using the expected ownership version; return the new grant privately."""
         return execute("takeover", command)
+
+    @server.tool(annotations=write)
+    def register_resource(command: CommandInput) -> dict[str, Any]:
+        """Register current-host identity with the current plan owner's grant; create no execution use."""
+        return execute("register_resource", command)
+
+    @server.tool(annotations=write)
+    def reconcile_resources(command: CommandInput) -> dict[str, Any]:
+        """Reconcile explicitly attested equivalent identities while preserving every unresolved use."""
+        return execute("reconcile_resources", command)
 
     return server

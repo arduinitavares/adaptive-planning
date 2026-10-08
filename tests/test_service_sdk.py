@@ -351,9 +351,13 @@ async def probe_protocols() -> tuple[SdkProbe, ...]:
 @asynccontextmanager
 async def running_service(app, sock):
     """Run and settle only the supplied ephemeral listener, including failure paths."""
-    server = uvicorn.Server(uvicorn.Config(app, log_config=None, access_log=False, lifespan="on"))
-    task = asyncio.create_task(server.serve(sockets=[sock]))
+    access = logging.getLogger("uvicorn.access")
+    handlers = tuple(access.handlers)
+    propagate = access.propagate
+    server = task = None
     try:
+        server = uvicorn.Server(uvicorn.Config(app, log_config=None, access_log=False, lifespan="on"))
+        task = asyncio.create_task(server.serve(sockets=[sock]))
         async def ready():
             while not server.started:
                 if task.done():
@@ -364,9 +368,19 @@ async def running_service(app, sock):
         yield server
     finally:
         try:
-            await shutdown_probe_server(server, task)
+            if server is not None and task is not None:
+                await shutdown_probe_server(server, task)
         finally:
-            sock.close()
+            try:
+                sock.close()
+            finally:
+                # Config(access_log=False) clears handlers and propagation even
+                # with log_config=None; restore the serial fixture's prior state.
+                for handler in tuple(access.handlers):
+                    access.removeHandler(handler)
+                for handler in handlers:
+                    access.addHandler(handler)
+                access.propagate = propagate
 
 
 @contextmanager
@@ -477,7 +491,8 @@ class TestService(unittest.TestCase):
         from adaptive_planning.transport import build_mcp
         names = asyncio.run(list_tool_names(build_mcp(self.f.service)))
         self.assertEqual(set(names), {"read_service_info", "list_plans", "read_plan", "read_events",
-                                      "list_ready", "read_coordination", "create_plan", "revise_plan", "takeover"})
+                                      "list_ready", "read_coordination", "create_plan", "revise_plan", "takeover",
+                                      "register_resource", "reconcile_resources"})
         self.assertIn("create_plan", names)
         self.assertNotIn("assign_step", names)
 

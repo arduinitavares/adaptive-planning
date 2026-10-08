@@ -4,6 +4,36 @@ import sqlite3
 
 SCHEMA_VERSION: int = 1
 
+# Identity indexes decode only the strictly shaped v1 attestation. CASE, rather
+# than AND evaluation order, keeps historical opaque/malformed text readable.
+_RESOURCE_ATTESTATION = "CASE WHEN json_valid(physical_identity) THEN physical_identity ELSE '{}' END"
+_DEVICE = f"json_extract({_RESOURCE_ATTESTATION}, '$.device')"
+_INODE = f"json_extract({_RESOURCE_ATTESTATION}, '$.inode')"
+_EXTERNAL = f"json_extract({_RESOURCE_ATTESTATION}, '$.external_identity')"
+
+
+def _decimal_identity(expression: str) -> str:
+    return (f"length({expression}) BETWEEN 1 AND 1024 AND "
+            f"({expression} = '0' OR ({expression} GLOB '[1-9]*' AND {expression} NOT GLOB '*[^0-9]*'))")
+
+
+_RESOURCE_V1 = f"""
+    json_type({_RESOURCE_ATTESTATION}) = 'object'
+    AND json_type({_RESOURCE_ATTESTATION}, '$.v') = 'integer'
+    AND json_extract({_RESOURCE_ATTESTATION}, '$.v') = 1
+    AND json_type({_RESOURCE_ATTESTATION}, '$.case_insensitive') IN ('true', 'false')
+    AND ((json_type({_RESOURCE_ATTESTATION}, '$.device') = 'null'
+          AND json_type({_RESOURCE_ATTESTATION}, '$.inode') = 'null')
+         OR (json_type({_RESOURCE_ATTESTATION}, '$.device') = 'text'
+             AND json_type({_RESOURCE_ATTESTATION}, '$.inode') = 'text'
+             AND {_decimal_identity(_DEVICE)} AND {_decimal_identity(_INODE)}))
+    AND (json_type({_RESOURCE_ATTESTATION}, '$.external_identity') = 'null'
+         OR (json_type({_RESOURCE_ATTESTATION}, '$.external_identity') = 'text'
+             AND length({_EXTERNAL}) BETWEEN 1 AND 10000 AND instr({_EXTERNAL}, char(0)) = 0))
+    AND json_remove({_RESOURCE_ATTESTATION}, '$.v', '$.device', '$.inode',
+                    '$.case_insensitive', '$.external_identity') = '{{}}'
+"""
+
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     # 1. installation singleton
     """CREATE TABLE IF NOT EXISTS installation (
@@ -84,6 +114,12 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
 );""",
     """CREATE INDEX IF NOT EXISTS idx_resources_host ON resources (host_id);""",
     """CREATE INDEX IF NOT EXISTS idx_resources_host_physical ON resources (host_id, physical_identity);""",
+    f"""CREATE UNIQUE INDEX IF NOT EXISTS idx_resources_canonical_physical
+ON resources (host_id, {_DEVICE} COLLATE BINARY, {_INODE} COLLATE BINARY)
+WHERE status = 'active' AND ({_RESOURCE_V1}) AND json_type({_RESOURCE_ATTESTATION}, '$.device') = 'text';""",
+    f"""CREATE UNIQUE INDEX IF NOT EXISTS idx_resources_canonical_external
+ON resources (host_id, {_EXTERNAL} COLLATE BINARY)
+WHERE status = 'active' AND ({_RESOURCE_V1}) AND json_type({_RESOURCE_ATTESTATION}, '$.external_identity') = 'text';""",
     """CREATE TRIGGER IF NOT EXISTS trg_resources_validate_parent_insert
 BEFORE INSERT ON resources
 WHEN NEW.repository_id IS NOT NULL

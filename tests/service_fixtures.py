@@ -524,6 +524,40 @@ class ServiceFixture:
         return self.service.execute(cmd)
 
 
+def seed_orphan_use(fixture: ServiceFixture, resource_id: ResourceId) -> ReservationView:
+    """Test-only Store.write seed of an unresolved, store-scoped host writer."""
+    from adaptive_planning import plans, resources
+    from adaptive_planning.types import DomainError
+
+    def insert(db):
+        row = db.execute("SELECT kind, repository_id FROM resources WHERE resource_id=?", (resource_id,)).fetchone()
+        if row is None:
+            raise DomainError("not_found", "The test resource is not registered")
+        kind, parent = row
+        if kind == "repository":
+            execution = ExecutionContext("repository", resource_id, None, True, (), True, None)
+        elif kind == "external":
+            execution = ExecutionContext("external-only", None, None, False, (resource_id,), True, None)
+        else:
+            execution = ExecutionContext("repository" if parent else "non-repository", parent,
+                                         resource_id, False, (), True, None)
+        canonical = resources.resolve_context(db, execution)[0]
+        host = db.execute("SELECT host_id FROM installation WHERE id=1").fetchone()[0]
+        use_id, ts = str(uuid.uuid4()), fixture.clock().isoformat()
+        db.execute("INSERT INTO absent_host_work (absent_work_id, host_id, resource_id, scope, declared_identity, "
+                   "status, created_at) VALUES ('seeded-orphan', ?, ?, ?, 'synthetic-orphan', 'unresolved', ?)",
+                   (host, canonical, kind, ts))
+        db.execute("INSERT INTO resource_uses (use_id, resource_id, plan_id, attempt_id, absent_work_id, scope, "
+                   "status, created_at) VALUES (?, ?, NULL, NULL, 'seeded-orphan', ?, 'unresolved', ?)",
+                   (use_id, canonical, kind, ts))
+        plans._insert_event(db, None, None, "seeded_orphan_use", "synthetic-orphan", ts,
+                            {"use_id": use_id, "resource_id": canonical})
+        return ReservationView(use_id, None, None, "seeded-orphan", (canonical,), "synthetic-orphan", True, True,
+                               kind == "repository")
+    with plans.service_context("http://127.0.0.1:8790", fixture.clock):
+        return fixture.store.write(insert)
+
+
 def make_service(directory: Path, clock: FakeClock | None = None) -> ServiceFixture:
     """Lazy-import and initialize PlanningService for testing."""
     if clock is None:

@@ -15,7 +15,7 @@ from starlette.routing import Mount
 from adaptive_planning.admin import load_service_token
 from adaptive_planning.config import Config, RequestBoundary, http_allowlist
 
-from adaptive_planning import plans
+from adaptive_planning import plans, resources
 from adaptive_planning.ownership import command_relay, require_kind_capabilities, require_orchestrator
 from adaptive_planning.store import Store
 from adaptive_planning.types import (
@@ -30,11 +30,13 @@ from adaptive_planning.types import (
     ReadyStep,
 )
 
-# Only planning and ownership mutations are enabled; every other kind is rejected before any state is touched.
+# Planning, ownership and identity mutations are enabled; execution remains disabled.
 HANDLERS: dict[str, Callable[[sqlite3.Connection, Command], MutationReceipt]] = {
     "create_plan": plans.create_plan,
     "revise_plan": plans.revise_plan,
     "takeover": plans.takeover,
+    "register_resource": resources.register_resource,
+    "reconcile_resources": resources.reconcile_resources,
 }
 
 
