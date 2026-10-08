@@ -13,12 +13,16 @@ _EXTERNAL = f"json_extract({_RESOURCE_ATTESTATION}, '$.external_identity')"
 
 
 def _decimal_identity(expression: str) -> str:
-    return (f"length({expression}) BETWEEN 1 AND 1024 AND "
+    return (f"instr({expression}, char(0)) = 0 AND length({expression}) BETWEEN 1 AND 1024 AND "
             f"({expression} = '0' OR ({expression} GLOB '[1-9]*' AND {expression} NOT GLOB '*[^0-9]*'))")
 
 
+# JSON paths can truncate NUL-bearing labels. Remove escaped backslash pairs
+# before checking for a NUL escape, so literal backslash-u0000 text stays valid.
 _RESOURCE_V1 = f"""
     json_type({_RESOURCE_ATTESTATION}) = 'object'
+    AND instr({_RESOURCE_ATTESTATION}, char(0)) = 0
+    AND instr(replace({_RESOURCE_ATTESTATION}, char(92) || char(92), ''), char(92) || 'u0000') = 0
     AND json_type({_RESOURCE_ATTESTATION}, '$.v') = 'integer'
     AND json_extract({_RESOURCE_ATTESTATION}, '$.v') = 1
     AND json_type({_RESOURCE_ATTESTATION}, '$.case_insensitive') IN ('true', 'false')

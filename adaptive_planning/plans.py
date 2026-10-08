@@ -421,6 +421,7 @@ def _load_item(connection: sqlite3.Connection, plan_id: PlanId, kind: str, rid: 
             "FROM attempts WHERE rowid = ?", (rid,)).fetchone()
         return CoordinationItem("attempt", _attempt_view(row))
     if kind == "reservation":
+        from adaptive_planning.resources import resolve_resource_id
         use_id, use_plan, attempt_id, absent_id, resource_id, scope, status, assignee, identity = connection.execute(
             "SELECT u.use_id, u.plan_id, u.attempt_id, u.absent_work_id, u.resource_id, u.scope, u.status, "
             "a.assignee, h.declared_identity FROM resource_uses u "
@@ -429,7 +430,7 @@ def _load_item(connection: sqlite3.Connection, plan_id: PlanId, kind: str, rid: 
             (rid,)).fetchone()
         return CoordinationItem("reservation", ReservationView(
             use_id=use_id, plan_id=use_plan, attempt_id=attempt_id, absent_work_id=absent_id,
-            resource_ids=(resource_id,), actor=assignee or identity or "", writer_active=status != "released",
+            resource_ids=(resolve_resource_id(connection, resource_id),), actor=assignee or identity or "", writer_active=status != "released",
             unresolved=status == "unresolved", repository_exclusive=scope == "repository"))
     if kind == "hold":
         hold_id, reason = connection.execute("SELECT hold_id, reason FROM holds WHERE rowid = ?", (rid,)).fetchone()

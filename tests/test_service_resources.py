@@ -487,6 +487,176 @@ class TestService(unittest.TestCase):
             initialize_schema(db2)
         self.assertEqual(tuple(db2.execute("SELECT * FROM resources ORDER BY resource_id")), before)
 
+    def identity_database(self):
+        from adaptive_planning.schema import SCHEMA_STATEMENTS
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        for statement in SCHEMA_STATEMENTS:
+            if "CREATE UNIQUE INDEX IF NOT EXISTS idx_resources_canonical_" not in statement:
+                db.execute(statement)
+        return db
+
+    def test_initialization_excludes_nul_labels_and_decimals_without_repairing_legacy(self):
+        from adaptive_planning.schema import initialize_schema
+        supported = {"v": 1, "device": "7", "inode": "901", "case_insensitive": False,
+                     "external_identity": None}
+        cases = [("label-" + label, {key + ("\0junk" if key == label else ""): value
+                                   for key, value in supported.items()}) for label in supported]
+        cases.extend(("decimal-" + label, {**supported, label: supported[label] + "\0junk"})
+                     for label in ("device", "inode"))
+        cases.append(("external-nul", {**supported, "external_identity": "opaque\0junk"}))
+        for name, unsupported in cases:
+            with self.subTest(case=name):
+                db = self.identity_database()
+                raw = json.dumps(unsupported)
+                self.assertIsNone(self.resources()._decode(raw))
+                for rid, value in (("supported", json.dumps(supported)),
+                                   ("legacy-a", raw), ("legacy-b", raw)):
+                    db.execute("INSERT INTO resources (resource_id, host_id, kind, physical_identity, created_at) "
+                               "VALUES (?, 'synthetic-host', 'workspace', ?, 'ts')", (rid, value))
+                before = tuple(db.execute("SELECT * FROM resources ORDER BY resource_id"))
+                initialize_schema(db)
+                self.assertEqual(tuple(db.execute("SELECT * FROM resources ORDER BY resource_id")), before)
+                with self.assertRaises(sqlite3.IntegrityError):
+                    db.execute("INSERT INTO resources (resource_id, host_id, kind, physical_identity, created_at) "
+                               "VALUES ('supported-duplicate', 'synthetic-host', 'workspace', ?, 'ts')",
+                               (json.dumps(dict(reversed(list(supported.items())))),))
+
+    def test_supported_reordered_keys_and_literal_nul_escape_still_fail_duplicate_initialization(self):
+        from adaptive_planning.schema import initialize_schema
+        physical = {"v": 1, "device": "7", "inode": "902", "case_insensitive": False,
+                    "external_identity": None}
+        for name, supported in (("physical", physical),
+                                ("literal-escape", {**physical, "device": None, "inode": None,
+                                                    "external_identity": r"opaque\u0000-label"}),
+                                ("two-literal-slashes", {**physical, "device": None, "inode": None,
+                                                        "external_identity": r"opaque\\u0000-label"})):
+            with self.subTest(case=name):
+                db = self.identity_database()
+                raw = json.dumps(supported)
+                self.assertIsNotNone(self.resources()._decode(raw))
+                reordered = dict(reversed(list(supported.items())))
+                reordered["case_insensitive"] = True
+                for rid, value in (("supported-a", raw), ("supported-b", json.dumps(reordered, indent=2))):
+                    db.execute("INSERT INTO resources (resource_id, host_id, kind, physical_identity, created_at) "
+                               "VALUES (?, 'synthetic-host', ?, ?, 'ts')",
+                               (rid, "external" if supported["external_identity"] is not None else "workspace", value))
+                before = tuple(db.execute("SELECT * FROM resources ORDER BY resource_id"))
+                with self.assertRaises(sqlite3.IntegrityError):
+                    initialize_schema(db)
+                self.assertEqual(tuple(db.execute("SELECT * FROM resources ORDER BY resource_id")), before)
+
+    def test_current_reservation_ids_resolve_losing_fk_after_reopen_and_second_merge(self):
+        left = replace(workspace("/synthetic/current-left", 903), device=None, inode=None)
+        right = replace(left, canonical_path="/synthetic/current-right")
+        a, b = self.register(left), self.register(right)
+        losing = max(a, b)
+        normal = self.owned_use(losing, self.p, use_id="current-normal", status="active")
+        orphan = self.orphan(losing)
+        peer = self.f.create(creation_id="current-peer")
+        plan_id, peer_id = self.p.committed_metadata.plan_id, peer.committed_metadata.plan_id
+        original = {view.use_id: view for view in self.f.service.read_plan(plan_id).coordination.reservations}
+
+        def immutable_rows():
+            return self.f.store.read(lambda db: {name: tuple(db.execute(f"SELECT * FROM {name} ORDER BY rowid"))
+                                                for name in ("resource_uses", "absent_host_work", "aliases", "events", "requests")})
+
+        def assert_preserved(before):
+            after = immutable_rows()
+            for name in before:
+                self.assertEqual(after[name][:len(before[name])], before[name], name)
+
+        def assert_current(fixture, canonical, stage):
+            for selected, expected_ids in ((plan_id, (normal, orphan.use_id)), (peer_id, (orphan.use_id,))):
+                views = fixture.service.read_plan(selected).coordination.reservations
+                page = fixture.service.read_coordination(selected)
+                for reader, reservations in (("plan", views),
+                                             ("coordination", tuple(item.value for item in page.items
+                                                                    if item.kind == "reservation"))):
+                    with self.subTest(stage=stage, plan=selected, reader=reader):
+                        actual = {view.use_id: view for view in reservations}
+                        self.assertEqual(set(actual), set(expected_ids))
+                        for use_id in expected_ids:
+                            self.assertEqual(actual[use_id], replace(original[use_id], resource_ids=(canonical,)))
+
+        before = immutable_rows()
+        canonical = workspace("/synthetic/current-canonical", 903)
+        command = self.f.command("reconcile_resources", {"resource_ids": (a, b), "canonical_claim": canonical,
+                                 "reason": "host-attested current view equivalence"}, receipt=self.p)
+        first_receipt = self.f.service.execute(command)
+        first = first_receipt.committed["resource_id"]
+        self.assertEqual(first, min(a, b))
+        assert_current(self.f, first, "first")
+        assert_current(make_service(self.f.directory, self.f.clock), first, "first-reopen")
+        assert_preserved(before)
+        first_key = self.f.store.read(lambda db: db.execute(
+            "SELECT physical_identity FROM resources WHERE resource_id=?", (first,)).fetchone()[0])
+        third_claim = replace(left, canonical_path="/synthetic/current-third")
+        third = self.register(third_claim)
+        before_second = immutable_rows()
+        second = self.reconcile((first, third), replace(canonical, canonical_path=third_claim.canonical_path))
+        self.assertEqual(second.committed["resource_id"], third)
+        self.assertEqual(self.f.store.read(lambda db: db.execute(
+            "SELECT physical_identity FROM resources WHERE resource_id=?", (first,)).fetchone()[0]), first_key)
+        assert_current(self.f, third, "second")
+        assert_current(make_service(self.f.directory, self.f.clock), third, "second-reopen")
+        assert_preserved(before_second)
+        replay = self.f.service.execute(command)
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.committed, first_receipt.committed)
+        self.assertEqual(replay.committed["resource_id"], first)
+        self.assertEqual(immutable_rows()["resource_uses"], before["resource_uses"])
+
+    def test_current_unknown_legacy_reservations_remain_visible_without_write_validation(self):
+        for index, raw in enumerate((None, "opaque-legacy", "{unsupported")):
+            rid = f"visible-legacy-{index}"
+            self.f.store.write(lambda db: db.execute(
+                "INSERT INTO resources (resource_id, host_id, kind, physical_identity, created_at) "
+                "VALUES (?, 'synthetic-host', 'workspace', ?, 'ts')", (rid, raw)))
+            use = self.owned_use(rid, self.p, use_id=f"visible-use-{index}")
+            before = self.rows()
+            for fixture in (self.f, make_service(self.f.directory, self.f.clock)):
+                current = fixture.service.read_plan(self.p.committed_metadata.plan_id).coordination.reservations
+                reservation = next(view for view in current if view.use_id == use)
+                self.assertEqual(reservation.resource_ids, (rid,))
+                self.assertTrue(reservation.writer_active)
+                self.assertTrue(reservation.unresolved)
+                page = fixture.service.read_coordination(self.p.committed_metadata.plan_id)
+                self.assertIn(reservation, tuple(item.value for item in page.items if item.kind == "reservation"))
+            self.assertEqual(self.rows(), before)
+            with self.assertRaises(DomainError) as raised:
+                self.resolve(context(rid))
+            self.assertEqual(raised.exception.code, "held")
+
+    def test_current_reservation_projection_fails_closed_for_corrupt_redirect_chains(self):
+        for index, corruption in enumerate(("active-edge", "retired-without-edge", "cross-kind", "cross-host")):
+            with self.subTest(corruption=corruption):
+                f = make_service(self.f.directory / f"current-corrupt-{index}", self.f.clock)
+                p = f.create()
+                rid = f.register(workspace("/synthetic/current-corrupt", 904), p)
+                def seed(db):
+                    db.execute("INSERT INTO absent_host_work (absent_work_id, host_id, resource_id, scope) "
+                               "VALUES ('current-corrupt-work', 'synthetic-host', ?, 'workspace')", (rid,))
+                    db.execute("INSERT INTO resource_uses (use_id, resource_id, absent_work_id, scope, status) "
+                               "VALUES ('current-corrupt-use', ?, 'current-corrupt-work', 'workspace', 'unresolved')", (rid,))
+                    if corruption != "active-edge":
+                        db.execute("UPDATE resources SET status='retired' WHERE resource_id=?", (rid,))
+                    if corruption != "retired-without-edge":
+                        db.execute("INSERT INTO resources (resource_id, host_id, kind, created_at) VALUES "
+                                   "('current-corrupt-target', ?, ?, 'ts')",
+                                   ("foreign-host" if corruption == "cross-host" else "synthetic-host",
+                                    "repository" if corruption == "cross-kind" else "workspace"))
+                        db.execute("INSERT INTO resource_redirects (retired_id, survivor_id) "
+                                   "VALUES (?, 'current-corrupt-target')", (rid,))
+                f.store.write(seed)
+                before = f.store.read(lambda db: tuple(db.iterdump()))
+                for reader in (f.service.read_plan, f.service.read_coordination):
+                    with self.subTest(reader=reader.__name__):
+                        with self.assertRaises(DomainError) as raised:
+                            reader(p.committed_metadata.plan_id)
+                        self.assertEqual(raised.exception.code, "held")
+                self.assertEqual(f.store.read(lambda db: tuple(db.iterdump())), before)
+
     def test_reconcile_rejects_missing_equivalence_contradictions_and_cycles_atomically(self):
         a = self.register(replace(workspace("/synthetic/a-unknown", 830), device=None, inode=None))
         b = self.register(replace(workspace("/synthetic/b-unknown", 830), device=None, inode=None))

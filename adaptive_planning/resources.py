@@ -88,6 +88,43 @@ class _Resource:
     status: str
 
 
+def _resolve_identity(rid: str, host: str, lookup, roots: dict[str, str]) -> ResourceId:
+    """Interpret registered redirect metadata without deciding physical identity."""
+    if rid in roots:
+        return roots[rid]
+    origin = lookup(rid)
+    if origin is None:
+        raise DomainError("not_found", "The resource is not registered")
+    if origin[0] != host:
+        raise DomainError("invalid", "The resource belongs to a different host")
+    visited = set()
+    current = rid
+    while True:
+        row = lookup(current)
+        if current in visited or row is None or row[0] != host or row[1] != origin[1]:
+            raise DomainError("held", "Resource redirects are not consistent")
+        visited.add(current)
+        status, target = row[2:]
+        if ((status == "active" and target is not None)
+                or (status == "retired" and target is None) or status not in ("active", "retired")):
+            raise DomainError("held", "Resource canonical status is not consistent")
+        if target is None:
+            for item in visited:
+                roots[item] = current
+            return current
+        current = target
+
+
+def resolve_resource_id(connection: sqlite3.Connection, resource_id: ResourceId) -> ResourceId:
+    """Resolve a current public reference; preserve unsupported legacy evidence."""
+    host = connection.execute("SELECT host_id FROM installation WHERE id=1").fetchone()[0]
+    def lookup(rid):
+        return connection.execute(
+            "SELECT r.host_id, r.kind, r.status, d.survivor_id FROM resources r "
+            "LEFT JOIN resource_redirects d ON d.retired_id = r.resource_id WHERE r.resource_id = ?", (rid,)).fetchone()
+    return _resolve_identity(resource_id, host, lookup, {})
+
+
 class _Registry:
     def __init__(self, db: sqlite3.Connection):
         self.db = db
@@ -122,29 +159,10 @@ class _Registry:
                 raise DomainError("held", "Resource repository history is contradictory")
 
     def resolve(self, rid: str) -> str:
-        if rid in self.roots:
-            return self.roots[rid]
-        origin = self.rows.get(rid)
-        if origin is None:
-            raise DomainError("not_found", "The resource is not registered")
-        if origin.host_id != self.host:
-            raise DomainError("invalid", "The resource belongs to a different host")
-        visited = set()
-        current = rid
-        while True:
+        def lookup(current):
             row = self.rows.get(current)
-            if current in visited or row is None or row.host_id != self.host or row.kind != origin.kind:
-                raise DomainError("held", "Resource redirects are not consistent")
-            visited.add(current)
-            target = self.redirects.get(current)
-            if ((row.status == "active" and target is not None)
-                    or (row.status == "retired" and target is None) or row.status not in ("active", "retired")):
-                raise DomainError("held", "Resource canonical status is not consistent")
-            if target is None:
-                for item in visited:
-                    self.roots[item] = current
-                return current
-            current = target
+            return None if row is None else (row.host_id, row.kind, row.status, self.redirects.get(current))
+        return _resolve_identity(rid, self.host, lookup, self.roots)
 
     def members(self, root: str) -> tuple[_Resource, ...]:
         return self.groups[root]
