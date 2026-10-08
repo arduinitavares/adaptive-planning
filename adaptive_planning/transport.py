@@ -33,6 +33,7 @@ _ARGUMENTS = {
     "assign_step": frozenset({"command"}),
     "bind_availability": frozenset({"command"}), "start_step": frozenset({"command"}),
     "report_activity": frozenset({"command"}),
+    "record_checkpoint": frozenset({"command"}),
 }
 _MESSAGES = {
     "invalid": "Tool arguments are invalid.", "not_found": "The requested planning record was not found.",
@@ -261,6 +262,31 @@ class _ActivityPayload(_InputModel):
     observed_activity: str
 
 
+class _ReassessmentInput(_InputModel):
+    summary: str
+    facts: list[str]
+    assumptions: list[str]
+    disposition: Literal["unchanged", "material"]
+    reason: str
+    affected_steps: list[str]
+    unbounded: StrictBool
+    proposed_draft: dict[str, Any] | None
+
+
+class _CheckpointInput(_InputModel):
+    outcome: Literal["passed", "failed", "blocked"]
+    check: str
+    evidence: list[_EvidenceInput]
+    reassessment: _ReassessmentInput
+    origin_worker: str
+    relay: str | None
+    artifact: _ArtifactInput | None
+
+
+class _RecordCheckpointPayload(_InputModel):
+    checkpoint: _CheckpointInput
+
+
 class _Envelope(_InputModel):
     epoch: str
     key: str
@@ -321,8 +347,13 @@ class ReportActivityInput(_Envelope):
     payload: _ActivityPayload
 
 
+class RecordCheckpointInput(_Envelope):
+    kind: Literal["record_checkpoint"]
+    payload: _RecordCheckpointPayload
+
+
 CommandInput = Annotated[CreatePlanInput | RevisePlanInput | TakeoverInput | RegisterResourceInput | ReconcileResourcesInput | AssignStepInput
-                         | BindAvailabilityInput | StartStepInput | ReportActivityInput,
+                         | BindAvailabilityInput | StartStepInput | ReportActivityInput | RecordCheckpointInput,
                          Field(discriminator="kind")]
 _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_fields,
                            *_CreatePayload.model_fields, *_RevisePayload.model_fields, *_TakeoverPayload.model_fields,
@@ -331,6 +362,7 @@ _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_field
                            *_ExecutionContextInput.model_fields, *_AssignStepPayload.model_fields,
                            *_ArtifactInput.model_fields, *_EvidenceInput.model_fields, *_AvailabilityInput.model_fields,
                            *_BindAvailabilityPayload.model_fields, *_ActivityPayload.model_fields,
+                           *_ReassessmentInput.model_fields, *_CheckpointInput.model_fields, *_RecordCheckpointPayload.model_fields,
                            "plan_id", "include_terminal", "after", "limit", *_ARGUMENTS})
 
 
@@ -491,5 +523,10 @@ def build_mcp(service: PlanningService) -> MCPServer:
     def report_activity(command: CommandInput) -> dict[str, Any]:
         """Record actual authenticated worker observation without changing execution lifecycle."""
         return execute("report_activity", command)
+
+    @server.tool(annotations=write)
+    def record_checkpoint(command: CommandInput) -> dict[str, Any]:
+        """Submit attributed worker findings and provisional reassessment holds atomically."""
+        return execute("record_checkpoint", command)
 
     return server
