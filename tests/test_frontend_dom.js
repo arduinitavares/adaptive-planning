@@ -146,9 +146,6 @@ assert.deepEqual(errors, []);
 console.log('Actual dashboard DOM/event regressions passed');
 }
 
-testLegacy(); // Absent body mode remains legacy.
-testLegacy('legacy');
-
 const hostile = '<script>globalThis.executed = true</script>';
 const publishedAt = '2026-10-06T12:00:00+00:00';
 const serviceStep = (id, status) => ({id, title: hostile + id, status, dependsOn: [],
@@ -347,4 +344,135 @@ async function testServiceIndex() {
   console.log('Service multi-plan index safe text and optional workflow regressions passed');
 }
 
-(async () => {await testService(); await testServiceIndex();})().catch(error => {console.error(error); process.exitCode = 1;});
+function detailsFixture() {
+  const state = {view: serviceView(), items: JSON.parse(JSON.stringify([...firstItems, ...secondItems])), eventCount: 205};
+  const h = serviceHarness(url => {
+    if (url === '/api/plans/service-plan') return response(state.view);
+    const query = new URLSearchParams(url.split('?')[1]);
+    assert.equal(query.get('limit'), '100');
+    if (url.startsWith('/api/plans/service-plan/coordination')) {
+      assert.equal(query.get('after'), null);
+      return response({plan_id: state.view.plan_id, revision: state.view.metadata.revision,
+        store_sequence: state.view.coordination.store_sequence, total_counts: state.view.coordination.total_counts,
+        items: state.items, next_cursor: null});
+    }
+    if (url.startsWith('/api/plans/service-plan/events')) {
+      const after = Number(query.get('after'));
+      return response({events: Array.from({length: Math.min(100, Math.max(0, state.eventCount - after))},
+        (_, i) => event(after + i + 1))});
+    }
+    assert.fail('Unexpected public endpoint ' + url);
+  });
+  return {h, state};
+}
+
+function coordinationDetails(h, kind, matches) {
+  const details = h.el('coordination-list').children.find(node =>
+    node.classList.contains('coordination-item--' + kind) && matches(JSON.parse(node.querySelector('pre').textContent)));
+  assert.ok(details, 'Missing coordination record of kind ' + kind);
+  return details;
+}
+
+function eventDetails(h, sequence) {
+  const details = h.el('service-events').querySelectorAll('details').find(node =>
+    node.querySelector('summary').textContent.startsWith(`#${sequence} `));
+  assert.ok(details, 'Missing event ' + sequence);
+  return details;
+}
+
+async function testExpandedDetailsUnchanged() {
+  const {h} = detailsFixture();
+  await h.settle();
+  const attemptDetails = coordinationDetails(h, 'attempt', value => value.attempt_id === 'att-a');
+  const reviewDetails = coordinationDetails(h, 'review', value => value.recorded_sequence === 200);
+  const payloadDetails = eventDetails(h, 1);
+  attemptDetails.open = reviewDetails.open = payloadDetails.open = true;
+  await h.tick();
+  assert.equal(h.el('conn-label').textContent, 'Connected');
+  assert.equal(h.el('published-state').dataset.revision, '1');
+  assert.equal(h.el('published-state').dataset.storeSequence, '205');
+  assert.deepEqual({
+    attempt: coordinationDetails(h, 'attempt', value => value.attempt_id === 'att-a').open,
+    review: coordinationDetails(h, 'review', value => value.recorded_sequence === 200).open,
+    event: eventDetails(h, 1).open
+  }, {attempt: true, review: true, event: true}, 'Unchanged successful polls must preserve opened evidence and findings');
+  assert.equal(coordinationDetails(h, 'attempt', value => value.attempt_id === 'att-a'), attemptDetails);
+  assert.equal(coordinationDetails(h, 'review', value => value.recorded_sequence === 200), reviewDetails);
+  assert.equal(eventDetails(h, 1), payloadDetails);
+  assert.equal(coordinationDetails(h, 'attempt', value => value.attempt_id === 'att-b').open, false);
+  assert.equal(eventDetails(h, 2).open, false);
+  assert.deepEqual(h.errors, []);
+  console.log('Opened coordination findings and event evidence survive unchanged successful polls; closed records remain closed');
+}
+
+async function testExpandedDetailsUnrelatedAddition() {
+  const {h, state} = detailsFixture();
+  await h.settle();
+  const records = [
+    ['attempt', value => value.attempt_id === 'att-a'],
+    ['reservation', value => value.use_id === 'use-1'],
+    ['hold', value => value.hold_id === 'hold-1'],
+    ['review', value => value.recorded_sequence === 200],
+    ['invalidation', value => value.invalidation_id === 'invalid-1']
+  ];
+  const opened = records.map(([kind, matches]) => coordinationDetails(h, kind, matches));
+  for (const details of opened) details.open = true;
+  const payloadDetails = eventDetails(h, 1);
+  payloadDetails.open = true;
+  const newReview = JSON.parse(JSON.stringify(state.items.find(item => item.kind === 'review')));
+  newReview.value.recorded_sequence = 202;
+  state.items = [
+    {kind: 'hold', value: {hold_id: 'att-a', kind: 'reassessment', step_id: 'b', source_id: 'source-2', reason: 'Unrelated hold'}},
+    newReview, attempt('att-new', 'b', 'released'), ...state.items.reverse()
+  ];
+  Object.assign(state.view.coordination.total_counts, {attempts: 4, holds: 2, reviews: 2});
+  state.view.coordination.store_sequence = state.eventCount = 206;
+  await h.tick();
+  assert.equal(h.el('conn-label').textContent, 'Connected');
+  assert.equal(h.el('published-state').dataset.revision, '1');
+  assert.equal(h.el('published-state').dataset.storeSequence, '206');
+  assert.deepEqual({
+    coordination: records.map(([kind, matches]) => coordinationDetails(h, kind, matches).open),
+    event: eventDetails(h, 1).open
+  }, {coordination: [true, true, true, true, true], event: true},
+  'Unrelated committed additions and record reordering must preserve expansions by durable identity');
+  records.forEach(([kind, matches], i) => assert.equal(coordinationDetails(h, kind, matches), opened[i]));
+  assert.equal(eventDetails(h, 1), payloadDetails);
+  assert.equal(coordinationDetails(h, 'attempt', value => value.attempt_id === 'att-b').open, false);
+  assert.equal(coordinationDetails(h, 'attempt', value => value.attempt_id === 'att-new').open, false);
+  assert.equal(coordinationDetails(h, 'hold', value => value.hold_id === 'att-a').open, false, 'Different kinds cannot share expansion state');
+  assert.equal(coordinationDetails(h, 'review', value => value.recorded_sequence === 202).open, false, 'New review of the same attempt starts closed');
+  assert.equal(eventDetails(h, 2).open, false);
+  assert.equal(eventDetails(h, 206).open, false, 'New event starts closed');
+
+  // Current user choices, including closing old records, survive subsequent polls.
+  opened[0].open = opened[3].open = payloadDetails.open = false;
+  coordinationDetails(h, 'attempt', value => value.attempt_id === 'att-b').open = eventDetails(h, 2).open = true;
+  await h.tick();
+  assert.equal(coordinationDetails(h, 'attempt', value => value.attempt_id === 'att-a').open, false);
+  assert.equal(coordinationDetails(h, 'review', value => value.recorded_sequence === 200).open, false);
+  assert.equal(eventDetails(h, 1).open, false);
+  assert.equal(coordinationDetails(h, 'attempt', value => value.attempt_id === 'att-b').open, true);
+  assert.equal(eventDetails(h, 2).open, true);
+
+  // A restored epoch can reuse public record IDs without inheriting the previous publication's UI state.
+  state.view.metadata.epoch = 'epoch-2';
+  await h.tick();
+  assert.equal(h.el('conn-label').textContent, 'Connected');
+  assert.ok(h.el('coordination-list').querySelectorAll('details').every(details => !details.open));
+  assert.ok(h.el('service-events').querySelectorAll('details').every(details => !details.open));
+  assert.deepEqual(h.errors, []);
+  console.log('Durable record identity preserves expansions through unrelated additions and reordering; closed/new/reused-epoch records remain closed');
+}
+
+(async () => {
+  if (process.argv[2] === 'expanded-unchanged') return testExpandedDetailsUnchanged();
+  if (process.argv[2] === 'expanded-unrelated') return testExpandedDetailsUnrelatedAddition();
+  assert.equal(process.argv.length, 2, 'Unknown focused DOM scenario');
+  testLegacy(); // Absent body mode remains legacy.
+  testLegacy('legacy');
+  await testService();
+  await testServiceIndex();
+  await testExpandedDetailsUnchanged();
+  await testExpandedDetailsUnrelatedAddition();
+})().catch(error => {console.error(error); process.exitCode = 1;});

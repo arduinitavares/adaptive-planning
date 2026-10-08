@@ -1095,6 +1095,31 @@
       return `Invalidation ${value.invalidation_id} · producer ${value.producer_step_id}`;
     }
 
+    function coordinationIdentity(item) {
+      const value = item.value;
+      if (item.kind === 'review') {
+        return [value.plan_id, value.step_id, value.attempt_id, value.definition_version, value.recorded_sequence];
+      }
+      return value[{attempt: 'attempt_id', reservation: 'use_id', hold: 'hold_id', invalidation: 'invalidation_id'}[item.kind]];
+    }
+
+    function serviceDetailsByIdentity(container) {
+      const records = new Map();
+      for (const details of container.querySelectorAll('details')) {
+        records.set(details.dataset.recordIdentity, details);
+      }
+      return records;
+    }
+
+    function serviceRecordDetails(records, identity, className) {
+      const key = JSON.stringify(identity);
+      // Reuse only this durable record's node; its current open state belongs to the user.
+      const details = records.get(key) || textElement('details', className, '');
+      details.dataset.recordIdentity = key;
+      details.textContent = '';
+      return details;
+    }
+
     function renderServiceState(view, items, events, sequence) {
       document.getElementById('service-section').hidden = false;
       document.getElementById('plan-index-link').hidden = false;
@@ -1109,10 +1134,13 @@
         `Store sequence ${coord.store_sequence} · owner ${coord.ownership_actor} (version ${coord.ownership_version}). ` +
         Object.entries(coord.total_counts).map(([kind, count]) => `${kind}: ${count}`).join(' · ') +
         ` · Accepted result versions: ${JSON.stringify(coord.result_versions)}`);
+      const identity = [view.metadata.epoch, view.plan_id, view.metadata.generation];
       const list = document.getElementById('coordination-list');
+      const coordinationDetails = serviceDetailsByIdentity(list);
       list.textContent = '';
       for (const item of items) {
-        const details = textElement('details', 'coordination-item coordination-item--' + item.kind, '');
+        const details = serviceRecordDetails(coordinationDetails, [...identity, item.kind, coordinationIdentity(item)],
+          'coordination-item coordination-item--' + item.kind);
         details.appendChild(textElement('summary', '', coordinationLabel(item)));
         details.appendChild(textElement('pre', '', JSON.stringify(item.value, null, 2)));
         list.appendChild(details);
@@ -1129,10 +1157,11 @@
       setText(document.getElementById('events-summary'),
         `${events.length} committed events · last plan event sequence ${sequence}. All pages consumed for this published state.`);
       const eventList = document.getElementById('service-events');
+      const eventDetails = serviceDetailsByIdentity(eventList);
       eventList.textContent = '';
       for (const event of events) {
         const li = textElement('li', 'event-item', '');
-        const details = textElement('details', '', '');
+        const details = serviceRecordDetails(eventDetails, [...identity, event.sequence], '');
         details.appendChild(textElement('summary', '',
           `#${event.sequence} ${event.kind} · ${event.published_at} · actor ${event.actor}` +
           (event.origin_worker === null ? '' : ` · origin ${event.origin_worker}`) +
