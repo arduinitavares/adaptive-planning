@@ -104,6 +104,7 @@ class TestService(unittest.TestCase):
         self.assertEqual(swept.metadata.revision, before.metadata.revision + 1)
         self.assertEqual(swept_receipt.committed["attempt_ids"], (active.committed["attempt_id"],))
         self.assertEqual(len(swept.coordination.holds), 1)
+        self.assertEqual(swept.coordination.holds[0].kind, "stale")
         heartbeat = self.f.command("report_activity", {
             "origin_worker": "worker-a", "relay": None, "observed_activity": "returned",
         }, receipt=self.p, attempt=active)
@@ -137,6 +138,7 @@ class TestService(unittest.TestCase):
         self.assertEqual(view.coordination.store_sequence, before.coordination.store_sequence + 1)
         self.assertEqual({a.prior_state for a in view.coordination.attempts}, {"assigned", "active", "submitted"})
         self.assertEqual(len(view.coordination.holds), 3)
+        self.assertEqual({hold.kind for hold in view.coordination.holds}, {"stale"})
         for attempt in view.coordination.attempts:
             original = next(a for a in before.coordination.attempts if a.attempt_id == attempt.attempt_id)
             self.assertEqual((attempt.state, attempt.version, attempt.last_activity),
@@ -197,6 +199,7 @@ class TestService(unittest.TestCase):
         self.f.clock.advance(900)
         self.sweep()
         before = self.view()
+        self.assertEqual([hold.kind for hold in before.coordination.holds], ["stale"])
         prior_payload = self.payload(active)
         prior_step = before.legacy_snapshot["steps"][0]
         recovery = self.f.submit(self.p, active, value)
@@ -213,6 +216,7 @@ class TestService(unittest.TestCase):
         self.assertEqual(rows, [(int(submitted.committed["checkpoint_id"]),)])
         self.f.service.execute(self.resolve_command(active))
         self.assertEqual(self.view().coordination.attempts[0].state, "submitted")
+        self.assertFalse(self.view().coordination.holds)
         accepted = self.f.accept(self.p, active, value)
         self.assertEqual(self.view().coordination.attempts[0].state, "accepted")
         event = next(e for e in self.f.service.read_events(self.plan_id) if e.kind == "accept_step")
@@ -222,9 +226,12 @@ class TestService(unittest.TestCase):
 
     def test_recovery_material_holds_survive_confirmation_and_resolve_exact_source(self):
         active = self.stale()
+        self.assertEqual([hold.kind for hold in self.view().coordination.holds], ["stale"])
         report = self.f.submit(self.p, active, checkpoint(affected=("a",)))
         source = report.committed["recovery_event_id"]
         holds = self.view().coordination.holds
+        self.assertEqual({hold.kind for hold in holds}, {"stale", "reassessment"})
+        self.assertEqual({hold.source_id for hold in holds if hold.kind == "reassessment"}, {source})
         self.assertEqual({h.step_id for h in holds if h.kind == "reassessment"}, {"a", "c"})
         self.f.service.execute(self.resolve_command(active))
         self.assertEqual({h.kind for h in self.view().coordination.holds}, {"reassessment"})

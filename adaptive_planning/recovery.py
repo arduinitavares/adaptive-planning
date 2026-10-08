@@ -61,7 +61,7 @@ def _mark_stale(connection, plan_id, now, threshold_seconds, actor):
                                   "hold_id": item["hold_id"], "version": item["version"]})
         connection.execute("UPDATE attempts SET state='stale',version=?,payload=? WHERE plan_id=? AND attempt_id=?",
                            (item["version"], json.dumps(data, sort_keys=True, ensure_ascii=False), plan_id, row[0]))
-        reason = {"kind": "stale_ownership", "step_id": row[1], "source_id": source_id,
+        reason = {"kind": "stale", "step_id": row[1], "source_id": source_id,
                   "reason": "Recorded inactivity requires an explicit ownership decision"}
         connection.execute("INSERT INTO holds(hold_id,plan_id,reason,active,created_at) VALUES(?,?,?,1,?)",
                            (item["hold_id"], plan_id, json.dumps(reason, sort_keys=True), ts))
@@ -162,7 +162,7 @@ def swept_target(connection, plan, command):
     marker = data.get("stale_source")
     item = linked_sweep(connection, plan.plan_id, row, data, marker)
     holds = connection.execute("SELECT hold_id,reason FROM holds WHERE plan_id=? AND active=1", (plan.plan_id,)).fetchall()
-    expected = {"kind": "stale_ownership", "step_id": row[1], "source_id": marker["source_id"],
+    expected = {"kind": "stale", "step_id": row[1], "source_id": marker["source_id"],
                 "reason": "Recorded inactivity requires an explicit ownership decision"}
     source_holds = [identity for identity, raw in holds
                     if plans._hold_view(identity, raw).source_id == marker["source_id"]]
