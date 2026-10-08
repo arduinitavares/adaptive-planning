@@ -313,7 +313,7 @@ class TestService(unittest.TestCase):
         start = replace(start, expected_revision=None, ownership_version=None)
         other_store = Store(self.f.store.path, self.f.clock, host_id="synthetic-host")
         other = PlanningService(other_store, base_url="http://127.0.0.1:8790", clock=self.f.clock)
-        boundary, entering = threading.Barrier(2), threading.Barrier(2)
+        boundary = threading.Barrier(2)
         release = threading.Event()
         connect, other_connect = self.f.store._connect, other_store._connect
         paused = False
@@ -335,16 +335,15 @@ class TestService(unittest.TestCase):
 
         def contender_connection():
             db = other_connect()
-            def trace(sql):
-                if sql == "BEGIN IMMEDIATE":
-                    entering.wait(timeout=10)
-            db.set_trace_callback(trace)
+            # Only this test-owned connection fails immediately on the publisher's real write lock.
+            db.execute("PRAGMA busy_timeout = 0")
             return db
 
         self.f.store.write(lambda db: db.execute(
             "CREATE TRIGGER owned_checkpoint_boundary_trigger BEFORE INSERT ON holds "
             "BEGIN SELECT owned_checkpoint_boundary(); END"))
         before_revision = self.f.service.read_plan(self.plan_id).metadata.revision
+        before_publication = self.snapshot()
         with patch.object(self.f.store, "_connect", publishing_connection), \
                 patch.object(other_store, "_connect", contender_connection), ThreadPoolExecutor(max_workers=2) as pool:
             publisher = pool.submit(self.execute, publish)
@@ -355,18 +354,36 @@ class TestService(unittest.TestCase):
                 self.assertEqual(view.metadata.revision, before_revision)
                 self.assertEqual(view.coordination.holds, ())
                 self.assertEqual(other_store.read(lambda db: db.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]), 0)
+                self.assertEqual(other_store.read(lambda db: db.execute("PRAGMA busy_timeout").fetchone()[0]), 0)
                 contender = pool.submit(other.execute, start)
-                entering.wait(timeout=10)
+                # Publication stays paused until SQLite itself has rejected the conflicting BEGIN IMMEDIATE.
+                with self.assertRaises(DomainError) as busy:
+                    contender.result(timeout=10)
+                self.assertEqual(busy.exception.code, "busy")
+                sqlite_error = busy.exception.__cause__
+                self.assertIsInstance(sqlite_error, sqlite3.OperationalError)
+                self.assertEqual(sqlite_error.sqlite_errorcode, sqlite3.SQLITE_BUSY)
+                self.assertEqual(sqlite_error.sqlite_errorname, "SQLITE_BUSY")
+                self.assertFalse(release.is_set())
+                self.assertFalse(publisher.done())
+                self.assertTrue(other_store.read(lambda db: tuple(db.iterdump())) == before_publication,
+                                "Contended start published an attempt, revision, event or request")
             finally:
                 release.set()
             receipt = publisher.result(timeout=10)
+            before_retry = self.snapshot()
             with self.assertRaises(DomainError) as denied:
-                contender.result(timeout=10)
+                other.execute(start)
+            self.assertTrue(self.snapshot() == before_retry, "Held retry changed persisted state")
         self.assertEqual(denied.exception.code, "held")
         self.assertEqual(self.attempt(assigned).state, "assigned")
         self.assertEqual(len(self.rows("checkpoints")), 1)
         self.assertEqual(len(self.rows("holds")), 3)
         self.assertEqual(self.f.service.read_plan(self.plan_id).metadata.revision, receipt.committed_metadata.revision)
+        print(json.dumps({"task15_contention": "actual SQLite write-lock rejection before publisher release",
+                          "sqlite_errorcode": sqlite_error.sqlite_errorcode, "sqlite_errorname": sqlite_error.sqlite_errorname,
+                          "contender_domain": busy.exception.code, "identical_retry_domain": denied.exception.code},
+                         sort_keys=True))
 
     def test_interleaved_sibling_updates_preserved(self):
         a, b = self.active(), self.active("b", assignee="worker-b")
