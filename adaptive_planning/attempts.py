@@ -242,6 +242,20 @@ def _matching_reviews(connection, plan_id, producer, artifact):
     return matched
 
 
+def _validate_proof_pointers(connection, plan_id, source, checkpoints, reviews, links):
+    """Every supplied pointer must identify scoped passing proof, whichever layout supplies it."""
+    if "checkpoint_sequence" in source:
+        sequence = source["checkpoint_sequence"]
+        _audit_event(connection, plan_id, sequence, **links)
+        if sequence not in checkpoints:
+            raise DomainError("invalid", "Accepted output requires its artifact-bound passing checkpoint")
+    if "review_sequence" in source:
+        review_event = _audit_event(connection, plan_id, source["review_sequence"], **links)
+        review_id = review_event.get("review_id")
+        if not _nonblank(review_id) or review_id not in reviews:
+            raise DomainError("invalid", "Accepted output review pointer does not identify a matching passing review")
+
+
 def _review_after_invalidation(connection, plan_id, invalidation_sequence, reviews, links) -> bool:
     """Only the first exact-ID link records a review; later references cannot refresh it."""
     seen = set()
@@ -338,20 +352,15 @@ def _accepted_history(connection: sqlite3.Connection, plan, prerequisite: str, r
                 and supplied == artifact and _passing_evidence(evidence, artifact)):
             _audit_event(connection, plan.plan_id, sequence, **links)
             checkpoints.add(sequence)
-    if "checkpoint_sequence" in data:
-        _audit_event(connection, plan.plan_id, data["checkpoint_sequence"], **links)
-    if not checkpoints or ("checkpoint_sequence" in data and data["checkpoint_sequence"] not in checkpoints):
+    if not checkpoints:
         raise DomainError("invalid", "Accepted output requires its artifact-bound passing checkpoint")
     reviews = _matching_reviews(connection, plan.plan_id, producer, artifact)
     if step.definition["review_required"] and not reviews:
         raise DomainError("invalid", "Accepted output requires a distinct matching passing review")
-    if "review_sequence" in data:
-        review_event = _audit_event(connection, plan.plan_id, data["review_sequence"], **links)
-        review_id = review_event.get("review_id")
-        if not _nonblank(review_id) or review_id not in reviews:
-            raise DomainError("invalid", "Accepted output review pointer does not identify a matching passing review")
+    _validate_proof_pointers(connection, plan.plan_id, data, checkpoints, reviews, links)
     if "accepted_sequence" in data:
         accepted_event = _audit_event(connection, plan.plan_id, data["accepted_sequence"], **links)
+        _validate_proof_pointers(connection, plan.plan_id, accepted_event, checkpoints, reviews, links)
         for name in ("checkpoint_sequence", "review_sequence"):
             if name in accepted_event and name in data and accepted_event[name] != data[name]:
                 raise DomainError("invalid", "Accepted output contains contradictory audit pointers")

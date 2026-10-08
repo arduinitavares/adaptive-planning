@@ -384,6 +384,119 @@ class TestService(unittest.TestCase):
         self.edit_payload(result.attempt_id, lambda data: data.update(checkpoint_sequence=999999))
         self.denied(command)
 
+    def event_pointer_history(self, missing_copies):
+        self.f = make_service()
+        self.addCleanup(self.f.cleanup)
+        self.p = self.f.create(steps=(step("a", review_required=True), step("b"), step("c", ("a",))),
+                               creation_id="event-only-accepted-proof")
+        self.plan_id = self.p.current_metadata.plan_id
+        result = self.seed()
+        data = self.f.store.read(lambda db: json.loads(db.execute(
+            "SELECT payload FROM attempts WHERE plan_id=? AND attempt_id=?",
+            (self.plan_id, result.attempt_id)).fetchone()[0]))
+        self.edit_payload(result.attempt_id, lambda payload: [payload.pop(name) for name in missing_copies])
+        raw = self.f.store.read(lambda db: db.execute(
+            "SELECT payload FROM events WHERE plan_id=? AND sequence=?",
+            (self.plan_id, data["accepted_sequence"])).fetchone()[0])
+        return result, data, raw
+
+    def test_event_only_accepted_pointers_preserve_coherent_mixed_layouts(self):
+        for missing in (("checkpoint_sequence",), ("review_sequence",), ("checkpoint_sequence", "review_sequence")):
+            with self.subTest(missing=missing):
+                result, _, _ = self.event_pointer_history(missing)
+                consumer = self.assign("c")
+                self.bind(consumer, (self.binding(result),))
+                self.execute(self.worker(consumer))
+                self.assertEqual(self.attempt(consumer).state, "active")
+
+    def event_only_pointer_denials(self, pointer_name):
+        variants = ("nonexistent", "unrelated", "cross-plan", "wrong-artifact", "unproved",
+                    "none", "bool", "string", "float", "zero", "negative", "list", "object")
+        for variant in variants:
+            for operation in ("bind_availability", "start_step"):
+                with self.subTest(pointer=pointer_name, variant=variant, operation=operation):
+                    result, data, original = self.event_pointer_history((pointer_name,))
+                    consumer = self.assign("c")
+                    if operation == "start_step":
+                        self.bind(consumer, (self.binding(result),))
+                    if variant in ("unrelated", "cross-plan"):
+                        if variant == "unrelated":
+                            other = self.seed("b", result.artifact)
+                        else:
+                            foreign = self.f.create(creation_id="foreign-pointer-plan")
+                            other = seed_accepted_result(self.f, foreign.current_metadata.plan_id, "a", result.artifact)
+                        other_data = self.f.store.read(lambda db: json.loads(db.execute(
+                            "SELECT payload FROM attempts WHERE plan_id=? AND attempt_id=?",
+                            (other.plan_id, other.attempt_id)).fetchone()[0]))
+                        value = other_data[pointer_name]
+                    elif variant in ("wrong-artifact", "unproved"):
+                        links = self.f.store.read(lambda db: json.loads(db.execute(
+                            "SELECT payload FROM events WHERE plan_id=? AND sequence=?",
+                            (self.plan_id, data[pointer_name])).fetchone()[0]))
+                        if variant == "wrong-artifact":
+                            links["artifact"] = plans.to_jsonable(replace(result.artifact, version="wrong-version"))
+                        elif pointer_name == "review_sequence":
+                            links.pop("review_id")
+                        value = self.history_event("proof-reference", links)
+                    else:
+                        value = {"nonexistent": 999999, "none": None, "bool": True,
+                                 "string": str(data[pointer_name]), "float": float(data[pointer_name]),
+                                 "zero": 0, "negative": -1, "list": [], "object": {}}[variant]
+                    altered = json.loads(original)
+                    altered[pointer_name] = value
+                    before = self.snapshot()
+                    self.f.store.write(lambda db: db.execute(
+                        "UPDATE events SET payload=? WHERE plan_id=? AND sequence=?",
+                        (json.dumps(altered), self.plan_id, data["accepted_sequence"])))
+                    command = (self.bind_command(consumer, (self.binding(result),)) if operation == "bind_availability"
+                               else self.worker(consumer))
+                    try:
+                        self.denied(command)
+                    finally:
+                        self.f.store.write(lambda db: db.execute(
+                            "UPDATE events SET payload=? WHERE plan_id=? AND sequence=?",
+                            (original, self.plan_id, data["accepted_sequence"])))
+                    self.assertTrue(self.snapshot() == before, "Exact audit restoration changed unrelated history")
+
+    def test_event_only_checkpoint_pointer_rejects_incoherent_history(self):
+        self.event_only_pointer_denials("checkpoint_sequence")
+
+    def test_event_only_review_pointer_rejects_incoherent_history(self):
+        self.event_only_pointer_denials("review_sequence")
+
+    def test_accepted_event_and_attempt_pointer_copies_must_agree(self):
+        for pointer_name in ("checkpoint_sequence", "review_sequence"):
+            with self.subTest(pointer=pointer_name):
+                result, data, original = self.event_pointer_history(())
+                consumer = self.assign("c")
+                self.bind(consumer, (self.binding(result),))
+                links = self.f.store.read(lambda db: json.loads(db.execute(
+                    "SELECT payload FROM events WHERE plan_id=? AND sequence=?",
+                    (self.plan_id, data[pointer_name])).fetchone()[0]))
+                value = self.history_event("coherent-proof-reference", links)
+                if pointer_name == "checkpoint_sequence":
+                    self.f.store.write(lambda db: db.execute(
+                        "INSERT INTO checkpoints(plan_id,attempt_id,sequence,outcome,check_name,evidence,origin_worker,relay,artifact,reassessment,created_at) "
+                        "SELECT plan_id,attempt_id,?,outcome,check_name,evidence,origin_worker,relay,artifact,reassessment,created_at "
+                        "FROM checkpoints WHERE plan_id=? AND attempt_id=? AND sequence=?",
+                        (value, self.plan_id, result.attempt_id, data[pointer_name])))
+                # Both pointers independently identify matching passed proof; their copies still disagree.
+                altered = json.loads(original)
+                altered[pointer_name] = value
+                before = self.snapshot()
+                self.f.store.write(lambda db: db.execute(
+                    "UPDATE events SET payload=? WHERE plan_id=? AND sequence=?",
+                    (json.dumps(altered), self.plan_id, data["accepted_sequence"])))
+                try:
+                    self.denied(self.bind_command(consumer, (self.binding(result),)))
+                    self.denied(self.worker(consumer))
+                finally:
+                    self.f.store.write(lambda db: db.execute(
+                        "UPDATE events SET payload=? WHERE plan_id=? AND sequence=?",
+                        (original, self.plan_id, data["accepted_sequence"])))
+                self.assertTrue(self.snapshot() == before, "Exact pointer-copy restoration changed unrelated history")
+                self.execute(self.worker(consumer))
+
     def test_missing_or_ambiguous_accepted_result_is_not_available(self):
         result = self.seed()
         consumer = self.assign("c")
