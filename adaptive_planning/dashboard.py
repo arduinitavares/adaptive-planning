@@ -121,12 +121,18 @@ def dashboard_routes(service: PlanningService) -> list[BaseRoute]:
             view = service.read_plan(request.path_params["plan_id"])
             base = "/api/plans/" + quote(view.plan_id, safe="")
             attrs = {"mode": "service", "plan-id": view.plan_id, "plan-url": base,
-                     "coordination-url": base + "/coordination", "events-url": base + "/events"}
+                     "coordination-url": base + "/coordination", "events-url": base + "/events",
+                     "recovery-warnings-url": base + "/recovery-warnings"}
             body = "<body " + " ".join(f'data-{key}="{escape(value, quote=True)}"'
                                           for key, value in attrs.items()) + ">"
             template = _asset("index.html").decode("utf-8")
             if '<body data-mode="legacy">' not in template:
                 raise RuntimeError("Packaged dashboard body marker is missing")
+            marker = '<p id="recovery-state"></p>'
+            if template.count(marker) != 1:
+                raise RuntimeError("Packaged dashboard recovery marker is missing or ambiguous")
+            template = template.replace(marker, marker + '\n        <p id="recovery-warnings" role="status">'
+                                        'Recorded inactivity warnings unavailable.</p>', 1)
             return HTMLResponse(template.replace('<body data-mode="legacy">', body, 1), headers=HEADERS)
         return _public_read(read)
 
@@ -156,6 +162,15 @@ def dashboard_routes(service: PlanningService) -> list[BaseRoute]:
                                   after=_integer(values, "after", 0), limit=_integer(values, "limit", 100))})
         return _public_read(read)
 
+    def api_recovery_warnings(request):
+        def read():
+            _query(request, set())
+            response = _bounded_json(service.read_recovery_warnings(request.path_params["plan_id"]))
+            if request.method == "HEAD":
+                return Response(headers=dict(response.headers))
+            return response
+        return _public_read(read)
+
     def script(request):
         return Response(_asset("app.js"), media_type="text/javascript", headers=HEADERS)
 
@@ -168,5 +183,6 @@ def dashboard_routes(service: PlanningService) -> list[BaseRoute]:
             Route("/api/plans/{plan_id}", api_plan, methods=["GET", "HEAD"]),
             Route("/api/plans/{plan_id}/coordination", api_coordination, methods=["GET", "HEAD"]),
             Route("/api/plans/{plan_id}/events", api_events, methods=["GET", "HEAD"]),
+            Route("/api/plans/{plan_id}/recovery-warnings", api_recovery_warnings, methods=["GET", "HEAD"]),
             Route("/app.js", script, methods=["GET", "HEAD"]),
             Route("/style.css", stylesheet, methods=["GET", "HEAD"])]

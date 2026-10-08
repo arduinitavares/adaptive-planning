@@ -39,6 +39,8 @@ _ARGUMENTS = {
     "record_review": frozenset({"command"}), "reserve_verification": frozenset({"command"}),
     "accept_step": frozenset({"command"}),
     "release_resource_use": frozenset({"command"}), "reopen_attempt": frozenset({"command"}),
+    "sweep_stale": frozenset({"command"}), "resolve_attempt": frozenset({"command"}),
+    "append_late_evidence": frozenset({"command"}),
 }
 _MESSAGES = {
     "invalid": "Tool arguments are invalid.", "not_found": "The requested planning record was not found.",
@@ -358,6 +360,27 @@ class _ReopenAttemptPayload(_InputModel):
     reason: str
 
 
+class _SweepStalePayload(_InputModel):
+    pass
+
+
+class _ResolveAttemptPayload(_InputModel):
+    resolution: Literal["confirm-owner", "replace", "reject", "release", "attach-context"]
+    reason: str
+    next_step_state: Literal["pending", "blocked", "retired"]
+    stopped_resource_ids: list[str]
+    replacement_assignee: str | None
+    replacement_context: _ExecutionContextInput | None
+    attached_context: dict[str, Any] | None = None
+
+
+class _AppendLateEvidencePayload(_InputModel):
+    origin_attempt_id: str
+    evidence: list[_EvidenceInput]
+    stopped_resource_ids: list[str]
+    reason: str
+
+
 class _Envelope(_InputModel):
     epoch: str
     key: str
@@ -463,10 +486,26 @@ class ReopenAttemptInput(_Envelope):
     payload: _ReopenAttemptPayload
 
 
+class SweepStaleInput(_Envelope):
+    kind: Literal["sweep_stale"]
+    payload: _SweepStalePayload
+
+
+class ResolveAttemptInput(_Envelope):
+    kind: Literal["resolve_attempt"]
+    payload: _ResolveAttemptPayload
+
+
+class AppendLateEvidenceInput(_Envelope):
+    kind: Literal["append_late_evidence"]
+    payload: _AppendLateEvidencePayload
+
+
 CommandInput = Annotated[CreatePlanInput | RevisePlanInput | TakeoverInput | RegisterResourceInput | ReconcileResourcesInput | AssignStepInput
                          | BindAvailabilityInput | StartStepInput | ReportActivityInput | RecordCheckpointInput
                          | ResolveReassessmentInput | InvalidateResultInput | ResolveInvalidationInput
-                         | RecordReviewInput | AcceptStepInput | ReserveVerificationInput | ReleaseResourceUseInput | ReopenAttemptInput,
+                         | RecordReviewInput | AcceptStepInput | ReserveVerificationInput | ReleaseResourceUseInput | ReopenAttemptInput
+                         | SweepStaleInput | ResolveAttemptInput | AppendLateEvidenceInput,
                          Field(discriminator="kind")]
 _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_fields,
                            *_CreatePayload.model_fields, *_RevisePayload.model_fields, *_TakeoverPayload.model_fields,
@@ -482,6 +521,8 @@ _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_field
                            *_ReviewInput.model_fields, *_RecordReviewPayload.model_fields,
                            *_ReserveVerificationPayload.model_fields, *_ReleaseResourceUsePayload.model_fields,
                            *_ReopenAttemptPayload.model_fields,
+                           *_SweepStalePayload.model_fields, *_ResolveAttemptPayload.model_fields,
+                           *_AppendLateEvidencePayload.model_fields,
                            "plan_id", "include_terminal", "after", "limit", *_ARGUMENTS})
 
 
@@ -687,5 +728,20 @@ def build_mcp(service: PlanningService) -> MCPServer:
     def reopen_attempt(command: CommandInput) -> dict[str, Any]:
         """Reopen the same current submitted attempt after scope, hold and retained-use checks."""
         return execute("reopen_attempt", command)
+
+    @server.tool(annotations=write)
+    def sweep_stale(command: CommandInput) -> dict[str, Any]:
+        """Explicitly record overdue ownership in one target-plan batch without releasing resources."""
+        return execute("sweep_stale", command)
+
+    @server.tool(annotations=write)
+    def resolve_attempt(command: CommandInput) -> dict[str, Any]:
+        """Confirm observed ownership or explicitly cancel, retire or replace an exact swept native attempt."""
+        return execute("resolve_attempt", command)
+
+    @server.tool(annotations=write)
+    def append_late_evidence(command: CommandInput) -> dict[str, Any]:
+        """Retain attributed historical observations and stop reports without releasing or accepting work."""
+        return execute("append_late_evidence", command)
 
     return server

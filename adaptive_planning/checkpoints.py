@@ -190,7 +190,7 @@ def _linked_checkpoint(connection: sqlite3.Connection, plan_id: PlanId, checkpoi
 def install_holds(connection: sqlite3.Connection, plan_id: PlanId, checkpoint_id: str,
                   reassessment: Reassessment) -> None:
     """Append source-linked immediate holds; publication never clears any prior hold."""
-    stored, ts = _linked_checkpoint(connection, plan_id, checkpoint_id)
+    stored, ts = _reassessment_source(connection, plan_id, checkpoint_id)
     reassessment = _to_reassessment(reassessment)
     if reassessment != stored.reassessment:
         raise DomainError("invalid", "Hold reassessment does not match its durable checkpoint")
@@ -222,6 +222,10 @@ def record_checkpoint(connection: sqlite3.Connection, command: Command) -> Mutat
     """Submit one current active worker, its complete findings and provisional holds in the service transaction."""
     if command.kind != "record_checkpoint":
         raise DomainError("invalid", "The command kind does not match checkpoint publication")
+    attempts.require_attempt(connection, command)
+    target = attempts._attempt_row(connection, command.plan_id, command.attempt_id)
+    if target is not None and target[3] == "stale":
+        return _recovery_checkpoint(connection, command)
     plan, row, data, step = _active_target(connection, command)
     previous = plans.project_plan(connection, plan.plan_id)
     value = _to_checkpoint(command.payload["checkpoint"])
@@ -260,6 +264,75 @@ def record_checkpoint(connection: sqlite3.Connection, command: Command) -> Mutat
     install_holds(connection, plan.plan_id, committed["checkpoint_id"], value.reassessment)
     view = plans._commit_projection(connection, plan.plan_id, previous)
     return MutationReceipt(committed, view.metadata, view.metadata, False, None)
+
+
+def _recovery_checkpoint(connection, command):
+    from adaptive_planning.recovery import swept_target
+    plan = plans._load_plan(connection, command.plan_id)
+    if command.payload["checkpoint"].relay is not None:
+        plans._check_preconditions(plan, command)
+    row, data, step, marker = swept_target(connection, plan, command)
+    previous = plans.project_plan(connection, plan.plan_id)
+    value = _to_checkpoint(command.payload["checkpoint"])
+    _validate_checkpoint(value, previous.legacy_snapshot, [])
+    version, revision, ts = row[4] + 1, plan.revision + 1, plans._timestamp(plan.updated_at)
+    committed = {"attempt_id": row[0], "step_id": row[1], "version": version, "definition_version": row[5],
+                 "recovery_only": True}
+    event = {**committed, "before_version": row[4], "definition": data["definition"], "context": data["context"],
+             "epoch": data["epoch"], "generation": data["generation"], "stale_source": marker,
+             "source_graph": _graph(plan), "checkpoint": plans.to_jsonable(value)}
+    _event_limits(event)
+    cursor = connection.execute(
+        "INSERT INTO events(plan_id,plan_revision,kind,actor,origin_worker,relay,published_at,payload) VALUES(?,?,?,?,?,?,?,?)",
+        (plan.plan_id, revision, "recovery_checkpoint", command.actor, value.origin_worker, value.relay, ts,
+         json.dumps(event, sort_keys=True, ensure_ascii=False)))
+    committed["recovery_event_id"] = str(cursor.lastrowid)
+    connection.execute("UPDATE events SET payload=? WHERE plan_id=? AND sequence=?",
+                       (json.dumps({**event, "recovery_event_id": committed["recovery_event_id"]}, sort_keys=True,
+                                   ensure_ascii=False), plan.plan_id, cursor.lastrowid))
+    connection.execute("UPDATE attempts SET version=? WHERE plan_id=? AND attempt_id=?", (version, plan.plan_id, row[0]))
+    connection.execute("UPDATE plans SET revision=?,updated_at=? WHERE plan_id=?", (revision, ts, plan.plan_id))
+    install_holds(connection, plan.plan_id, committed["recovery_event_id"], value.reassessment)
+    view = plans._commit_projection(connection, plan.plan_id, previous)
+    return MutationReceipt(committed, view.metadata, view.metadata, False, None)
+
+
+def _reassessment_source(connection, plan_id, source_id):
+    """A separate source reader; canonical checkpoint selection stays strictly unchanged."""
+    if (not isinstance(source_id, str) or re.fullmatch(r"[1-9][0-9]{0,18}", source_id) is None
+            or int(source_id) > 2**63 - 1):
+        raise DomainError("invalid", "Reassessment source must be a canonical event sequence")
+    event = connection.execute(
+        "SELECT kind,actor,origin_worker,relay,published_at,payload FROM events WHERE plan_id=? AND sequence=?",
+        (plan_id, int(source_id))).fetchone()
+    if event is None or event[0] != "recovery_checkpoint":
+        return _linked_checkpoint(connection, plan_id, source_id)
+    from adaptive_planning.recovery import linked_sweep
+    payload = attempts._object(event[5], "recovery checkpoint event")
+    row = attempts._attempt_row(connection, plan_id, payload.get("attempt_id"))
+    if row is None or connection.execute("SELECT 1 FROM checkpoints WHERE plan_id=? AND sequence=?", (plan_id, int(source_id))).fetchone():
+        raise DomainError("invalid", "Recovery source contradicts canonical or attempt history")
+    data = attempts._object(row[7], "recovery source attempt")
+    value = _to_checkpoint(payload.get("checkpoint"))
+    item = linked_sweep(connection, plan_id, row, data, payload.get("stale_source"))
+    links = {"recovery_only": True, "recovery_event_id": source_id, "step_id": row[1], "definition_version": row[5],
+             "definition": data.get("definition"), "context": item["context"], "epoch": item["epoch"],
+             "generation": item["generation"]}
+    if (payload.get("recovery_only") is not True or any(payload.get(key) != expected for key, expected in links.items())
+            or type(payload.get("before_version")) is not int or type(payload.get("version")) is not int
+            or not item["version"] <= payload["before_version"] < payload["version"] <= row[4]
+            or payload["version"] != payload["before_version"] + 1
+            or (event[1], event[2], event[3]) != (value.relay or value.origin_worker, value.origin_worker, value.relay)
+            or value.origin_worker != row[2]):
+        raise DomainError("invalid", "Recovery source contradicts its frozen attribution and semantic versions")
+    # Content is validated against its original scope, not a later changed current definition.
+    graph = payload.get("source_graph")
+    if (not isinstance(graph, dict) or not isinstance(graph.get("steps"), list)
+            or [node for node in graph["steps"] if isinstance(node, dict) and node.get("id") == row[1]]
+            != [{"id": row[1], "dependsOn": data["definition"]["dependencies"]}]):
+        raise DomainError("invalid", "Recovery source graph contradicts the frozen original definition")
+    _validate_checkpoint(value, graph, [])
+    return value, event[4]
 
 
 def _owner_target(connection: sqlite3.Connection, command: Command, kind: str):
@@ -336,7 +409,7 @@ def resolve_reassessment(connection: sqlite3.Connection, command: Command) -> Mu
     plan = _owner_target(connection, command, "resolve_reassessment")
     payload = command.payload
     _text(payload["reason"], "Reassessment classification reason")
-    _linked_checkpoint(connection, plan.plan_id, payload["checkpoint_id"])
+    _reassessment_source(connection, plan.plan_id, payload["checkpoint_id"])
     decision, draft = payload["decision"], payload["draft"]
     if decision == "apply":
         if draft is None:

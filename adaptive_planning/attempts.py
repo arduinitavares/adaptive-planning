@@ -36,6 +36,22 @@ def activity_policy(stale_seconds: int):
         _STALE_SECONDS.reset(token)
 
 
+def activity_timestamp(data: dict) -> datetime:
+    """Decode an observed aware timestamp without manufacturing or refreshing activity."""
+    try:
+        timestamp = datetime.fromisoformat(data["last_activity"])
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise DomainError("invalid", "The attempt has no valid activity timestamp") from None
+    return timestamp
+
+
+def require_fresh_activity(data: dict) -> None:
+    if (plans._now() - activity_timestamp(data)).total_seconds() >= _STALE_SECONDS.get():
+        raise DomainError("stale", "The attempt exceeded its configured inactivity threshold")
+
+
 def ready_steps(connection: sqlite3.Connection, plan_id: PlanId) -> tuple[ReadyStep, ...]:
     """Return advisory logical readiness; assignment rechecks its context in the write transaction."""
     return plans.list_ready(connection, plan_id)

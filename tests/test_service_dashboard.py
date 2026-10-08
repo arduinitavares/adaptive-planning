@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import unittest
 from html.parser import HTMLParser
@@ -12,8 +13,9 @@ from unittest import mock
 from adaptive_planning import plans
 from adaptive_planning.admin import initialize_installation, load_service_token
 from adaptive_planning.app import build_app
+from adaptive_planning.app import PlanningService
 from adaptive_planning.config import Config, http_allowlist
-from tests.service_fixtures import make_service
+from tests.service_fixtures import checkpoint, make_service, step
 from tests.test_service_http import call
 from tests.test_service_plans import dump, insert_attempt
 
@@ -117,6 +119,8 @@ class TestService(unittest.TestCase):
         self.assertEqual(attrs["data-plan-url"], "/api/plans/" + self.plan_id)
         self.assertEqual(attrs["data-coordination-url"], "/api/plans/" + self.plan_id + "/coordination")
         self.assertEqual(attrs["data-events-url"], "/api/plans/" + self.plan_id + "/events")
+        self.assertEqual(attrs["data-recovery-warnings-url"], "/api/plans/" + self.plan_id + "/recovery-warnings")
+        self.assertEqual(len([attrs for _, attrs in page.tags if attrs.get("id") == "recovery-warnings"]), 1)
         self.assertEqual([a for t, a in page.tags if t == "script"], [{"src": "/app.js"}])
         self.assertIn("Host edits are not controlled", body.decode())
         self.assertIn("read-only", body.decode().lower())
@@ -127,6 +131,137 @@ class TestService(unittest.TestCase):
         self.assertEqual(query_status, 200)
         self.assertEqual(query_body, body)
         self.assertNotIn(b"untrusted-query-marker", query_body)
+
+    def warning_app(self, threshold=6):
+        from starlette.applications import Starlette
+        from adaptive_planning.dashboard import dashboard_routes
+        self.f.service = PlanningService(self.f.store, base_url="http://127.0.0.1:8790", clock=self.f.clock,
+                                         stale_seconds=threshold)
+        self.app = Starlette(routes=dashboard_routes(self.f.service))
+
+    def warnings(self, method="GET"):
+        return self.request("/api/plans/" + self.plan_id + "/recovery-warnings", method=method)
+
+    def test_recovery_warnings_are_pure_custom_policy_and_time_only_observations(self):
+        self.warning_app()
+        assigned = self.f.assign(self.p)
+        before = dump(self.f.store)
+        self.f.clock.advance(5)
+        status, headers, body = self.warnings()
+        self.assertEqual(status, 200)
+        first = json.loads(body)
+        self.assertEqual(set(first), {"metadata", "store_sequence", "observed_at", "threshold_seconds", "overdue", "unassessable_activity"})
+        self.assertEqual((first["threshold_seconds"], first["overdue"], first["unassessable_activity"]), (6, [], []))
+        self.f.clock.advance(1)
+        status, _, body = self.warnings()
+        second = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(second["metadata"], first["metadata"])
+        self.assertEqual(second["store_sequence"], first["store_sequence"])
+        self.assertNotEqual(second["observed_at"], first["observed_at"])
+        self.assertEqual(second["overdue"], [{"attempt_id": assigned.committed["attempt_id"], "version": 1,
+            "state": "assigned", "last_activity": "2026-10-06T12:00:00+00:00"}])
+        self.assertEqual(dict(headers)["cache-control"], "no-store")
+        self.assertNotIn(self.p.private.orchestrator_token.encode(), body)
+        self.assertNotIn(assigned.private.attempt_token.encode(), body)
+        self.assertNotIn(b"context", body)
+        status, _, body = self.warnings("HEAD")
+        self.assertEqual((status, body), (200, b""))
+        self.assertEqual(dump(self.f.store), before)
+
+    def test_recovery_warnings_cover_all_current_attempts_beyond_summary(self):
+        self.warning_app()
+        self.p = self.f.create(steps=tuple(step(f"s{i}") for i in range(102)), creation_id="warning-pages")
+        self.plan_id = self.p.current_metadata.plan_id
+        for i in range(102):
+            self.f.assign(self.p, f"s{i}")
+        before = dump(self.f.store)
+        self.f.clock.advance(6)
+        status, _, body = self.warnings()
+        self.assertEqual(status, 200)
+        value = json.loads(body)
+        self.assertEqual(len(value["overdue"]), 102)
+        self.assertEqual(len({item["attempt_id"] for item in value["overdue"]}), 102)
+        view = self.f.service.read_plan(self.plan_id)
+        self.assertLess(len(view.coordination.attempts), 102)
+        self.assertEqual(value["metadata"], plans.to_jsonable(view.metadata))
+        self.assertEqual(value["store_sequence"], view.coordination.store_sequence)
+        self.assertEqual(dump(self.f.store), before)
+
+    def test_recovery_warnings_states_malformed_timestamps_and_foreign_store_watermark(self):
+        self.warning_app()
+        assigned = self.f.assign(self.p)
+        active = self.f.start(self.p, self.f.assign(self.p, "b"))
+        self.f.submit(self.p, active, checkpoint())
+        self.f.clock.advance(6)
+        status, _, body = self.warnings()
+        value = json.loads(body)
+        self.assertEqual({item["state"] for item in value["overdue"]}, {"assigned", "submitted"})
+        first_sequence = value["store_sequence"]
+        first_metadata = value["metadata"]
+        self.f.create(creation_id="foreign-warning-watermark")
+        value = json.loads(self.warnings()[2])
+        self.assertEqual(value["metadata"], first_metadata)
+        self.assertGreater(value["store_sequence"], first_sequence)
+        def malformed(db):
+            row = db.execute("SELECT payload FROM attempts WHERE plan_id=? AND attempt_id=?",
+                             (self.plan_id, assigned.committed["attempt_id"])).fetchone()
+            data = json.loads(row[0])
+            data["last_activity"] = "2026-10-06T12:00:00"
+            db.execute("UPDATE attempts SET payload=? WHERE plan_id=? AND attempt_id=?",
+                       (json.dumps(data), self.plan_id, assigned.committed["attempt_id"]))
+            db.execute("UPDATE attempts SET state='accepted' WHERE plan_id=? AND attempt_id=?",
+                       (self.plan_id, active.committed["attempt_id"]))
+        self.f.store.write(malformed)
+        before = dump(self.f.store)
+        value = json.loads(self.warnings()[2])
+        self.assertEqual(value["overdue"], [])
+        self.assertEqual([item["attempt_id"] for item in value["unassessable_activity"]], [assigned.committed["attempt_id"]])
+        self.assertEqual(dump(self.f.store), before)
+
+    def test_recovery_warning_read_never_sweeps_and_excludes_recorded_stale(self):
+        self.warning_app()
+        active = self.f.start(self.p, self.f.assign(self.p))
+        self.f.clock.advance(6)
+        self.assertEqual(json.loads(self.warnings()[2])["overdue"][0]["state"], "active")
+        self.f.service.execute(self.f.command("sweep_stale", {}, receipt=self.p))
+        before = dump(self.f.store)
+        self.assertEqual(json.loads(self.warnings()[2])["overdue"], [])
+        self.assertEqual(self.f.service.read_plan(self.plan_id).coordination.attempts[0].state, "stale")
+        self.assertEqual(dump(self.f.store), before)
+
+    def test_recovery_unassessable_activity_keeps_exact_canonical_display_tuple(self):
+        self.warning_app()
+        active = self.f.start(self.p, self.f.assign(self.p))
+        self.f.clock.advance(6)
+        for activity in (None, "", "not-a-timestamp", "2026-10-06T12:00:00", "2026-10-06T12:00:07+00:00"):
+            with self.subTest(activity=activity):
+                def mutate(db):
+                    row = db.execute("SELECT payload FROM attempts WHERE plan_id=? AND attempt_id=?",
+                                     (self.plan_id, active.committed["attempt_id"])).fetchone()
+                    data = json.loads(row[0])
+                    if activity is None:
+                        data.pop("last_activity", None)
+                    else:
+                        data["last_activity"] = activity
+                    db.execute("UPDATE attempts SET payload=? WHERE plan_id=? AND attempt_id=?",
+                               (json.dumps(data), self.plan_id, active.committed["attempt_id"]))
+                self.f.store.write(mutate)
+                before = hashlib.sha256(repr(dump(self.f.store)).encode()).hexdigest()
+                value = json.loads(self.warnings()[2])
+                current = self.f.service.read_plan(self.plan_id).coordination.attempts[0]
+                self.assertEqual(value["overdue"], [])
+                self.assertEqual(value["unassessable_activity"], [{"attempt_id": current.attempt_id,
+                    "version": current.version, "state": current.state, "last_activity": current.last_activity}])
+                self.assertEqual(hashlib.sha256(repr(dump(self.f.store)).encode()).hexdigest(), before)
+
+    def test_recovery_warning_endpoint_rejects_queries_and_missing_plan(self):
+        self.warning_app()
+        before = dump(self.f.store)
+        status, _, _ = self.request("/api/plans/" + self.plan_id + "/recovery-warnings", query=b"now=1")
+        self.assertEqual(status, 400)
+        self.assertEqual(self.request("/api/plans/missing/recovery-warnings")[0], 404)
+        self.assertEqual(dump(self.f.store), before)
 
     def test_public_json_matches_committed_projections_without_tokens(self):
         before = dump(self.f.store)

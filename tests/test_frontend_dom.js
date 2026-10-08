@@ -192,12 +192,13 @@ const event = sequence => ({sequence, plan_revision: sequence === 1 ? 1 : null, 
     assumptions: [], disposition: 'unchanged', reason: 'observed', affected_steps: [], unbounded: false, proposed_draft: null},
     origin_worker: 'worker-origin', relay: 'owner-relay', artifact: null}}});
 
-function serviceHarness(responder, {index = false} = {}) {
+function serviceHarness(responder, {index = false, warnings = null} = {}) {
   const elements = new Map();
   const el = id => { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); };
   const body = new Element('body');
   body.dataset = index ? {mode: 'service', plansUrl: '/api/plans'} : {mode: 'service', planId: 'service-plan',
     planUrl: '/api/plans/service-plan', coordinationUrl: '/api/plans/service-plan/coordination', eventsUrl: '/api/plans/service-plan/events'};
+  if (warnings !== null) body.dataset.recoveryWarningsUrl = '/api/plans/service-plan/recovery-warnings';
   const intervals = [], calls = [], errors = [];
   let active = 0, maximumActive = 0;
   const context = {
@@ -210,7 +211,10 @@ function serviceHarness(responder, {index = false} = {}) {
       assert.ok(!options.method || options.method === 'GET');
       assert.ok(!options.headers || !options.headers.Authorization);
       calls.push(url); active++; maximumActive = Math.max(maximumActive, active);
-      try { return await responder(url, calls.length); } finally {active--;}
+      try {
+        return await (warnings !== null && url === body.dataset.recoveryWarningsUrl
+          ? warnings(url, calls.length) : responder(url, calls.length));
+      } finally {active--;}
     },
     localStorage: {getItem: () => assert.fail('No persisted progress'), setItem: () => assert.fail('No persisted progress')},
     sessionStorage: {getItem: () => assert.fail('No persisted progress'), setItem: () => assert.fail('No persisted progress')},
@@ -465,9 +469,157 @@ async function testExpandedDetailsUnrelatedAddition() {
   console.log('Durable record identity preserves expansions through unrelated additions and reordering; closed/new/reused-epoch records remain closed');
 }
 
+async function testRecoveryWarnings() {
+  let view = serviceView();
+  const items = Array.from({length: 101}, (_, i) => attempt(i === 100 ? hostile : 'warning-' + i, 'a',
+    ['assigned', 'active', 'submitted'][i % 3]));
+  view.coordination.total_counts.attempts = 101;
+  let observed = publishedAt, overdue = [], unable = [], fail = false, corrupt = null, mutateAfterWarning = false;
+  const item = value => ({attempt_id: value.attempt_id, version: value.version, state: value.state,
+    last_activity: value.last_activity});
+  const warningValue = () => ({metadata: JSON.parse(JSON.stringify(view.metadata)),
+    store_sequence: view.coordination.store_sequence, observed_at: observed, threshold_seconds: 6,
+    overdue: overdue.map(i => item(items[i].value)), unassessable_activity: unable.map(i => item(items[i].value))});
+  const h = serviceHarness(url => {
+    if (url === '/api/plans/service-plan') return response(view);
+    if (url.startsWith('/api/plans/service-plan/coordination')) {
+      const after = new URLSearchParams(url.split('?')[1]).get('after');
+      return response({plan_id: view.plan_id, revision: view.metadata.revision, store_sequence: view.coordination.store_sequence,
+        items: after ? items.slice(100) : items.slice(0, 100), next_cursor: after ? null : 'last-warning-page'});
+    }
+    if (url.startsWith('/api/plans/service-plan/events')) return response({events: []});
+    assert.fail('Unexpected warning publication endpoint ' + url);
+  }, {warnings: () => {
+    if (fail) throw new Error('Synthetic advisory unavailable');
+    const value = warningValue();
+    if (corrupt) corrupt(value);
+    if (mutateAfterWarning) {
+      mutateAfterWarning = false;
+      view.metadata.revision = view.legacy_snapshot.revision = 2;
+      view.legacy_snapshot.changeSummary = 'New fenced publication';
+    }
+    return response(value);
+  }});
+  await h.settle();
+  assert.equal(h.el('recovery-warnings').dataset.status, 'current');
+  assert.match(h.el('recovery-warnings').textContent, /No overdue recorded inactivity/);
+  assert.ok(h.calls.indexOf('/api/plans/service-plan/recovery-warnings') < h.calls.lastIndexOf('/api/plans/service-plan'));
+  const canonical = h.el('published-state').textContent;
+  observed = '2026-10-06T12:00:06+00:00';
+  overdue = Array.from({length: 101}, (_, i) => i); // All 101 are six seconds old, including the second page.
+  await h.tick();
+  assert.equal(h.el('published-state').textContent, canonical);
+  assert.equal(h.el('recovery-warnings').dataset.observedAt, observed);
+  assert.match(h.el('recovery-warnings').textContent, /101 overdue/);
+  assert.match(h.el('recovery-warnings').textContent, /<script>globalThis.executed/);
+  assert.equal(h.el('recovery-warnings').querySelectorAll('script').length, 0);
+  assert.equal(h.context.executed, undefined);
+
+  // Every metadata field and the global store sequence must match the canonical publication.
+  const metadataChanges = [
+    v => {v.metadata.epoch = 'another-epoch';}, v => {v.metadata.plan_id = 'another-plan';},
+    v => {v.metadata.generation = 'another-generation';}, v => {v.metadata.revision++;},
+    v => {v.metadata.ownership_version++;}, v => {v.metadata.dashboard_url += '/foreign';},
+    v => {v.store_sequence++;}, v => {v.overdue[100].version++;},
+    v => {v.overdue[100].state = 'accepted';}, v => {v.overdue[100].last_activity = publishedAt + 'bad';},
+    v => {v.overdue.pop();}, v => {v.overdue.push({...v.overdue[0]});},
+    v => {v.overdue[0].attempt_id = 'unknown';}
+  ];
+  for (const change of metadataChanges) {
+    corrupt = change;
+    const start = h.calls.length;
+    await h.tick();
+    assert.equal(h.el('recovery-warnings').dataset.status, 'unavailable');
+    assert.doesNotMatch(h.el('recovery-warnings').textContent, /101 overdue|<script>/);
+    assert.ok(h.calls.slice(start).filter(url => url === '/api/plans/service-plan/recovery-warnings').length <= 2);
+    corrupt = null;
+    await h.tick();
+    assert.equal(h.el('recovery-warnings').dataset.status, 'current');
+  }
+  for (const change of [v => {v.threshold_seconds = 0;}, v => {v.threshold_seconds = true;},
+      v => {v.observed_at = '2026-10-06T12:00:06';}, v => {v.overdue[0].version = Number.MAX_SAFE_INTEGER + 1;},
+      v => {v.extra = 'unexpected';}, v => {v.metadata.extra = 'unexpected';}]) {
+    corrupt = change;
+    await h.tick();
+    assert.equal(h.el('conn-label').textContent, 'Connected', 'Advisory shape failure may retain a valid canonical view');
+    assert.equal(h.el('recovery-warnings').dataset.status, 'unavailable');
+    corrupt = null;
+    await h.tick();
+  }
+  fail = true;
+  await h.tick();
+  assert.equal(h.el('conn-label').textContent, 'Connected');
+  assert.match(h.el('recovery-warnings').textContent, /unavailable/i);
+  assert.doesNotMatch(h.el('recovery-warnings').textContent, /101 overdue/);
+  fail = false;
+  await h.tick();
+  // Preserve the service's microsecond boundary rather than rounding it into browser milliseconds.
+  for (const current of items) current.value.last_activity = '2026-10-06T12:00:00.000001+00:00';
+  view.coordination.store_sequence++;
+  observed = '2026-10-06T13:00:06.000000+01:00';
+  overdue = [];
+  await h.tick();
+  assert.equal(h.el('recovery-warnings').dataset.status, 'current');
+  assert.match(h.el('recovery-warnings').textContent, /No overdue recorded inactivity/);
+  observed = '2026-10-06T13:00:06.000001+01:00';
+  overdue = Array.from({length: 101}, (_, i) => i);
+  await h.tick();
+  assert.match(h.el('recovery-warnings').textContent, /101 overdue/);
+  items[0].value.last_activity = '2026-10-06T12:00:00';
+  items[1].value.last_activity = '2026-10-06T13:00:07+01:00';
+  view.coordination.store_sequence++;
+  unable = [0, 1];
+  overdue = overdue.slice(2);
+  await h.tick();
+  assert.equal(h.el('recovery-warnings').dataset.status, 'current');
+  assert.match(h.el('recovery-warnings').textContent, /Unable to assess recorded activity: warning-0, warning-1/);
+  for (const change of [v => {v.unassessable_activity.pop();},
+      v => {v.unassessable_activity[0].version++;}, v => {v.unassessable_activity[0].state = 'accepted';},
+      v => {v.unassessable_activity[0].last_activity = publishedAt;},
+      v => {v.overdue.push({...v.unassessable_activity[0]});}]) {
+    corrupt = change;
+    await h.tick();
+    assert.equal(h.el('recovery-warnings').dataset.status, 'unavailable');
+    corrupt = null;
+    await h.tick();
+  }
+  for (const current of items) current.value.last_activity = publishedAt;
+  view.coordination.store_sequence++;
+  observed = '2026-10-06T12:00:06+00:00';
+  // Canonical activity can be a started_at fallback; service-observed raw absence remains unassessable.
+  unable = [0];
+  overdue = Array.from({length: 100}, (_, i) => i + 1);
+  await h.tick();
+  assert.equal(h.el('recovery-warnings').dataset.status, 'current');
+  assert.match(h.el('recovery-warnings').textContent, /100 overdue/);
+  assert.match(h.el('recovery-warnings').textContent, /Unable to assess recorded activity: warning-0/);
+  unable = [];
+  overdue = Array.from({length: 101}, (_, i) => i);
+  await h.tick();
+  // A foreign-plan event changes only the global watermark, and old warnings cannot attach to it.
+  view.coordination.store_sequence++;
+  corrupt = v => {v.store_sequence--;};
+  await h.tick();
+  assert.equal(h.el('recovery-warnings').dataset.status, 'unavailable');
+  corrupt = null;
+  await h.tick();
+  mutateAfterWarning = true;
+  await h.tick();
+  assert.equal(h.el('published-state').dataset.revision, '2', 'The final canonical read must fence after the advisory fetch');
+  assert.equal(h.el('recovery-warnings').dataset.status, 'current');
+  view.metadata.epoch = 'new-warning-epoch';
+  fail = true;
+  await h.tick();
+  assert.equal(h.el('recovery-warnings').dataset.status, 'unavailable');
+  assert.doesNotMatch(h.el('recovery-warnings').textContent, /101 overdue/);
+  assert.equal(h.maximumActive(), 1);
+  console.log('Pure-time recovery warnings: all pages, exact metadata/store fence, bounded retry, unavailable clearing and escaped text passed');
+}
+
 (async () => {
   if (process.argv[2] === 'expanded-unchanged') return testExpandedDetailsUnchanged();
   if (process.argv[2] === 'expanded-unrelated') return testExpandedDetailsUnrelatedAddition();
+  if (process.argv[2] === 'recovery-warnings') return testRecoveryWarnings();
   assert.equal(process.argv.length, 2, 'Unknown focused DOM scenario');
   testLegacy(); // Absent body mode remains legacy.
   testLegacy('legacy');
@@ -475,4 +627,5 @@ async function testExpandedDetailsUnrelatedAddition() {
   await testServiceIndex();
   await testExpandedDetailsUnchanged();
   await testExpandedDetailsUnrelatedAddition();
+  await testRecoveryWarnings();
 })().catch(error => {console.error(error); process.exitCode = 1;});

@@ -15,7 +15,7 @@ from starlette.routing import Mount
 from adaptive_planning.admin import load_service_token
 from adaptive_planning.config import Config, DEFAULT_STALE_SECONDS, RequestBoundary, http_allowlist
 
-from adaptive_planning import attempts, checkpoints, plans, resources, reviews
+from adaptive_planning import attempts, checkpoints, plans, recovery, resources, reviews
 from adaptive_planning.ownership import command_relay, require_kind_capabilities, require_orchestrator
 from adaptive_planning.store import Store
 from adaptive_planning.types import (
@@ -51,6 +51,9 @@ HANDLERS: dict[str, Callable[[sqlite3.Connection, Command], MutationReceipt]] = 
     "reserve_verification": reviews.reserve_verification,
     "release_resource_use": reviews.release_resource_use,
     "reopen_attempt": attempts.reopen_attempt,
+    "sweep_stale": recovery.sweep_stale,
+    "resolve_attempt": recovery.resolve_attempt,
+    "append_late_evidence": recovery.append_late_evidence,
 }
 
 
@@ -93,7 +96,7 @@ class PlanningService:
                 require_orchestrator(db, command)
             replayed = plans.replay_request(db, command)
             if replayed is not None:
-                return replayed
+                return recovery.replacement_replay(db, command, replayed)
             receipt = HANDLERS[command.kind](db, command)
         except DomainError as error:
             if error.current_metadata is None and error.code in ("stale", "conflict") and command.plan_id:
@@ -142,6 +145,10 @@ class PlanningService:
     ) -> CoordinationPage:
         return self._run_read(  # type: ignore[return-value]
             lambda db: plans.read_coordination_page(db, plan_id, after, limit))
+
+    def read_recovery_warnings(self, plan_id: PlanId) -> dict:
+        return self._run_read(  # type: ignore[return-value]
+            lambda db: recovery.recovery_warnings(db, plan_id, self._clock(), self._stale_seconds))
 
 
 def build_app(config: Config) -> Starlette:

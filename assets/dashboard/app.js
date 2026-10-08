@@ -1148,7 +1148,8 @@
       if (!items.length) list.appendChild(textElement('p', 'empty-message', 'No coordination records.'));
       const recovery = [coord.store_hold ? 'Store hold active.' : 'No store hold.'];
       if (coord.restore_cutoff) recovery.push(`Restored backup cutoff: ${coord.restore_cutoff}.`);
-      if (items.some(item => item.kind === 'attempt' && (item.value.state === 'stale' || item.value.recovery_required))) {
+      if (items.some(item => item.kind === 'attempt' && (item.value.state === 'stale' ||
+          (['assigned', 'active', 'submitted'].includes(item.value.state) && item.value.recovery_required)))) {
         recovery.push('Stale attempts require recovery.');
       }
       if (coord.has_unresolved_uses) recovery.push('Outstanding reservations require host work reconciliation.');
@@ -1189,17 +1190,115 @@
       return error;
     }
 
+    function awareMicros(value) {
+      if (typeof value !== 'string') return null;
+      const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+      if (!match) return null;
+      const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+      const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+      const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+      const zone = match[8];
+      if (year < 1 || month < 1 || month > 12 || day < 1 || day > days[month - 1] ||
+          hour > 23 || minute > 59 || second > 59 ||
+          (zone !== 'Z' && (Number(zone.slice(1, 3)) > 23 || Number(zone.slice(4, 6)) > 59))) return null;
+      const millis = Date.parse(`${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}${zone}`);
+      if (!Number.isSafeInteger(millis)) return null;
+      return BigInt(millis) * 1000n + BigInt((match[7] || '').padEnd(6, '0'));
+    }
+
+    function renderServiceWarnings(value) {
+      const region = document.getElementById('recovery-warnings');
+      if (!region) return;
+      region.dataset.status = value === null ? 'unavailable' : 'current';
+      region.dataset.observedAt = value === null ? '' : value.observed_at;
+      if (value === null) {
+        setText(region, 'Recorded inactivity warnings unavailable.');
+        return;
+      }
+      const overdue = value.overdue;
+      const unable = value.unassessable_activity;
+      const text = overdue.length ? `${overdue.length} overdue recorded inactivity observations: ` +
+        overdue.map(item => `${item.attempt_id} (${item.state})`).join(', ') + '.' : 'No overdue recorded inactivity.';
+      setText(region, `${text} Observed at ${value.observed_at}; policy ${value.threshold_seconds} seconds.` +
+        (unable.length ? ` Unable to assess recorded activity: ${unable.map(item => item.attempt_id).join(', ')}.` : '') +
+        ' These observations require an owner decision and do not establish that host work failed or stopped.');
+    }
+
+    function validateServiceWarnings(value, view, items) {
+      const object = item => item !== null && typeof item === 'object' && !Array.isArray(item);
+      const keys = (item, expected) => object(item) && Object.keys(item).length === expected.length &&
+        expected.every(key => Object.prototype.hasOwnProperty.call(item, key));
+      const metadataKeys = ['epoch', 'plan_id', 'generation', 'revision', 'ownership_version', 'dashboard_url'];
+      if (!keys(value, ['metadata', 'store_sequence', 'observed_at', 'threshold_seconds', 'overdue', 'unassessable_activity']) ||
+          !keys(value.metadata, metadataKeys) || !Number.isSafeInteger(value.store_sequence) || value.store_sequence < 0 ||
+          !Number.isSafeInteger(value.threshold_seconds) || value.threshold_seconds < 1 ||
+          !Number.isSafeInteger(value.metadata.revision) || value.metadata.revision < 1 ||
+          !Number.isSafeInteger(value.metadata.ownership_version) || value.metadata.ownership_version < 1 ||
+          !['epoch', 'plan_id', 'generation', 'dashboard_url'].every(key => typeof value.metadata[key] === 'string' && value.metadata[key]) ||
+          !Array.isArray(value.overdue) || !Array.isArray(value.unassessable_activity)) throw new Error('Invalid recovery advisory');
+      const observed = awareMicros(value.observed_at);
+      if (observed === null) throw new Error('Invalid recovery observation time');
+      if (metadataKeys.some(key => value.metadata[key] !== view.metadata[key]) ||
+          value.store_sequence !== view.coordination.store_sequence) throw cursorConflict();
+      const attempts = new Map(), expected = {overdue: new Set(), unassessable_activity: new Set()};
+      for (const item of items.filter(item => item.kind === 'attempt')) {
+        const current = item.value;
+        if (typeof current.attempt_id !== 'string' || !current.attempt_id || attempts.has(current.attempt_id) ||
+            !Number.isSafeInteger(current.version) || current.version < 1) throw new Error('Invalid current attempt');
+        attempts.set(current.attempt_id, current);
+        if (!['assigned', 'active', 'submitted'].includes(current.state)) continue;
+        const activity = awareMicros(current.last_activity);
+        if (activity === null || activity > observed) expected.unassessable_activity.add(current.attempt_id);
+        else if (observed - activity >= BigInt(value.threshold_seconds) * 1000000n) expected.overdue.add(current.attempt_id);
+      }
+      const seen = new Set();
+      // The canonical DTO can display started_at for missing activity. Exact service-observed
+      // unassessable membership is authoritative; that display fallback never proves freshness.
+      for (const category of ['unassessable_activity', 'overdue']) {
+        for (const item of value[category]) {
+          if (!keys(item, ['attempt_id', 'version', 'state', 'last_activity']) ||
+              typeof item.attempt_id !== 'string' || !item.attempt_id ||
+              !Number.isSafeInteger(item.version) || item.version < 1 ||
+              !['assigned', 'active', 'submitted'].includes(item.state) ||
+              !(item.last_activity === null || typeof item.last_activity === 'string')) throw new Error('Invalid recovery attempt');
+          const current = attempts.get(item.attempt_id);
+          if (seen.has(item.attempt_id) || !current || item.version !== current.version || item.state !== current.state ||
+              item.last_activity !== current.last_activity) throw cursorConflict();
+          if (category === 'unassessable_activity') expected.overdue.delete(item.attempt_id);
+          else if (!expected.overdue.has(item.attempt_id)) throw cursorConflict();
+          seen.add(item.attempt_id);
+        }
+        if (category === 'unassessable_activity') {
+          if ([...expected.unassessable_activity].some(identity => !seen.has(identity))) throw cursorConflict();
+        } else if (value.overdue.length !== expected.overdue.size) throw cursorConflict();
+      }
+      return value;
+    }
+
+    async function readServiceWarnings(view, items) {
+      if (!bodyData.recoveryWarningsUrl) return null;
+      try {
+        return validateServiceWarnings(await fetchPublic(bodyData.recoveryWarningsUrl), view, items);
+      } catch (error) {
+        if (error.code === 'conflict') throw error;
+        return null;
+      }
+    }
+
     let polling = false;
     let serviceNeedsFullRead = true;
     let serviceEvents = [];
     let serviceSequence = 0;
     let serviceIdentity = null;
+    let serviceWarningPublication = null;
 
     async function readServicePublication() {
       const view = await fetchPublic(bodyData.planUrl);
       const plan = serviceSnapshot(view);
       if (view.plan_id !== bodyData.planId) throw new Error('Unexpected public plan identity');
       const identity = JSON.stringify([view.metadata.epoch, view.plan_id, view.metadata.generation]);
+      const warningPublication = JSON.stringify([view.metadata, view.coordination.store_sequence]);
+      if (warningPublication !== serviceWarningPublication) renderServiceWarnings(null);
       const full = serviceNeedsFullRead || identity !== serviceIdentity || view.coordination.store_sequence < serviceSequence;
       const items = [], cursors = new Set();
       let cursor = null;
@@ -1236,6 +1335,8 @@
         }
       } while (page.events.length === 100);
 
+      const warnings = await readServiceWarnings(view, items);
+
       // A final public read fences the independently read pages. A write during
       // the drain causes a restart rather than a mixed view or fabricated freshness.
       const confirmed = await fetchPublic(bodyData.planUrl);
@@ -1244,7 +1345,7 @@
           confirmed.metadata.generation !== view.metadata.generation || confirmed.metadata.revision !== view.metadata.revision ||
           confirmed.metadata.ownership_version !== view.metadata.ownership_version ||
           confirmed.coordination.store_sequence !== view.coordination.store_sequence) throw cursorConflict();
-      return {view, plan, items, events, sequence, identity};
+      return {view, plan, items, events, sequence, identity, warnings, warningPublication};
     }
 
     async function pollService() {
@@ -1257,6 +1358,8 @@
               const state = await readServicePublication();
               renderAcceptedPlan(state.plan, JSON.stringify(state.plan));
               renderServiceState(state.view, state.items, state.events, state.sequence);
+              renderServiceWarnings(state.warnings);
+              serviceWarningPublication = state.warningPublication;
               serviceEvents = state.events;
               serviceSequence = state.sequence;
               serviceIdentity = state.identity;
@@ -1272,6 +1375,7 @@
             setTransportStatus('connected');
             break;
           } catch (error) {
+            renderServiceWarnings(null);
             serviceNeedsFullRead = true;
             if (error.code === 'conflict' && attempt === 0) continue;
             availabilityWarning = true;

@@ -334,8 +334,9 @@ class TestRevisionsAndRetries(PlanServiceTestCase):
                 self.assertEqual(ctx.exception.code, "forbidden")
         self.assertEqual(dump(self.f.store), before_dump)
 
-    def test_only_planning_mutations_are_enabled(self):
-        command = self.f.command("sweep_stale", {}, receipt=self.p)
+    def test_future_store_hold_command_remains_disabled(self):
+        command = self.f.command("resolve_store_hold", {"backup_cutoff": "not-restored", "inventory_complete": True,
+            "absent_work_inventory": (), "resource_resolutions": (), "reason": "future command remains disabled"}, receipt=self.p)
         before = counts(self.f.store)
         with self.assertRaises(DomainError) as ctx:
             self.f.service.execute(command)

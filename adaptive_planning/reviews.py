@@ -334,6 +334,8 @@ def reserve_verification(connection: sqlite3.Connection, command: Command) -> Mu
     _store_hold(connection)
     target = _resolve_review_target(connection, plan, command.payload["step_id"])
     _assert_target(command, target)
+    if target.result_version is None:
+        attempts.require_fresh_activity(target.data)
     verifier = command.payload["verifier"]
     checkpoints._text(verifier, "Verifier label")
     if verifier == target.row[2]:
