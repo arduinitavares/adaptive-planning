@@ -7,12 +7,13 @@
   <title>Live Plan</title>
   <link rel="stylesheet" href="/style.css">
 </head>
-<body>
+<body data-mode="legacy">
   <div class="app-container">
     <header class="app-header" role="banner">
       <div class="header-top">
         <div class="header-brand">
           <span class="brand-title">LIVE PLAN</span>
+          <a id="plan-index-link" href="/" hidden>All plans</a>
           <div id="conn-pill" class="status-pill status-pill--connecting" role="status" aria-live="polite">
             <span class="pill-dot" aria-hidden="true"></span>
             <span id="conn-label">Connecting…</span>
@@ -49,6 +50,7 @@
           <span class="meta-label">Task ID:</span>
           <code id="task-id-val" class="task-id-code"></code>
         </div>
+        <p id="published-state" class="service-published" hidden></p>
       </div>
 
       <div id="reconnect-banner" class="banner banner--warning" hidden role="alert">
@@ -137,6 +139,22 @@
         </section>
       </aside>
     </main>
+    <section id="service-section" class="panel service-section" hidden aria-labelledby="coordination-title">
+      <div class="panel-header"><h2 id="coordination-title" class="panel-title">Committed coordination</h2></div>
+      <div class="service-body">
+        <p>Read-only view. Host edits are not controlled by this service.</p>
+        <p id="coordination-summary"></p>
+        <div id="coordination-list" class="coordination-list"></div>
+        <h3>Recovery (read-only descriptions)</h3>
+        <p id="recovery-state"></p>
+        <p>Stale attempts require owner confirmation, replacement, rejection or release after host work is checked.
+          Reservations need explicit stopped or isolated evidence. Reassessment and invalidation holds require
+          owner decisions and evidence. A restored store requires host inventory and resource reconciliation.</p>
+        <h3>Published activity and evidence</h3>
+        <p id="events-summary"></p>
+        <ol id="service-events" class="service-events"></ol>
+      </div>
+    </section>
   </div>
 
   <script src="/app.js"></script>

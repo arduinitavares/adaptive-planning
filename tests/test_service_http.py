@@ -872,8 +872,10 @@ class TestProductionEntry(unittest.TestCase):
             for path in ("/", "/?token=" + OTHER_TOKEN):
                 status, payload = wire("GET", path, host)
                 self.assertEqual(status, 200)
-                public = json.loads(payload)
-                self.assertEqual(public["dashboard_url"], config.base_url + "/")
+                self.assertTrue(payload.startswith(b"<!DOCTYPE html>"))
+                self.assertIn(b'data-mode="service"', payload)
+                self.assertIn(b'data-plans-url="/api/plans"', payload)
+                self.assertIn(b'<script src="/app.js"></script>', payload)
                 self.assertNotIn(SYNTHETIC_TOKEN.encode(), payload)
                 self.assertNotIn(OTHER_TOKEN.encode(), payload)
             status, payload = wire("POST", "/mcp?token=" + OTHER_TOKEN, host, auth,

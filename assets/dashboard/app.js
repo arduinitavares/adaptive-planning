@@ -1,8 +1,7 @@
 /**
  * Live Plan Dashboard Application Script
- * Local-only, zero dependencies. Connects exclusively to SSE endpoint /events
- * and renders reactive dependency DAG, verification evidence, retired steps,
- * and revision history.
+ * Local-only, zero dependencies. Legacy mode consumes SSE /events; service
+ * mode polls committed public projections without persisting browser progress.
  */
 
 (function (root, factory) {
@@ -137,8 +136,26 @@
     return { accept: false, plan, rawText, clearAvailability: true, consistencyWarning: true, reason: 'unknown_state' };
   }
 
+  // Service snapshots are renderer-compatible, even when multiple active attempts
+  // prevent a strict legacy publication. Coordination may change at the same revision.
+  function serviceSnapshot(view) {
+    if (!view || !view.metadata || !view.coordination || !view.draft ||
+        typeof view.plan_id !== 'string' || view.metadata.plan_id !== view.plan_id ||
+        typeof view.metadata.epoch !== 'string' || typeof view.metadata.generation !== 'string' ||
+        !Number.isSafeInteger(view.coordination.store_sequence) || view.coordination.store_sequence < 0 ||
+        !renderablePlan(view.legacy_snapshot) || view.legacy_snapshot.schemaVersion !== 2 ||
+        view.legacy_snapshot.taskId !== view.plan_id || view.legacy_snapshot.revision !== view.metadata.revision ||
+        view.legacy_snapshot.generation !== view.metadata.generation || view.legacy_snapshot.status !== view.status ||
+        view.legacy_snapshot.updatedAt !== view.published_at) {
+      throw new Error('Invalid public plan projection');
+    }
+    return view.legacy_snapshot;
+  }
+
   // If running in browser environment, initialize UI logic
   if (typeof document !== 'undefined') {
+    const bodyData = document.body ? document.body.dataset : {};
+    const serviceMode = bodyData.mode === 'service';
     // DOM Elements
     const connPill = document.getElementById('conn-pill');
     const connLabel = document.getElementById('conn-label');
@@ -1000,11 +1017,14 @@
         return;
       }
 
-      // Accepted update
-      const identityChanged = currentPlan && (currentPlan.taskId !== decision.plan.taskId ||
-        (currentPlan.schemaVersion === 2 && decision.plan.generation !== currentPlan.generation));
+      renderAcceptedPlan(decision.plan, rawText);
+    }
+
+    function renderAcceptedPlan(plan, rawText) {
+      const identityChanged = currentPlan && (currentPlan.taskId !== plan.taskId ||
+        (currentPlan.schemaVersion === 2 && plan.generation !== currentPlan.generation));
       if (identityChanged) selectedStepId = null;
-      currentPlan = decision.plan;
+      currentPlan = plan;
       lastRawText = rawText;
 
       renderHeader(currentPlan);
@@ -1030,6 +1050,215 @@
       renderGraph(currentPlan);
       renderDetails();
       renderHistory(currentPlan);
+    }
+
+    function textElement(tag, className, text) {
+      const node = document.createElement(tag);
+      node.className = className;
+      setText(node, text);
+      return node;
+    }
+
+    function renderServiceIndex(views) {
+      const list = document.getElementById('plan-list');
+      list.textContent = '';
+      for (const view of views) {
+        const card = textElement('article', 'plan-card', '');
+        card.dataset.planId = view.plan_id;
+        const heading = textElement('h2', '', '');
+        const link = textElement('a', '', view.draft.objective);
+        link.setAttribute('href', '/plans/' + encodeURIComponent(view.plan_id));
+        heading.appendChild(link);
+        card.appendChild(heading);
+        card.appendChild(textElement('p', 'plan-card-meta', `${view.status} · Rev #${view.metadata.revision}`));
+        const published = textElement('p', '', 'Published: ');
+        const time = textElement('time', '', view.published_at);
+        time.setAttribute('datetime', view.published_at);
+        published.appendChild(time);
+        card.appendChild(published);
+        card.appendChild(textElement('code', 'task-id-code', view.plan_id));
+        if (view.draft.workflow !== null && view.draft.workflow !== undefined) {
+          card.appendChild(textElement('p', 'workflow-info', 'Workflow: ' +
+            Object.entries(view.draft.workflow).map(([key, value]) => `${key}: ${value}`).join('; ')));
+        }
+        list.appendChild(card);
+      }
+      if (!views.length) list.appendChild(textElement('p', 'empty-message', 'No committed plans.'));
+    }
+
+    function coordinationLabel(item) {
+      const value = item.value;
+      if (item.kind === 'attempt') return `Step ${value.step_id} · ${value.state} · ${value.assignee} · ${value.attempt_id}`;
+      if (item.kind === 'reservation') return `Reservation ${value.use_id} · ${value.writer_active ? 'writer active' : 'writer inactive'} · ${value.unresolved ? 'unresolved' : 'resolved'}`;
+      if (item.kind === 'hold') return `Hold ${value.hold_id} · ${value.kind} · ${value.step_id || 'whole plan'}`;
+      if (item.kind === 'review') return `Review ${value.step_id} · ${value.review.verdict} · ${value.review.reviewer}`;
+      return `Invalidation ${value.invalidation_id} · producer ${value.producer_step_id}`;
+    }
+
+    function renderServiceState(view, items, events, sequence) {
+      document.getElementById('service-section').hidden = false;
+      document.getElementById('plan-index-link').hidden = false;
+      const published = document.getElementById('published-state');
+      published.hidden = false;
+      published.dataset.revision = String(view.metadata.revision);
+      published.dataset.storeSequence = String(view.coordination.store_sequence);
+      published.dataset.eventSequence = String(sequence);
+      setText(published, `Last published state: Rev #${view.metadata.revision} · ${view.published_at}`);
+      const coord = view.coordination;
+      setText(document.getElementById('coordination-summary'),
+        `Store sequence ${coord.store_sequence} · owner ${coord.ownership_actor} (version ${coord.ownership_version}). ` +
+        Object.entries(coord.total_counts).map(([kind, count]) => `${kind}: ${count}`).join(' · ') +
+        ` · Accepted result versions: ${JSON.stringify(coord.result_versions)}`);
+      const list = document.getElementById('coordination-list');
+      list.textContent = '';
+      for (const item of items) {
+        const details = textElement('details', 'coordination-item coordination-item--' + item.kind, '');
+        details.appendChild(textElement('summary', '', coordinationLabel(item)));
+        details.appendChild(textElement('pre', '', JSON.stringify(item.value, null, 2)));
+        list.appendChild(details);
+      }
+      if (!items.length) list.appendChild(textElement('p', 'empty-message', 'No coordination records.'));
+      const recovery = [coord.store_hold ? 'Store hold active.' : 'No store hold.'];
+      if (coord.restore_cutoff) recovery.push(`Restored backup cutoff: ${coord.restore_cutoff}.`);
+      if (items.some(item => item.kind === 'attempt' && (item.value.state === 'stale' || item.value.recovery_required))) {
+        recovery.push('Stale attempts require recovery.');
+      }
+      if (coord.has_unresolved_uses) recovery.push('Outstanding reservations require host work reconciliation.');
+      if (coord.has_plan_holds) recovery.push('Plan holds require explicit resolution.');
+      setText(document.getElementById('recovery-state'), recovery.join(' '));
+      setText(document.getElementById('events-summary'),
+        `${events.length} committed events · last plan event sequence ${sequence}. All pages consumed for this published state.`);
+      const eventList = document.getElementById('service-events');
+      eventList.textContent = '';
+      for (const event of events) {
+        const li = textElement('li', 'event-item', '');
+        const details = textElement('details', '', '');
+        details.appendChild(textElement('summary', '',
+          `#${event.sequence} ${event.kind} · ${event.published_at} · actor ${event.actor}` +
+          (event.origin_worker === null ? '' : ` · origin ${event.origin_worker}`) +
+          (event.relay === null ? '' : ` · relay ${event.relay}`)));
+        details.appendChild(textElement('pre', '', JSON.stringify(event.payload, null, 2)));
+        li.appendChild(details);
+        eventList.appendChild(li);
+      }
+    }
+
+    async function fetchPublic(url) {
+      const response = await fetch(url, {cache: 'no-store', credentials: 'same-origin'});
+      const value = await response.json();
+      if (!response.ok) {
+        const error = new Error('Public read unavailable');
+        error.code = value && value.error && value.error.code;
+        throw error;
+      }
+      return value;
+    }
+
+    function cursorConflict() {
+      const error = new Error('Committed publication changed during paging');
+      error.code = 'conflict';
+      return error;
+    }
+
+    let polling = false;
+    let serviceNeedsFullRead = true;
+    let serviceEvents = [];
+    let serviceSequence = 0;
+    let serviceIdentity = null;
+
+    async function readServicePublication() {
+      const view = await fetchPublic(bodyData.planUrl);
+      const plan = serviceSnapshot(view);
+      if (view.plan_id !== bodyData.planId) throw new Error('Unexpected public plan identity');
+      const identity = JSON.stringify([view.metadata.epoch, view.plan_id, view.metadata.generation]);
+      const full = serviceNeedsFullRead || identity !== serviceIdentity || view.coordination.store_sequence < serviceSequence;
+      const items = [], cursors = new Set();
+      let cursor = null;
+      do {
+        const url = bodyData.coordinationUrl + '?' + (cursor === null ? '' : 'after=' + encodeURIComponent(cursor) + '&') + 'limit=100';
+        const page = await fetchPublic(url);
+        if (page.plan_id !== view.plan_id || page.revision !== view.metadata.revision ||
+            page.store_sequence !== view.coordination.store_sequence) throw cursorConflict();
+        if (!Array.isArray(page.items) || page.items.length > 100 ||
+            !page.items.every(item => item && ['attempt', 'reservation', 'hold', 'review', 'invalidation'].includes(item.kind) && item.value)) {
+          throw new Error('Invalid coordination page');
+        }
+        items.push(...page.items);
+        cursor = page.next_cursor;
+        if (cursor !== null && (typeof cursor !== 'string' || !cursor || cursors.has(cursor))) {
+          throw new Error('Coordination cursor made no progress');
+        }
+        if (cursor !== null) cursors.add(cursor);
+      } while (cursor !== null);
+
+      const events = full ? [] : serviceEvents.slice();
+      let sequence = full ? 0 : serviceSequence;
+      let page;
+      do {
+        page = await fetchPublic(bodyData.eventsUrl + '?after=' + sequence + '&limit=100');
+        if (!Array.isArray(page.events) || page.events.length > 100) throw new Error('Invalid event page');
+        for (const event of page.events) {
+          if (!event || !Number.isSafeInteger(event.sequence) || event.sequence <= sequence || event.plan_id !== view.plan_id) {
+            throw new Error('Event page made no progress');
+          }
+          if (event.sequence > view.coordination.store_sequence) throw cursorConflict();
+          events.push(event);
+          sequence = event.sequence;
+        }
+      } while (page.events.length === 100);
+
+      // A final public read fences the independently read pages. A write during
+      // the drain causes a restart rather than a mixed view or fabricated freshness.
+      const confirmed = await fetchPublic(bodyData.planUrl);
+      serviceSnapshot(confirmed);
+      if (confirmed.plan_id !== view.plan_id || confirmed.metadata.epoch !== view.metadata.epoch ||
+          confirmed.metadata.generation !== view.metadata.generation || confirmed.metadata.revision !== view.metadata.revision ||
+          confirmed.metadata.ownership_version !== view.metadata.ownership_version ||
+          confirmed.coordination.store_sequence !== view.coordination.store_sequence) throw cursorConflict();
+      return {view, plan, items, events, sequence, identity};
+    }
+
+    async function pollService() {
+      if (polling) return;
+      polling = true;
+      try {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            if (bodyData.planId) {
+              const state = await readServicePublication();
+              renderAcceptedPlan(state.plan, JSON.stringify(state.plan));
+              renderServiceState(state.view, state.items, state.events, state.sequence);
+              serviceEvents = state.events;
+              serviceSequence = state.sequence;
+              serviceIdentity = state.identity;
+            } else {
+              const value = await fetchPublic(bodyData.plansUrl);
+              if (!value || !Array.isArray(value.plans)) throw new Error('Invalid public plan index');
+              value.plans.forEach(serviceSnapshot);
+              renderServiceIndex(value.plans);
+            }
+            serviceNeedsFullRead = false;
+            availabilityWarning = false;
+            consistencyWarning = false;
+            setTransportStatus('connected');
+            break;
+          } catch (error) {
+            serviceNeedsFullRead = true;
+            if (error.code === 'conflict' && attempt === 0) continue;
+            availabilityWarning = true;
+            setTransportStatus('offline');
+            break;
+          }
+        }
+      } finally {
+        polling = false;
+      }
+    }
+
+    function initService() {
+      setTransportStatus('connecting');
+      pollService();
+      setInterval(pollService, 1000);
     }
 
     function initEvents() {
@@ -1070,10 +1299,11 @@
       new ResizeObserver(() => { if (currentPlan) renderGraph(currentPlan); }).observe(containerEl);
     }
 
+    const initialize = serviceMode ? initService : initEvents;
     if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', initEvents);
+      document.addEventListener('DOMContentLoaded', initialize);
     } else {
-      initEvents();
+      initialize();
     }
   }
 

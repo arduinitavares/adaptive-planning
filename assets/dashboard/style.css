@@ -907,6 +907,22 @@ body {
 .node-id { overflow-wrap: anywhere; }
 .panel-header { gap: 12px; flex-wrap: wrap; }
 
+/* Shared service publications reuse the graph and add durable coordination. */
+.plan-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: 16px; }
+.plan-card { padding: 20px; background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); overflow-wrap: anywhere; }
+.plan-card h2 { font-size: 20px; margin-bottom: 12px; }
+.plan-card a, #plan-index-link { color: var(--color-selection); }
+.plan-card-meta { font-weight: 600; }
+.workflow-info, .service-published { color: var(--ink-secondary); font-size: 12px; overflow-wrap: anywhere; }
+.service-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.coordination-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 12px; }
+.coordination-item { padding: 12px; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); overflow-wrap: anywhere; }
+.coordination-item summary, .event-item summary { cursor: pointer; font-weight: 600; }
+.coordination-item pre, .event-item pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.6 var(--font-mono); margin-top: 8px; }
+.coordination-item--hold { border-color: var(--color-blocked-border); background: var(--color-blocked-bg); }
+.service-events { list-style: none; display: flex; flex-direction: column; gap: 12px; max-height: 400px; overflow-y: auto; }
+.event-item { padding: 10px; background: var(--bg-surface-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); overflow-wrap: anywhere; }
+
 /* Respect user's motion preferences */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

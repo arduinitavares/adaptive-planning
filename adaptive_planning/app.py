@@ -10,7 +10,7 @@ from typing import Callable
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
-from starlette.routing import Mount, Route
+from starlette.routing import Mount
 
 from adaptive_planning.admin import load_service_token
 from adaptive_planning.config import Config, RequestBoundary, http_allowlist
@@ -123,12 +123,13 @@ class PlanningService:
 
 
 def build_app(config: Config) -> Starlette:
-    """Compose one service authority, its future dashboard interface and the official MCP app."""
+    """Compose one service authority, its read-only dashboard and the official MCP app."""
     # Credential loading precedes even Store construction: ordinary startup never initializes it.
     token = load_service_token(config)
     clock = lambda: datetime.now(timezone.utc)
     service = PlanningService(Store(config.data_dir / "planning.sqlite", clock), base_url=config.base_url, clock=clock)
     from adaptive_planning.transport import MCPHttpErrors, MCPServerDiagnostics, build_mcp, mcp_server_diagnostics
+    from adaptive_planning.dashboard import dashboard_routes
     server = build_mcp(service)
     allowed_host, allowed_origin = http_allowlist(config)
     mcp_app = server.streamable_http_app(
@@ -145,16 +146,13 @@ def build_app(config: Config) -> Starlette:
             async with server.session_manager.run():
                 yield
 
-    async def dashboard_placeholder(request):
-        return JSONResponse(plans.to_jsonable(service.read_service_info()), headers={"Cache-Control": "no-store"})
-
     async def public_server_error(request, error):
         # Starlette can answer before re-raising to the outer RequestBoundary. Ignore
         # exception text and use the boundary's same constant public failure shape.
         return JSONResponse({"error": {"code": "internal_error", "message": "The request could not be completed."}},
                             status_code=500, headers={"Cache-Control": "no-store"})
 
-    app = Starlette(routes=[Route("/", dashboard_placeholder, methods=["GET", "HEAD"]),
+    app = Starlette(routes=[*dashboard_routes(service),
                             Mount("/", app=MCPHttpErrors(MCPServerDiagnostics(mcp_app)))], lifespan=lifespan,
                     exception_handlers={500: public_server_error})
     app.state.service = service
