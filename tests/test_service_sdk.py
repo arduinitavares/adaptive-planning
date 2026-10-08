@@ -2,7 +2,7 @@
 
 import asyncio
 import copy
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, replace
 import errno
 import json
@@ -367,6 +367,46 @@ async def running_service(app, sock):
             await shutdown_probe_server(server, task)
         finally:
             sock.close()
+
+
+@contextmanager
+def _private_sdk_client_logs(captured):
+    """Keep client wire records in the supplied memory capture for this test only.
+
+    Delegate to the previous public record factory without changing the record.
+    Before dispatch, filter its actual handler path, including handlers on dotted
+    loggers without materialized ancestors and handlers added during the test.
+    Preserve every existing filter and restore the previous factory on exit.
+    """
+    class PrivateClientRecords(logging.Filter):
+        def filter(self, record):
+            return record.name != "mcp.client" and not record.name.startswith("mcp.client.")
+
+    boundary = PrivateClientRecords()
+    previous_factory = logging.getLogRecordFactory()
+    installed = set()
+
+    def private_factory(*args, **kwargs):
+        record = previous_factory(*args, **kwargs)
+        if not boundary.filter(record):
+            handlers = [logging.lastResort] if logging.lastResort is not None else []
+            logger = logging.getLogger(record.name)
+            while logger is not None:
+                handlers.extend(tuple(logger.handlers))
+                logger = logger.parent if logger.propagate else None
+            for handler in handlers:
+                if handler is not captured and handler not in installed:
+                    handler.addFilter(boundary)
+                    installed.add(handler)
+        return record
+
+    try:
+        logging.setLogRecordFactory(private_factory)
+        yield
+    finally:
+        logging.setLogRecordFactory(previous_factory)
+        for handler in installed:
+            handler.removeFilter(boundary)
 
 
 class TestService(unittest.TestCase):
@@ -806,7 +846,8 @@ class TestService(unittest.TestCase):
                     self.assertEqual({r.path for r in selected}, {"/mcp"})
                     self.assertTrue(all(r.headers.get("authorization") == f"Bearer {SYNTHETIC_TOKEN}" for r in selected))
                 self.assertEqual(len(self.f.service.list_plans()), 2)
-        asyncio.run(exercise())
+        with _private_sdk_client_logs(captured):
+            asyncio.run(exercise())
         with self.assertRaises(OSError):
             socket.create_connection(("127.0.0.1", port), timeout=0.5)
         for line in captured.lines:
