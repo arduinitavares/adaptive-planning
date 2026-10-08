@@ -128,7 +128,7 @@ def build_app(config: Config) -> Starlette:
     token = load_service_token(config)
     clock = lambda: datetime.now(timezone.utc)
     service = PlanningService(Store(config.data_dir / "planning.sqlite", clock), base_url=config.base_url, clock=clock)
-    from adaptive_planning.transport import MCPHttpErrors, build_mcp
+    from adaptive_planning.transport import MCPHttpErrors, MCPServerDiagnostics, build_mcp, mcp_server_diagnostics
     server = build_mcp(service)
     allowed_host, allowed_origin = http_allowlist(config)
     mcp_app = server.streamable_http_app(
@@ -141,8 +141,9 @@ def build_app(config: Config) -> Starlette:
 
     @asynccontextmanager
     async def lifespan(app):
-        async with server.session_manager.run():
-            yield
+        with mcp_server_diagnostics():
+            async with server.session_manager.run():
+                yield
 
     async def dashboard_placeholder(request):
         return JSONResponse(plans.to_jsonable(service.read_service_info()), headers={"Cache-Control": "no-store"})
@@ -154,7 +155,7 @@ def build_app(config: Config) -> Starlette:
                             status_code=500, headers={"Cache-Control": "no-store"})
 
     app = Starlette(routes=[Route("/", dashboard_placeholder, methods=["GET", "HEAD"]),
-                            Mount("/", app=MCPHttpErrors(mcp_app))], lifespan=lifespan,
+                            Mount("/", app=MCPHttpErrors(MCPServerDiagnostics(mcp_app)))], lifespan=lifespan,
                     exception_handlers={500: public_server_error})
     app.state.service = service
     app.state.mcp = server

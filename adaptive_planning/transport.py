@@ -1,8 +1,11 @@
 """Typed semantic tools over the official MCP server and the shared service authority."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import logging
+from threading import RLock
 from typing import Annotated, Any, Literal, TYPE_CHECKING
 
 from mcp import MCPError
@@ -41,6 +44,50 @@ _MESSAGES = {
 }
 _PROTOCOL_MESSAGES = {-32700: "Parse error", -32600: "Invalid request", -32601: "Method not found",
                       -32602: "Invalid request parameters", -32603: "Internal error"}
+_SDK_LOGGER_NAMES = ("mcp.server._streamable_http_modern", "mcp.server.runner")
+_SDK_LOG_SCOPE = ContextVar("planning_sdk_log_scope", default=False)
+_SDK_LOG_LOCK = RLock()
+_SDK_LOG_USERS = 0
+
+
+class _OwnedSdkLogs(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # These pinned server channels can log peer notification names before
+        # middleware. Suppress their diagnostics only in our owned context.
+        return not _SDK_LOG_SCOPE.get()
+
+
+_SDK_LOG_FILTER = _OwnedSdkLogs()
+
+
+@contextmanager
+def mcp_server_diagnostics():
+    """Contain SDK diagnostics across owned requests, background tasks and lifespan."""
+    global _SDK_LOG_USERS
+    with _SDK_LOG_LOCK:
+        if _SDK_LOG_USERS == 0:
+            for name in _SDK_LOGGER_NAMES:
+                logging.getLogger(name).addFilter(_SDK_LOG_FILTER)
+        _SDK_LOG_USERS += 1
+    token = _SDK_LOG_SCOPE.set(True)
+    try:
+        yield
+    finally:
+        _SDK_LOG_SCOPE.reset(token)
+        with _SDK_LOG_LOCK:
+            _SDK_LOG_USERS -= 1
+            if _SDK_LOG_USERS == 0:
+                for name in _SDK_LOGGER_NAMES:
+                    logging.getLogger(name).removeFilter(_SDK_LOG_FILTER)
+
+
+class MCPServerDiagnostics:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        with mcp_server_diagnostics():
+            await self.app(scope, receive, send)
 
 
 class MCPHttpErrors:

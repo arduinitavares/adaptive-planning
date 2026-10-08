@@ -542,6 +542,165 @@ class TestService(unittest.TestCase):
         self.assertNotIn(SYNTHETIC_TOKEN[:24], text)
         self.assertEqual(self.snapshot(), before)
 
+    def test_idless_notifications_are_secret_free_for_both_protocols(self):
+        from adaptive_planning.app import build_app
+        from adaptive_planning.config import Config
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(sock.close)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(128)
+        port = sock.getsockname()[1]
+        self.assertNotEqual(port, 8790)
+        config = Config(self.f.directory, base_url=f"http://127.0.0.1:{port}")
+        token_path = config.data_dir / "service-token"
+        token_path.write_text(SYNTHETIC_TOKEN)
+        token_path.chmod(0o600)
+        app = build_app(config)
+        captured = CapturedLogs()
+        root = logging.getLogger()
+        old_level = root.level
+        root.addHandler(captured)
+        root.setLevel(logging.DEBUG)
+        self.addCleanup(root.setLevel, old_level)
+        self.addCleanup(root.removeHandler, captured)
+        before = self.snapshot()
+        database_bytes = (self.f.directory / "planning.sqlite").read_bytes()
+
+        async def exercise():
+            initial_tasks = set(asyncio.all_tasks())
+            async with running_service(app, sock):
+                for mode, version in (("auto", "2026-07-28"), ("legacy", "2025-11-25")):
+                    async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {SYNTHETIC_TOKEN}"}) as http_client:
+                        async with Client(streamable_http_client(config.base_url + "/mcp", http_client=http_client), mode=mode) as client:
+                            self.assertEqual(str(client.protocol_version), version)
+                            response = await http_client.post(config.base_url + "/mcp",
+                                headers={"MCP-Protocol-Version": version, "Accept": "application/json, text/event-stream"},
+                                json={"jsonrpc": "2.0", "method": f"{SYNTHETIC_TOKEN}-{mode}",
+                                      "params": {"orchestrator_token": SYNTHETIC_TOKEN}})
+                            self.assertEqual((response.status_code, response.content), (202, b""))
+                            healthy = await client.call_tool("read_service_info", {})
+                            self.assertFalse(healthy.is_error)
+                            self.assertEqual(self.snapshot(), before)
+                            self.assertEqual((self.f.directory / "planning.sqlite").read_bytes(), database_bytes)
+            self.assertFalse([task for task in asyncio.all_tasks() if task not in initial_tasks and not task.done()])
+
+        asyncio.run(exercise())
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual((self.f.directory / "planning.sqlite").read_bytes(), database_bytes)
+        with self.assertRaises(OSError):
+            socket.create_connection(("127.0.0.1", port), timeout=0.5)
+        server_logs = "\n".join(line for line in captured.lines if not line.startswith("mcp.client."))
+        for mode in ("auto", "legacy"):
+            with self.subTest(protocol=mode):
+                self.assertNotIn(f"{SYNTHETIC_TOKEN}-{mode}", server_logs)
+        self.assertNotIn(SYNTHETIC_TOKEN[:24], server_logs)
+
+    def test_notification_log_containment_is_scoped_and_lifecycle_bounded(self):
+        from adaptive_planning.app import build_app
+        from adaptive_planning.config import Config
+        config = Config(self.f.directory, base_url="http://127.0.0.1:9001")
+        token_path = config.data_dir / "service-token"
+        token_path.write_text(SYNTHETIC_TOKEN)
+        token_path.chmod(0o600)
+        captured = CapturedLogs()
+        root = logging.getLogger()
+        old_level = root.level
+        root.addHandler(captured)
+        root.setLevel(logging.DEBUG)
+        self.addCleanup(root.setLevel, old_level)
+        self.addCleanup(root.removeHandler, captured)
+        loggers = [logging.getLogger(name) for name in ("mcp.server._streamable_http_modern", "mcp.server.runner")]
+        for logger in loggers:
+            previous = (logger.level, logger.disabled)
+            self.addCleanup(setattr, logger, "disabled", previous[1])
+            self.addCleanup(logger.setLevel, previous[0])
+            logger.setLevel(logging.DEBUG)
+            logger.disabled = False
+            logger.addHandler(captured)
+            self.addCleanup(logger.removeHandler, captured)
+            marker = logging.Filter()
+            logger.addFilter(marker)
+            self.addCleanup(logger.removeFilter, marker)
+        original = [(tuple(logger.filters), tuple(logger.handlers), logger.level, logger.propagate, logger.disabled)
+                    for logger in loggers]
+
+        def assert_configuration(active):
+            for logger, (filters, handlers, level, propagate, disabled) in zip(loggers, original):
+                self.assertEqual(tuple(logger.handlers), handlers)
+                self.assertEqual((logger.level, logger.propagate, logger.disabled), (level, propagate, disabled))
+                self.assertEqual(tuple(logger.filters[:len(filters)]), filters)
+                self.assertEqual(len(logger.filters), len(filters) + int(active))
+
+        async def exercise():
+            initial_tasks = set(asyncio.all_tasks())
+
+            async def own_lifespan(app, ready, finish):
+                async with app.router.lifespan_context(app):
+                    for logger in loggers:
+                        logger.warning("owned notification %s", SYNTHETIC_TOKEN)
+                    logging.getLogger("mcp.client.probe").warning("client marker %s", SYNTHETIC_TOKEN)
+                    logging.getLogger("unrelated.probe").warning("unrelated marker")
+                    ready.set()
+                    await finish.wait()
+                    for logger in loggers:
+                        logger.warning("owned shutdown %s", SYNTHETIC_TOKEN)
+
+            for cycle in range(3):
+                apps = [build_app(config), build_app(config)]
+                assert_configuration(False)
+                ready = [asyncio.Event(), asyncio.Event()]
+                finish = [asyncio.Event(), asyncio.Event()]
+                tasks = [asyncio.create_task(own_lifespan(app, started, stop))
+                         for app, started, stop in zip(apps, ready, finish)]
+                try:
+                    await asyncio.wait_for(asyncio.gather(*(started.wait() for started in ready)), 5)
+                    assert_configuration(True)
+                    for logger in loggers:
+                        logger.warning("outside service scope cycle %d", cycle)
+                    finish[0].set()
+                    await tasks[0]
+                    assert_configuration(True)
+                    if cycle == 2:
+                        tasks[1].cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await tasks[1]
+                    else:
+                        finish[1].set()
+                        await tasks[1]
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                assert_configuration(False)
+                for logger in loggers:
+                    logger.warning("after service shutdown cycle %d", cycle)
+
+            app = build_app(config)
+
+            @asynccontextmanager
+            async def failed_startup():
+                for logger in loggers:
+                    logger.warning("owned startup %s", SYNTHETIC_TOKEN)
+                raise RuntimeError("Synthetic startup failure")
+                yield
+
+            with patch.object(app.state.mcp.session_manager, "run", failed_startup):
+                with self.assertRaisesRegex(RuntimeError, "Synthetic startup failure"):
+                    async with app.router.lifespan_context(app):
+                        self.fail("Startup unexpectedly succeeded")
+            assert_configuration(False)
+            self.assertFalse([task for task in asyncio.all_tasks() if task not in initial_tasks and not task.done()])
+
+        asyncio.run(exercise())
+        for logger in loggers:
+            lines = [line for line in captured.lines if line.startswith(logger.name + ":")]
+            self.assertTrue(any("outside service scope cycle" in line for line in lines))
+            self.assertTrue(any("after service shutdown cycle" in line for line in lines))
+            self.assertFalse(any(SYNTHETIC_TOKEN in line for line in lines))
+        self.assertTrue(any("mcp.client.probe: client marker " + SYNTHETIC_TOKEN in line for line in captured.lines))
+        self.assertTrue(any("unrelated.probe: unrelated marker" in line for line in captured.lines))
+
     def test_shared_app_two_protocols_wire_errors_and_lifecycle(self):
         from adaptive_planning.app import build_app
         from adaptive_planning.config import Config
