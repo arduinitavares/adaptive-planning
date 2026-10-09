@@ -464,6 +464,12 @@ accepted artifact/result; required revalidation needs a passing original review
 recorded after invalidation. Resolving the producer does not automatically clear
 consumer holds, redispatch accepted work, grant authorization or renew scope.
 
+### Legacy authority handoff and transferred plans
+
+Transferred legacy plans use MCP as their only publisher authority. When migrating or importing an existing legacy live plan into the shared service, the legacy publisher must be explicitly stopped beforehand. The service records the original provenance, host ID, source directory, and original task ID.
+
+The database enforces canonical single-import identity via `imports UNIQUE(host_id,source_directory_id,original_task_id)`. The MCP server cannot technically prevent an independently launched legacy publisher process from writing its own JSON files on disk; therefore, handoff is explicit: operators must stop the old legacy publisher, preserve the legacy source file and provenance, import once by canonical identity, and subsequently publish all updates to the transferred plan through MCP only. The service introduces no polling, mirroring, or write-through back to the legacy file.
+
 ### Genuine installed-client and lifecycle evidence remains open
 
 The source test/docs checkpoint may integrate locally only after the

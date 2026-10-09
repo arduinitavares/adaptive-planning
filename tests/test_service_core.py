@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import http.client
 import json
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -143,6 +145,114 @@ class TestServiceCore(unittest.TestCase):
             )
             self.assertEqual(res.returncode, 0, f"CLI stderr: {res.stderr}")
             self.assertIn("live_plan.py", res.stdout)
+
+    def test_legacy_standard_library_cli_and_service_coexist(self):
+        """Standalone CLI serves legacy assets outside checkout without SDK import and checks handoff docs."""
+        script = (ROOT / "scripts" / "live_plan.py").resolve()
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([sys.executable, str(script), "--help"], cwd=directory, capture_output=True, text=True, timeout=10.0)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("publish", result.stdout)
+
+            operations = (ROOT / "docs" / "operations.md").read_text(encoding="utf-8")
+            self.assertIn("Transferred legacy plans use MCP as their only publisher authority", operations)
+            self.assertIn("imports UNIQUE(host_id,source_directory_id,original_task_id)", operations)
+
+            state_dir = Path(directory) / "state"
+            state_dir.mkdir()
+            ready_file = Path(directory) / "ready.json"
+
+            sdk_block_code = (
+                "import sys\n"
+                "blocked = {'mcp', 'starlette', 'uvicorn', 'httpx', 'pydantic'}\n"
+                "class BlockHook:\n"
+                "    def find_spec(self, fullname, path, target=None):\n"
+                "        if fullname.split('.')[0] in blocked:\n"
+                "            raise ImportError(f'Blocked SDK import {fullname}')\n"
+                "        return None\n"
+                "sys.meta_path.insert(0, BlockHook())\n"
+                "for b in list(blocked):\n"
+                "    sys.modules[b] = None\n"
+                "import runpy\n"
+                "sys.argv = [sys.argv[1]] + sys.argv[2:]\n"
+                "runpy.run_path(sys.argv[0], run_name='__main__')\n"
+            )
+
+            cmd = [
+                sys.executable,
+                "-c",
+                sdk_block_code,
+                str(script),
+                "serve",
+                "--state-dir",
+                str(state_dir),
+                "--port",
+                "0",
+                "--ready-file",
+                str(ready_file),
+            ]
+            server_proc = subprocess.Popen(
+                cmd,
+                cwd=directory,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                deadline = time.time() + 10.0
+                ready_data = None
+                while time.time() < deadline:
+                    if ready_file.is_file():
+                        try:
+                            ready_data = json.loads(ready_file.read_text(encoding="utf-8"))
+                            if "port" in ready_data:
+                                break
+                        except Exception:
+                            pass
+                    if server_proc.poll() is not None:
+                        stdout, stderr = server_proc.communicate()
+                        self.fail(f"Legacy server exited prematurely with code {server_proc.returncode}:\n{stderr.decode()}")
+                    time.sleep(0.05)
+
+                self.assertIsNotNone(ready_data, "Server ready file was not written within deadline")
+                port = ready_data["port"]
+                self.assertGreater(port, 0)
+
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5.0)
+                try:
+                    conn.request("GET", "/")
+                    resp = conn.getresponse()
+                    self.assertEqual(resp.status, 200)
+                    body = resp.read()
+                    resp.close()
+                    self.assertIn(b"<!DOCTYPE html>", body)
+
+                    conn.request("GET", "/app.js")
+                    resp = conn.getresponse()
+                    self.assertEqual(resp.status, 200)
+                    body = resp.read()
+                    resp.close()
+                    self.assertIn(b"LivePlan", body)
+
+                    conn.request("GET", "/style.css")
+                    resp = conn.getresponse()
+                    self.assertEqual(resp.status, 200)
+                    body = resp.read()
+                    resp.close()
+                    self.assertIn(b"Live Plan Dashboard Stylesheet", body)
+                finally:
+                    conn.close()
+
+            finally:
+                server_proc.terminate()
+                try:
+                    server_proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    server_proc.kill()
+                    server_proc.wait(timeout=5.0)
+                if server_proc.stdout is not None:
+                    server_proc.stdout.close()
+                if server_proc.stderr is not None:
+                    server_proc.stderr.close()
 
     def test_scope_publication_is_pure(self):
         """prepare_publication does not mutate inputs and injects pure timestamp/generation."""

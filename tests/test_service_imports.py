@@ -24,6 +24,8 @@ from tests.service_fixtures import (
     checkpoint, context, draft, legacy_proposal, make_service, step, workspace,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 def active_legacy_snapshot() -> dict[str, JSONValue]:
     """Test-only helper: copy legacy_proposal(), set first step to in-progress, publish."""
@@ -400,6 +402,71 @@ class TestServiceImports(unittest.TestCase):
         with self.assertRaises(DomainError) as error:
             self.f.service.execute(cmd)
         self.assertEqual(error.exception.code, "held")
+
+    def test_transferred_plan_not_dual_authority(self):
+        """Transferred legacy plans use MCP as only publisher authority; imports unique key enforced."""
+        operations = (ROOT / "docs" / "operations.md").read_text(encoding="utf-8")
+        self.assertIn("Transferred legacy plans use MCP as their only publisher authority", operations)
+        self.assertIn("imports UNIQUE(host_id,source_directory_id,original_task_id)", operations)
+
+        info = self.f.service.read_service_info()
+        source = prepare_publication(
+            legacy_proposal(), None, timestamp="2026-10-06T00:00:00Z",
+            generation="00000000-0000-4000-8000-000000000001", expected_revision=0,
+            expected_generation=None, authorization_note="synthetic legacy authorization",
+            max_file_bytes=10 * 1024 * 1024, max_history=100,
+        )
+        directory_id = self.f.register(workspace("/synthetic/dual-authority-check", 300), self.p)
+        payload = {
+            "host_id": info.host_id,
+            "source_directory_id": directory_id,
+            "source_directory_claim": None,
+            "original_task_id": source["taskId"],
+            "original_snapshot": source,
+            "provenance": DocumentRef("legacy.json", None, None, "v1", None),
+            "writers_stopped": "legacy publisher stopped; MCP is single authority",
+            "known_contexts": {},
+        }
+        cmd = self.f.command("import_plan", payload, key="import-authority-1")
+        receipt = self.f.service.execute(cmd)
+        plan_id = receipt.current_metadata.plan_id
+        orch_token = receipt.private.orchestrator_token
+
+        schema_sql = self.f.store.read(lambda db: db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='imports'"
+        ).fetchone()[0])
+        self.assertIn("UNIQUE (host_id, source_directory_id, original_task_id)", schema_sql)
+
+        # Identical import under new key replays existing plan (no duplicate plan created)
+        retry = self.f.service.execute(self.f.command("import_plan", payload, key="import-authority-retry"))
+        self.assertEqual(retry.current_metadata.plan_id, plan_id)
+        self.assertEqual(retry.private.orchestrator_token, orch_token)
+
+        # Altering source under existing (host_id, source_directory_id, original_task_id) fails closed with conflict
+        changed = copy.deepcopy(payload)
+        changed["original_snapshot"]["objective"] = "conflicting altered source"
+        cmd_conflict = self.f.command("import_plan", changed, key="import-authority-conflict")
+        with self.assertRaises(DomainError) as ctx:
+            self.f.service.execute(cmd_conflict)
+        self.assertEqual(ctx.exception.code, "handoff_conflict")
+
+        source2 = copy.deepcopy(source)
+        source2["taskId"] = "distinct-task-id"
+        payload2 = dict(payload, original_task_id="distinct-task-id", original_snapshot=source2)
+        cmd2 = self.f.command("import_plan", payload2, key="import-authority-2")
+        receipt2 = self.f.service.execute(cmd2)
+        self.assertNotEqual(receipt2.current_metadata.plan_id, plan_id)
+
+        current_draft = self.f.service.read_plan(plan_id).draft
+        new_draft = replace(current_draft, facts=current_draft.facts + ("Transferred plan fact 1",))
+        revise_cmd = self.f.command(
+            "revise_plan",
+            {"draft": new_draft, "reason": "MCP-only publisher authority update", "authorization_change": None, "retire_steps": ()},
+            receipt=receipt,
+            key="revise-mcp-only",
+        )
+        rev_receipt = self.f.service.execute(revise_cmd)
+        self.assertEqual(rev_receipt.committed_metadata.revision, 2)
 
 
 def known_claim(path: str, inode: int, writes: bool = True) -> ExecutionContextClaims:
