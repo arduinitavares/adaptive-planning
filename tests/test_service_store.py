@@ -9,6 +9,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from contextlib import ExitStack
 from unittest.mock import patch
 
 from adaptive_planning.types import DomainError
@@ -23,10 +24,10 @@ class TestService(unittest.TestCase):
 
     def test_restart_preserves_epoch_and_events(self) -> None:
         """Closing and reopening DB preserves epoch, host_id, events, watermark, and monotonic sequence."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock, host_id="test-host")
+            store = stores.enter_context(Store(path, clock, host_id="test-host"))
             epoch = store.installation_epoch()
             host = store.host_id
             self.assertEqual(host, "test-host")
@@ -47,7 +48,7 @@ class TestService(unittest.TestCase):
             self.assertEqual(store.get_store_sequence(), 2)
 
             # Reopen store without specifying host_id: must recover stored host_id
-            reopened = Store(path, clock)
+            reopened = stores.enter_context(Store(path, clock))
             self.assertEqual(reopened.installation_epoch(), epoch)
             self.assertEqual(reopened.host_id, host)
 
@@ -75,10 +76,10 @@ class TestService(unittest.TestCase):
 
     def test_atomic_failure_rolls_back_every_record(self) -> None:
         """Injected failure after event insert rolls back plan, request, and event."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
             epoch = store.installation_epoch()
 
             def failing_write(db: sqlite3.Connection) -> None:
@@ -114,10 +115,10 @@ class TestService(unittest.TestCase):
 
     def test_write_contention_is_bounded(self) -> None:
         """Write contention on separate connection yields structured busy DomainError within bounded elapsed time."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
 
             barrier = threading.Barrier(2)
             blocker_done = threading.Event()
@@ -156,11 +157,11 @@ class TestService(unittest.TestCase):
 
     def test_directory_and_file_permissions(self) -> None:
         """Directory mode is 0700 and DB file mode is 0600."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             sub_dir = Path(directory) / "secure_dir"
             path = sub_dir / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            Store(path, clock)
+            stores.enter_context(Store(path, clock))
 
             dir_mode = stat.S_IMODE(os.stat(sub_dir).st_mode)
             file_mode = stat.S_IMODE(os.stat(path).st_mode)
@@ -170,10 +171,10 @@ class TestService(unittest.TestCase):
 
     def test_connection_pragmas(self) -> None:
         """Verify global PRAGMAs: foreign_keys=ON, busy_timeout=2000, WAL, synchronous=FULL."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
 
             def check_pragmas(db: sqlite3.Connection) -> dict[str, object]:
                 fk = db.execute("PRAGMA foreign_keys").fetchone()[0]
@@ -190,10 +191,10 @@ class TestService(unittest.TestCase):
 
     def test_cross_plan_fk_substitution_is_rejected(self) -> None:
         """Attempts and result versions cannot substitute foreign keys across plans."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
             now = clock().isoformat()
 
             def setup_data(db: sqlite3.Connection) -> None:
@@ -236,10 +237,10 @@ class TestService(unittest.TestCase):
 
     def test_resource_redirect_cycle_is_rejected(self) -> None:
         """Resource redirect cycle detection rejects cyclic redirection."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
             now = clock().isoformat()
 
             def setup_resources(db: sqlite3.Connection) -> None:
@@ -270,10 +271,10 @@ class TestService(unittest.TestCase):
 
     def test_refuses_newer_schema_before_mutation(self) -> None:
         """Refuses newer schema versions with DomainError(schema_newer) without invoking mutating callback."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
 
             # Manually advance schema version in installation table
             raw = sqlite3.connect(str(path))
@@ -297,22 +298,10 @@ class TestService(unittest.TestCase):
             self.assertEqual(ctx.exception.code, "schema_newer")
             self.assertFalse(callback_executed, "Mutating callback must not run on newer schema")
 
-            # 2. Reopened store also refuses newer schema on write
-            reopened = Store(path, clock)
-            reopened_callback_executed = False
-
-            def reopened_mutating_callback(db: sqlite3.Connection) -> None:
-                nonlocal reopened_callback_executed
-                reopened_callback_executed = True
-                db.execute(
-                    "INSERT INTO plans (plan_id, generation, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                    ("p-mut2", "g-mut2", clock().isoformat(), clock().isoformat()),
-                )
-
+            # 2. Startup itself now refuses before constructing a usable Store.
             with self.assertRaises(DomainError) as ctx:
-                reopened.write(reopened_mutating_callback)
+                Store(path, clock)
             self.assertEqual(ctx.exception.code, "schema_newer")
-            self.assertFalse(reopened_callback_executed, "Mutating callback must not run on newer schema after reopen")
 
             # Verify no mutation was persisted
             raw_check = sqlite3.connect(str(path))
@@ -322,21 +311,21 @@ class TestService(unittest.TestCase):
 
     def test_host_id_mismatch_rejected(self) -> None:
         """Reopening with mismatched host_id raises DomainError(invalid)."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            Store(path, clock, host_id="synthetic-host")
+            stores.enter_context(Store(path, clock, host_id="synthetic-host"))
 
             with self.assertRaises(DomainError) as ctx:
-                Store(path, clock, host_id="different-host")
+                stores.enter_context(Store(path, clock, host_id="different-host"))
             self.assertEqual(ctx.exception.code, "invalid")
 
     def test_resource_uses_exclusive_source_check(self) -> None:
         """resource_uses enforces exclusive source: either (plan_id, attempt_id) OR absent_work_id."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
             now = clock().isoformat()
 
             def setup(db: sqlite3.Connection) -> None:
@@ -357,11 +346,13 @@ class TestService(unittest.TestCase):
                     ("p1", "a1", "s1"),
                 )
                 db.execute(
-                    "INSERT INTO absent_host_work (absent_work_id, host_id, scope, created_at) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO absent_host_work (absent_work_id, host_id, scope, created_at,producer_id) VALUES (?, ?, ?, ?, 'synthetic-sql-seed')",
                     ("ab1", "host-1", "workspace", now),
                 )
 
             store.write(setup)
+
+            store.write(lambda db: db.execute("INSERT INTO absent_host_work_members VALUES('ab1','res-1','workspace')"))
 
             # Valid normal row
             store.write(
@@ -403,10 +394,10 @@ class TestService(unittest.TestCase):
 
     def test_read_establishes_single_snapshot(self) -> None:
         """Store.read executes across a single consistent SQLite snapshot for rows plus watermark."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
 
             # Insert an initial event
             store.write(
@@ -468,10 +459,10 @@ class TestService(unittest.TestCase):
 
     def test_sequence_only_notification_post_commit_not_rollback(self) -> None:
         """Listeners receive store_sequence only after commit, never during rollback."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
 
             notified: list[int] = []
             store.add_listener(lambda seq: notified.append(seq))
@@ -500,10 +491,10 @@ class TestService(unittest.TestCase):
 
     def test_checkpoint_review_availability_same_plan_fks(self) -> None:
         """Checkpoints, reviews, and availability enforce same-plan composite pairing."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
             now = clock().isoformat()
 
             def setup(db: sqlite3.Connection) -> None:
@@ -574,10 +565,10 @@ class TestService(unittest.TestCase):
 
     def test_unique_idempotency_constraints(self) -> None:
         """Verify UNIQUE constraints on requests, creation_ids, imports, and aliases."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
             epoch = store.installation_epoch()
             now = clock().isoformat()
 
@@ -662,10 +653,10 @@ class TestService(unittest.TestCase):
 
     def test_wal_shm_modes_while_existing(self) -> None:
         """WAL and SHM files have mode 0600 while they exist during active write."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
 
             wal_mode: int | None = None
             shm_mode: int | None = None
@@ -690,7 +681,7 @@ class TestService(unittest.TestCase):
 
     def test_initialization_atomicity_and_rollback(self) -> None:
         """Failure during schema or installation initialization rolls back completely."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
 
@@ -702,7 +693,7 @@ class TestService(unittest.TestCase):
 
             with patch("adaptive_planning.store.initialize_schema", side_effect=failing_init):
                 with self.assertRaises(RuntimeError):
-                    Store(path, clock)
+                    stores.enter_context(Store(path, clock))
 
             raw = sqlite3.connect(str(path))
             table_count = raw.execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
@@ -711,13 +702,13 @@ class TestService(unittest.TestCase):
 
     def test_permission_enforcement_raises_on_failure(self) -> None:
         """Storage permission enforcement raises DomainError(invalid) on chmod failure."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
 
             with patch("os.chmod", side_effect=OSError("Permission denied")):
                 with self.assertRaises(DomainError) as ctx:
-                    Store(path, clock)
+                    stores.enter_context(Store(path, clock))
                 self.assertEqual(ctx.exception.code, "invalid")
 
     # =========================================================================
@@ -726,10 +717,10 @@ class TestService(unittest.TestCase):
 
     def test_same_plan_wrong_step_pairing_rejected(self) -> None:
         """I1: Same-plan wrong-step pairing on reviews->attempts and availability->result_versions is rejected."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
             now = clock().isoformat()
 
             def setup(db: sqlite3.Connection) -> None:
@@ -829,10 +820,10 @@ class TestService(unittest.TestCase):
 
     def test_parent_delete_cannot_remove_unresolved_uses(self) -> None:
         """I2: Deleting parents of resource_uses or absent_host_work fails via RESTRICT and rolls back."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
             now = clock().isoformat()
 
             def setup(db: sqlite3.Connection) -> None:
@@ -863,10 +854,11 @@ class TestService(unittest.TestCase):
                     ("res-orphan", "h1", "workspace", now),
                 )
                 db.execute(
-                    "INSERT INTO absent_host_work (absent_work_id, host_id, resource_id, scope, created_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO absent_host_work (absent_work_id, host_id, resource_id, scope, created_at,producer_id) "
+                    "VALUES (?, ?, ?, ?, ?, 'synthetic-sql-seed')",
                     ("ab-orphan", "h1", "res-orphan", "workspace", now),
                 )
+                db.execute("INSERT INTO absent_host_work_members VALUES('ab-orphan','res-orphan','workspace')")
                 db.execute(
                     "INSERT INTO resource_uses (use_id, resource_id, absent_work_id, scope, status, created_at) "
                     "VALUES (?, ?, ?, ?, 'unresolved', ?)",
@@ -888,8 +880,8 @@ class TestService(unittest.TestCase):
                     ("res-absent-only", "h1", "workspace", now),
                 )
                 db.execute(
-                    "INSERT INTO absent_host_work (absent_work_id, host_id, resource_id, scope, created_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO absent_host_work (absent_work_id, host_id, resource_id, scope, created_at,producer_id) "
+                    "VALUES (?, ?, ?, ?, ?, 'synthetic-sql-seed')",
                     ("ab-standalone", "h1", "res-absent-only", "workspace", now),
                 )
                 db.execute(
@@ -935,10 +927,10 @@ class TestService(unittest.TestCase):
 
     def test_resource_repository_id_and_orphan_scope_constraints(self) -> None:
         """I3: Workspace->repository identity rules and orphan scope downgrade prevention."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
             now = clock().isoformat()
 
             def setup(db: sqlite3.Connection) -> None:
@@ -1013,10 +1005,12 @@ class TestService(unittest.TestCase):
             # --- Orphan use scope tests ---
             store.write(
                 lambda db: db.execute(
-                    "INSERT INTO absent_host_work (absent_work_id, host_id, scope, created_at) VALUES (?, ?, 'repository', ?)",
+                    "INSERT INTO absent_host_work (absent_work_id, host_id, scope, created_at,producer_id) VALUES (?, ?, 'repository', ?, 'synthetic-sql-seed')",
                     ("ab-repo-work", "host-1", now),
                 )
             )
+
+            store.write(lambda db: db.execute("INSERT INTO absent_host_work_members VALUES('ab-repo-work','repo-1','repository')"))
 
             # Inserting orphan use with downgraded scope ('workspace' instead of 'repository') must fail
             with self.assertRaises(sqlite3.IntegrityError):
@@ -1047,10 +1041,10 @@ class TestService(unittest.TestCase):
 
     def test_post_commit_cleanup_failure_does_not_mask_success(self) -> None:
         """I4: Post-commit cleanup and listener failure does not replace successful write result; pre-commit failure rolls back."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
 
             # 1. Post-commit chmod absent: write succeeds without attempting post-commit chmod (which would raise EPERM)
             real_connect = sqlite3.connect
@@ -1179,7 +1173,7 @@ class TestService(unittest.TestCase):
 
     def test_constructor_post_commit_cleanup_failure_does_not_fail(self) -> None:
         """I4: Constructor cleanup failure after installation commit does not report initialized store as failed."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
 
@@ -1216,7 +1210,7 @@ class TestService(unittest.TestCase):
 
             with patch("sqlite3.connect", side_effect=lambda *args, **kwargs: CommitTrackingConn(real_connect(*args, **kwargs))), \
                  patch("os.chmod", side_effect=selective_chmod):
-                store = Store(path, clock)
+                store = stores.enter_context(Store(path, clock))
                 self.assertIsNotNone(store.installation_epoch())
                 self.assertFalse(constructor_late_chmod_called, "Constructor post-commit chmod must not be invoked")
 
@@ -1225,14 +1219,14 @@ class TestService(unittest.TestCase):
         initial_umask = os.umask(0o022)
         os.umask(initial_umask)
 
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
             errors: list[Exception] = []
 
             def worker(idx: int) -> None:
                 try:
                     p = Path(directory) / f"store_{idx}.sqlite"
-                    s = Store(p, clock)
+                    s = stores.enter_context(Store(p, clock))
                     s.write(lambda db: db.execute("SELECT 1").fetchone())
                 except Exception as ex:
                     errors.append(ex)
@@ -1251,10 +1245,10 @@ class TestService(unittest.TestCase):
 
     def test_connection_closure_across_all_paths(self) -> None:
         """I5: Verify deterministic connection closure on PRAGMA failure, success, callback error, and busy."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
 
             real_connect = sqlite3.connect
 
@@ -1366,10 +1360,10 @@ class TestService(unittest.TestCase):
 
     def test_alias_host_scoping_enforced(self) -> None:
         """Ruling 13: Aliases must reference resources on the same host."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
             now = clock().isoformat()
 
             store.write(
@@ -1406,10 +1400,10 @@ class TestService(unittest.TestCase):
 
     def test_requests_command_digest_required_and_validated(self) -> None:
         """Ruling 15: Requests table requires command_digest column with exact 64-character SHA-256 length."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
             epoch = store.installation_epoch()
             now = clock().isoformat()
             valid_digest = "a" * 64
@@ -1481,10 +1475,10 @@ class TestService(unittest.TestCase):
 
     def test_resource_redirect_cycle_two_node_and_update(self) -> None:
         """Minors: Two-node redirect cycles and cyclic redirect updates are rejected."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             path = Path(directory) / "planning.sqlite"
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
             now = clock().isoformat()
 
             def setup_resources(db: sqlite3.Connection) -> None:
@@ -1534,20 +1528,24 @@ class TestService(unittest.TestCase):
 
     def test_preexisting_loose_permissions_tightened(self) -> None:
         """Minors: Pre-existing loose permissions (0755 dir, 0644 db file) are tightened to 0700 and 0600."""
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as stores:
             secure_dir = Path(directory) / "loose_dir"
             secure_dir.mkdir(mode=0o755, exist_ok=True)
             os.chmod(secure_dir, 0o755)
 
             path = secure_dir / "planning.sqlite"
-            path.touch(mode=0o644)
+            clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
+            # Admission refuses existing empty files; seed a real supported authority.
+            with Store(path,clock):
+                pass
+            os.chmod(secure_dir,0o755)
             os.chmod(path, 0o644)
 
             self.assertEqual(stat.S_IMODE(os.stat(secure_dir).st_mode), 0o755)
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o644)
 
             clock = FakeClock(datetime(2026, 10, 6, tzinfo=timezone.utc))
-            store = Store(path, clock)
+            store = stores.enter_context(Store(path, clock))
 
             self.assertEqual(stat.S_IMODE(os.stat(secure_dir).st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)

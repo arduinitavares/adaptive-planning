@@ -300,10 +300,17 @@ class ServiceFixture:
         self._temporary_closed = False
 
     def cleanup(self) -> None:
-        """Close only the temporary directory created and owned by this fixture."""
+        """Dispose the Store; remove only a directory created by this fixture."""
+        self.store.close()
         if self._temporary_owner is not None and not self._temporary_closed:
             self._temporary_closed = True
             self._temporary_owner.cleanup()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self,*args):
+        self.cleanup()
 
     def command(
         self,
@@ -550,6 +557,7 @@ def seed_orphan_use(fixture: ServiceFixture, resource_id: ResourceId) -> Reserva
     from adaptive_planning.types import DomainError
 
     def insert(db):
+        import json
         row = db.execute("SELECT kind, repository_id FROM resources WHERE resource_id=?", (resource_id,)).fetchone()
         if row is None:
             raise DomainError("not_found", "The test resource is not registered")
@@ -565,11 +573,15 @@ def seed_orphan_use(fixture: ServiceFixture, resource_id: ResourceId) -> Reserva
         host = db.execute("SELECT host_id FROM installation WHERE id=1").fetchone()[0]
         use_id, ts = str(uuid.uuid4()), fixture.clock().isoformat()
         db.execute("INSERT INTO absent_host_work (absent_work_id, host_id, resource_id, scope, declared_identity, "
-                   "status, created_at) VALUES ('seeded-orphan', ?, ?, ?, 'synthetic-orphan', 'unresolved', ?)",
+                   "status, created_at,producer_id) VALUES ('seeded-orphan', ?, ?, ?, 'synthetic-orphan', 'unresolved', ?, 'migration:seeded-orphan')",
                    (host, canonical, kind, ts))
+        db.execute("INSERT INTO absent_host_work_members VALUES('seeded-orphan',?,?)",(canonical,kind))
         db.execute("INSERT INTO resource_uses (use_id, resource_id, plan_id, attempt_id, absent_work_id, scope, "
                    "status, created_at) VALUES (?, ?, NULL, NULL, 'seeded-orphan', ?, 'unresolved', ?)",
                    (use_id, canonical, kind, ts))
+        db.execute("UPDATE absent_host_work SET anchor_use_id=? WHERE absent_work_id='seeded-orphan'",(use_id,))
+        declaration=dict(format=1,producer='migration',original_parent=['seeded-orphan',host,canonical,kind,'synthetic-orphan','unresolved',ts],members=[dict(use_id=use_id,resource_id=canonical,scope=kind,created_at=ts)])
+        db.execute("INSERT INTO host_work_declarations VALUES('migration:seeded-orphan','seeded-orphan','migration','synthetic-orphan','unknown',?,?)",(json.dumps(declaration,sort_keys=True),ts))
         plans._insert_event(db, None, None, "seeded_orphan_use", "synthetic-orphan", ts,
                             {"use_id": use_id, "resource_id": canonical})
         return ReservationView(use_id, None, None, "seeded-orphan", (canonical,), "synthetic-orphan", True, True,
@@ -892,6 +904,7 @@ def make_service(directory: Path | None = None, clock: FakeClock | None = None) 
         from tempfile import TemporaryDirectory
         owner = TemporaryDirectory(prefix="adaptive-planning-synthetic-")
         directory = Path(owner.name).resolve()
+    store = None
     try:
         store = Store(directory / "planning.sqlite", clock, host_id="synthetic-host")
         service = PlanningService(store, base_url="http://127.0.0.1:8790", clock=clock)
@@ -903,6 +916,8 @@ def make_service(directory: Path | None = None, clock: FakeClock | None = None) 
             fixture._temporary_identity = (identity.st_dev, identity.st_ino)
         return fixture
     except BaseException:
+        if store is not None:
+            store.close()
         if owner is not None:
             owner.cleanup()
         raise

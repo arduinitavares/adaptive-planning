@@ -41,6 +41,7 @@ _ARGUMENTS = {
     "release_resource_use": frozenset({"command"}), "reopen_attempt": frozenset({"command"}),
     "sweep_stale": frozenset({"command"}), "resolve_attempt": frozenset({"command"}),
     "append_late_evidence": frozenset({"command"}),
+    "resolve_store_hold": frozenset({"command"}),
 }
 _MESSAGES = {
     "invalid": "Tool arguments are invalid.", "not_found": "The requested planning record was not found.",
@@ -410,6 +411,31 @@ class _AppendLateEvidencePayload(_InputModel):
     reason: str
 
 
+class _HostWorkInput(_InputModel):
+    work_id: str
+    actor: str
+    state: Literal['running','stopped','unknown']
+    resource_ids: list[str]
+    resource_claims: list[_ResourceClaimInput]
+    evidence: list[_EvidenceInput]
+
+
+class _ResourceResolutionInput(_InputModel):
+    use_id: str | None
+    absent_work_id: str | None
+    resource_ids: list[str]
+    resolution: Literal['stopped','isolated','unresolved']
+    reason: str
+
+
+class _ResolveStoreHoldPayload(_InputModel):
+    backup_cutoff: str
+    inventory_complete: StrictBool
+    absent_work_inventory: list[_HostWorkInput]
+    resource_resolutions: list[_ResourceResolutionInput]
+    reason: str
+
+
 class _Envelope(_InputModel):
     epoch: str
     key: str
@@ -535,11 +561,16 @@ class AppendLateEvidenceInput(_Envelope):
     payload: _AppendLateEvidencePayload
 
 
+class ResolveStoreHoldInput(_Envelope):
+    kind: Literal['resolve_store_hold']
+    payload: _ResolveStoreHoldPayload
+
+
 CommandInput = Annotated[CreatePlanInput | ImportPlanInput | RevisePlanInput | TakeoverInput | RegisterResourceInput | ReconcileResourcesInput | AssignStepInput
                          | BindAvailabilityInput | StartStepInput | ReportActivityInput | RecordCheckpointInput
                          | ResolveReassessmentInput | InvalidateResultInput | ResolveInvalidationInput
                          | RecordReviewInput | AcceptStepInput | ReserveVerificationInput | ReleaseResourceUseInput | ReopenAttemptInput
-                         | SweepStaleInput | ResolveAttemptInput | AppendLateEvidenceInput,
+                         | SweepStaleInput | ResolveAttemptInput | AppendLateEvidenceInput | ResolveStoreHoldInput,
                          Field(discriminator="kind")]
 _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_fields,
                            *_CreatePayload.model_fields, *_ImportPayload.model_fields, *_RevisePayload.model_fields, *_TakeoverPayload.model_fields,
@@ -558,6 +589,7 @@ _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_field
                            *_ReopenAttemptPayload.model_fields,
                            *_SweepStalePayload.model_fields, *_ResolveAttemptPayload.model_fields,
                            *_AppendLateEvidencePayload.model_fields,
+                           *_HostWorkInput.model_fields, *_ResourceResolutionInput.model_fields, *_ResolveStoreHoldPayload.model_fields,
                            "plan_id", "include_terminal", "after", "limit", *_ARGUMENTS})
 
 
@@ -783,5 +815,10 @@ def build_mcp(service: PlanningService) -> MCPServer:
     def append_late_evidence(command: CommandInput) -> dict[str, Any]:
         """Retain attributed historical observations and stop reports without releasing or accepting work."""
         return execute("append_late_evidence", command)
+
+    @server.tool(annotations=write)
+    def resolve_store_hold(command: CommandInput) -> dict[str, Any]:
+        """Record explicit local absent-writer inventory and exact resource observations after restore."""
+        return execute('resolve_store_hold',command)
 
     return server

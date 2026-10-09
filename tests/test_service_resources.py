@@ -1,5 +1,6 @@
 """Host-attested identities remain conservative across aliases, plans and redirects."""
 from __future__ import annotations
+from contextlib import ExitStack
 
 import asyncio
 import copy
@@ -28,7 +29,7 @@ class TestService(unittest.TestCase):
     def setUp(self):
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.f = make_service(Path(self.tmp.name))
+        self.f = self.enterContext(make_service(Path(self.tmp.name)))
         self.p = self.f.create()
 
     def register(self, claim, receipt=None):
@@ -267,31 +268,32 @@ class TestService(unittest.TestCase):
         self.assertEqual(raised.exception.code, "held")
 
     def test_reconcile_keeps_old_unresolved_uses(self):
-        left = replace(workspace("/synthetic/alias-left", 800), device=None, inode=None)
-        right = replace(left, canonical_path="/synthetic/alias-right")
-        a = self.register(left)
-        b = self.register(right)
-        use = self.orphan(a)
-        canonical = workspace("/synthetic/canonical", 800)
-        command = self.f.command("reconcile_resources", {"resource_ids": (a, b), "canonical_claim": canonical,
-            "reason": "host-attested both paths refer to same physical workspace"}, receipt=self.p)
-        receipt = self.f.service.execute(command)
-        self.assertEqual(receipt.committed["resource_id"], min(a, b))
-        for rid in (a, b, self.register(canonical), self.register(left), self.register(right)):
-            self.assertIn(use.use_id, self.conflicts((rid,)))
-            self.assertEqual(self.resolve(context(rid)), (min(a, b),))
-        current = self.f.service.read_plan(self.p.committed_metadata.plan_id)
-        reservation = next(item for item in current.coordination.reservations if item.use_id == use.use_id)
-        self.assertTrue(reservation.unresolved)
-        self.assertTrue(reservation.writer_active)
-        self.assertIsNone(reservation.plan_id)
-        other = self.register(workspace("/synthetic/contradictory", 801))
-        before = self.rows()
-        with self.assertRaises(DomainError):
-            self.reconcile((a, other), canonical, reason="contradictory physical identity")
-        self.assertEqual(self.rows(), before)
-        reopened = make_service(self.f.directory, self.f.clock)
-        self.assertIn(use.use_id, self.conflicts((b,), fixture=reopened))
+        with ExitStack() as _owned_store_lifetimes:
+            left = replace(workspace("/synthetic/alias-left", 800), device=None, inode=None)
+            right = replace(left, canonical_path="/synthetic/alias-right")
+            a = self.register(left)
+            b = self.register(right)
+            use = self.orphan(a)
+            canonical = workspace("/synthetic/canonical", 800)
+            command = self.f.command("reconcile_resources", {"resource_ids": (a, b), "canonical_claim": canonical,
+                "reason": "host-attested both paths refer to same physical workspace"}, receipt=self.p)
+            receipt = self.f.service.execute(command)
+            self.assertEqual(receipt.committed["resource_id"], min(a, b))
+            for rid in (a, b, self.register(canonical), self.register(left), self.register(right)):
+                self.assertIn(use.use_id, self.conflicts((rid,)))
+                self.assertEqual(self.resolve(context(rid)), (min(a, b),))
+            current = self.f.service.read_plan(self.p.committed_metadata.plan_id)
+            reservation = next(item for item in current.coordination.reservations if item.use_id == use.use_id)
+            self.assertTrue(reservation.unresolved)
+            self.assertTrue(reservation.writer_active)
+            self.assertIsNone(reservation.plan_id)
+            other = self.register(workspace("/synthetic/contradictory", 801))
+            before = self.rows()
+            with self.assertRaises(DomainError):
+                self.reconcile((a, other), canonical, reason="contradictory physical identity")
+            self.assertEqual(self.rows(), before)
+            reopened = _owned_store_lifetimes.enter_context(make_service(self.f.directory, self.f.clock))
+            self.assertIn(use.use_id, self.conflicts((b,), fixture=reopened))
 
     def test_reconcile_prefers_matching_physical_survivor_and_keeps_fk_history(self):
         repo_old = self.repository("/synthetic/repo-old", 810)
@@ -325,48 +327,50 @@ class TestService(unittest.TestCase):
         self.assertIn(use.use_id, self.conflicts((physical,)))
 
     def test_second_reconciliation_preserves_historical_keys_aliases_and_losing_use(self):
-        left = replace(workspace("/synthetic/merge-left", 822), device=None, inode=None)
-        right = replace(left, canonical_path="/synthetic/merge-right")
-        a, b = self.register(left), self.register(right)
-        use = self.orphan(max(a, b))
-        initial_aliases = self.f.store.read(lambda db: tuple(db.execute("SELECT * FROM aliases ORDER BY alias_id")))
-        canonical = workspace("/synthetic/merge-canonical", 822)
-        first = self.reconcile((a, b), canonical).committed["resource_id"]
-        before_key = self.f.store.read(lambda db: db.execute(
-            "SELECT physical_identity FROM resources WHERE resource_id=?", (first,)).fetchone()[0])
-        third_claim = replace(left, canonical_path="/synthetic/merge-third")
-        third = self.register(third_claim)
-        second = self.reconcile((first, third), replace(canonical, canonical_path=third_claim.canonical_path))
-        self.assertEqual(second.committed["resource_id"], third)
-        self.assertEqual(self.f.store.read(lambda db: db.execute(
-            "SELECT physical_identity FROM resources WHERE resource_id=?", (first,)).fetchone()[0]), before_key)
-        current_aliases = self.f.store.read(lambda db: tuple(db.execute("SELECT * FROM aliases ORDER BY alias_id")))
-        self.assertTrue(set(initial_aliases).issubset(set(current_aliases)))
-        reopened = make_service(self.f.directory, self.f.clock)
-        for rid in (a, b, first, third):
-            self.assertIn(use.use_id, self.conflicts((rid,), fixture=reopened))
-            self.assertEqual(self.resolve(context(rid), fixture=reopened), (third,))
-        self.assertEqual(self.register(canonical), third)
-        self.assertEqual(self.register(left), third)
+        with ExitStack() as _owned_store_lifetimes:
+            left = replace(workspace("/synthetic/merge-left", 822), device=None, inode=None)
+            right = replace(left, canonical_path="/synthetic/merge-right")
+            a, b = self.register(left), self.register(right)
+            use = self.orphan(max(a, b))
+            initial_aliases = self.f.store.read(lambda db: tuple(db.execute("SELECT * FROM aliases ORDER BY alias_id")))
+            canonical = workspace("/synthetic/merge-canonical", 822)
+            first = self.reconcile((a, b), canonical).committed["resource_id"]
+            before_key = self.f.store.read(lambda db: db.execute(
+                "SELECT physical_identity FROM resources WHERE resource_id=?", (first,)).fetchone()[0])
+            third_claim = replace(left, canonical_path="/synthetic/merge-third")
+            third = self.register(third_claim)
+            second = self.reconcile((first, third), replace(canonical, canonical_path=third_claim.canonical_path))
+            self.assertEqual(second.committed["resource_id"], third)
+            self.assertEqual(self.f.store.read(lambda db: db.execute(
+                "SELECT physical_identity FROM resources WHERE resource_id=?", (first,)).fetchone()[0]), before_key)
+            current_aliases = self.f.store.read(lambda db: tuple(db.execute("SELECT * FROM aliases ORDER BY alias_id")))
+            self.assertTrue(set(initial_aliases).issubset(set(current_aliases)))
+            reopened = _owned_store_lifetimes.enter_context(make_service(self.f.directory, self.f.clock))
+            for rid in (a, b, first, third):
+                self.assertIn(use.use_id, self.conflicts((rid,), fixture=reopened))
+                self.assertEqual(self.resolve(context(rid), fixture=reopened), (third,))
+            self.assertEqual(self.register(canonical), third)
+            self.assertEqual(self.register(left), third)
 
     def test_case_collision_in_both_orders_and_cross_kind_identity_are_rejected(self):
-        self.register(workspace("/synthetic/test-enabled", 823))
-        for index, (first_case, second_case) in enumerate(((False, True), (True, False))):
-            f = make_service(self.f.directory / f"case-order-{index}", self.f.clock)
-            p = f.create()
-            f.register(workspace("/synthetic/CaseOrder", 824, case_insensitive=first_case), p)
-            before = f.store.read(lambda db: tuple(db.iterdump()))
-            with self.assertRaises(DomainError) as raised:
-                f.register(workspace("/synthetic/caseorder", 825, case_insensitive=second_case), p)
-            self.assertEqual(raised.exception.code, "resource_conflict")
-            self.assertEqual(f.store.read(lambda db: tuple(db.iterdump())), before)
-        value = workspace("/synthetic/cross-kind", 826)
-        self.register(value)
-        for changed in (replace(value, kind="repository"),
-                        replace(value, kind="repository", canonical_path="/synthetic/other-role-alias")):
-            with self.assertRaises(DomainError) as raised:
-                self.register(changed)
-            self.assertEqual(raised.exception.code, "resource_conflict")
+        with ExitStack() as _owned_store_lifetimes:
+            self.register(workspace("/synthetic/test-enabled", 823))
+            for index, (first_case, second_case) in enumerate(((False, True), (True, False))):
+                f = _owned_store_lifetimes.enter_context(make_service(self.f.directory / f"case-order-{index}", self.f.clock))
+                p = f.create()
+                f.register(workspace("/synthetic/CaseOrder", 824, case_insensitive=first_case), p)
+                before = f.store.read(lambda db: tuple(db.iterdump()))
+                with self.assertRaises(DomainError) as raised:
+                    f.register(workspace("/synthetic/caseorder", 825, case_insensitive=second_case), p)
+                self.assertEqual(raised.exception.code, "resource_conflict")
+                self.assertEqual(f.store.read(lambda db: tuple(db.iterdump())), before)
+            value = workspace("/synthetic/cross-kind", 826)
+            self.register(value)
+            for changed in (replace(value, kind="repository"),
+                            replace(value, kind="repository", canonical_path="/synthetic/other-role-alias")):
+                with self.assertRaises(DomainError) as raised:
+                    self.register(changed)
+                self.assertEqual(raised.exception.code, "resource_conflict")
 
     def test_identity_unique_indexes_ignore_json_order_case_and_kind(self):
         rid = self.register(workspace("/synthetic/index-source", 827))
@@ -396,71 +400,79 @@ class TestService(unittest.TestCase):
                 self.register(replace(workspace("/synthetic/invalid-scalar", 828), inode=bad))
 
     def test_legacy_null_malformed_wrong_shape_and_scalar_encodings_remain_held(self):
-        self.register(workspace("/synthetic/test-legacy-enabled", 829))
-        unknowns = (None, "opaque-legacy", "{malformed", '{"v":2}',
-                    '{"v":1,"device":"07","inode":"829","case_insensitive":false,"external_identity":null}',
-                    '{"v":1,"device":7,"inode":"829","case_insensitive":false,"external_identity":null}',
-                    '{"v":1,"v":1,"device":"7","inode":"829","case_insensitive":false,"external_identity":null}',
-                    '{"v":1,"device":null,"inode":null,"case_insensitive":false,"external_identity":null,"extra":true}')
-        for index, opaque in enumerate(unknowns):
-            f = make_service(self.f.directory / f"legacy-{index}", self.f.clock)
-            p = f.create()
-            known = f.register(workspace("/synthetic/legacy-known", 829), p)
-            f.store.write(lambda db: db.execute(
-                "INSERT INTO resources (resource_id, host_id, kind, physical_identity, canonical_path, created_at) "
-                "VALUES ('legacy-row', 'synthetic-host', 'workspace', ?, '/synthetic/legacy-alias', 'ts')", (opaque,)))
-            f.store.write(lambda db: db.execute(
-                "INSERT INTO aliases (alias_id, host_id, canonical_path, resource_id) "
-                "VALUES ('legacy-alias', 'synthetic-host', '/synthetic/legacy-alias', 'legacy-row')"))
-            f.store.write(lambda db: db.execute(
-                "INSERT INTO absent_host_work (absent_work_id, host_id, resource_id, scope) "
-                "VALUES ('legacy-work', 'synthetic-host', 'legacy-row', 'workspace')"))
-            f.store.write(lambda db: db.execute(
-                "INSERT INTO resource_uses (use_id, resource_id, absent_work_id, scope, status) "
-                "VALUES ('legacy-use', 'legacy-row', 'legacy-work', 'workspace', 'unresolved')"))
-            reopened = make_service(f.directory, self.f.clock)
-            self.assertIn("legacy-use", self.conflicts((known,), fixture=reopened))
-            with self.assertRaises(DomainError) as raised:
-                self.resolve(context("legacy-row"), fixture=reopened)
-            self.assertEqual(raised.exception.code, "held")
-            before = f.store.read(lambda db: tuple(db.iterdump()))
-            with self.assertRaises(DomainError) as raised:
-                f.register(workspace("/synthetic/legacy-alias", 830), p)
-            self.assertEqual(raised.exception.code, "held")
-            self.assertEqual(f.store.read(lambda db: tuple(db.iterdump())), before)
+        with ExitStack() as _owned_store_lifetimes:
+            self.register(workspace("/synthetic/test-legacy-enabled", 829))
+            unknowns = (None, "opaque-legacy", "{malformed", '{"v":2}',
+                        '{"v":1,"device":"07","inode":"829","case_insensitive":false,"external_identity":null}',
+                        '{"v":1,"device":7,"inode":"829","case_insensitive":false,"external_identity":null}',
+                        '{"v":1,"v":1,"device":"7","inode":"829","case_insensitive":false,"external_identity":null}',
+                        '{"v":1,"device":null,"inode":null,"case_insensitive":false,"external_identity":null,"extra":true}')
+            for index, opaque in enumerate(unknowns):
+                f = _owned_store_lifetimes.enter_context(make_service(self.f.directory / f"legacy-{index}", self.f.clock))
+                p = f.create()
+                known = f.register(workspace("/synthetic/legacy-known", 829), p)
+                f.store.write(lambda db: db.execute(
+                    "INSERT INTO resources (resource_id, host_id, kind, physical_identity, canonical_path, created_at) "
+                    "VALUES ('legacy-row', 'synthetic-host', 'workspace', ?, '/synthetic/legacy-alias', 'ts')", (opaque,)))
+                f.store.write(lambda db: db.execute(
+                    "INSERT INTO aliases (alias_id, host_id, canonical_path, resource_id) "
+                    "VALUES ('legacy-alias', 'synthetic-host', '/synthetic/legacy-alias', 'legacy-row')"))
+                f.store.write(lambda db: db.execute(
+                    "INSERT INTO absent_host_work (absent_work_id, host_id, resource_id, scope,declared_identity,producer_id) "
+                    "VALUES ('legacy-work', 'synthetic-host', 'legacy-row', 'workspace','synthetic-legacy-worker','migration:legacy-work')"))
+                f.store.write(lambda db: db.execute("INSERT INTO absent_host_work_members VALUES('legacy-work','legacy-row','workspace')"))
+                f.store.write(lambda db: db.execute(
+                    "INSERT INTO resource_uses (use_id, resource_id, absent_work_id, scope, status) "
+                    "VALUES ('legacy-use', 'legacy-row', 'legacy-work', 'workspace', 'unresolved')"))
+                def origin(db):
+                    db.execute("UPDATE absent_host_work SET anchor_use_id='legacy-use' WHERE absent_work_id='legacy-work'")
+                    value=dict(format=1,producer='migration',original_parent=['legacy-work','synthetic-host','legacy-row','workspace','synthetic-legacy-worker','unresolved',''],members=[dict(use_id='legacy-use',resource_id='legacy-row',scope='workspace',created_at='')])
+                    db.execute("INSERT INTO host_work_declarations VALUES('migration:legacy-work','legacy-work','migration','synthetic-legacy-worker','unknown',?,'')",(json.dumps(value),))
+                f.store.write(origin)
+                reopened = _owned_store_lifetimes.enter_context(make_service(f.directory, self.f.clock))
+                self.assertIn("legacy-use", self.conflicts((known,), fixture=reopened))
+                with self.assertRaises(DomainError) as raised:
+                    self.resolve(context("legacy-row"), fixture=reopened)
+                self.assertEqual(raised.exception.code, "held")
+                before = f.store.read(lambda db: tuple(db.iterdump()))
+                with self.assertRaises(DomainError) as raised:
+                    f.register(workspace("/synthetic/legacy-alias", 830), p)
+                self.assertEqual(raised.exception.code, "held")
+                self.assertEqual(f.store.read(lambda db: tuple(db.iterdump())), before)
 
     def test_redirect_status_host_and_kind_corruption_fails_closed(self):
-        self.register(workspace("/synthetic/test-status-enabled", 831))
-        for index, corruption in enumerate(("active-edge", "retired-without-edge", "unknown-status", "cross-host", "cross-kind")):
-            f = make_service(self.f.directory / f"status-{index}", self.f.clock)
-            p = f.create()
-            a = f.register(workspace("/synthetic/status-a", 832), p)
-            b = f.register(workspace("/synthetic/status-b", 833), p)
-            def corrupt(db):
-                if corruption == "retired-without-edge":
-                    db.execute("UPDATE resources SET status='retired' WHERE resource_id=?", (a,))
-                elif corruption == "unknown-status":
-                    db.execute("UPDATE resources SET status='other' WHERE resource_id=?", (a,))
-                else:
-                    if corruption == "cross-host":
-                        db.execute("UPDATE resources SET host_id='foreign-host' WHERE resource_id=?", (b,))
-                    if corruption == "cross-kind":
-                        db.execute("UPDATE resources SET kind='repository' WHERE resource_id=?", (b,))
-                    db.execute("INSERT INTO resource_redirects (retired_id, survivor_id) VALUES (?, ?)", (a, b))
-                    if corruption != "active-edge":
-                        db.execute("UPDATE resources SET status='retired' WHERE resource_id=?", (a,))
-            # Host FK backstops aliases; remove no data: use a foreign unaliased
-            # resource for the corrupt edge instead of changing an aliased host.
-            if corruption == "cross-host":
+        with ExitStack() as _owned_store_lifetimes:
+            self.register(workspace("/synthetic/test-status-enabled", 831))
+            for index, corruption in enumerate(("active-edge", "retired-without-edge", "unknown-status", "cross-host", "cross-kind")):
+                f = _owned_store_lifetimes.enter_context(make_service(self.f.directory / f"status-{index}", self.f.clock))
+                p = f.create()
+                a = f.register(workspace("/synthetic/status-a", 832), p)
+                b = f.register(workspace("/synthetic/status-b", 833), p)
                 def corrupt(db):
-                    db.execute("INSERT INTO resources (resource_id, host_id, kind, created_at) "
-                               "VALUES ('foreign-target', 'foreign-host', 'workspace', 'ts')")
-                    db.execute("UPDATE resources SET status='retired' WHERE resource_id=?", (a,))
-                    db.execute("INSERT INTO resource_redirects (retired_id, survivor_id) VALUES (?, 'foreign-target')", (a,))
-            f.store.write(corrupt)
-            with self.assertRaises(DomainError) as raised:
-                self.resolve(context(a), fixture=f)
-            self.assertEqual(raised.exception.code, "held")
+                    if corruption == "retired-without-edge":
+                        db.execute("UPDATE resources SET status='retired' WHERE resource_id=?", (a,))
+                    elif corruption == "unknown-status":
+                        db.execute("UPDATE resources SET status='other' WHERE resource_id=?", (a,))
+                    else:
+                        if corruption == "cross-host":
+                            db.execute("UPDATE resources SET host_id='foreign-host' WHERE resource_id=?", (b,))
+                        if corruption == "cross-kind":
+                            db.execute("UPDATE resources SET kind='repository' WHERE resource_id=?", (b,))
+                        db.execute("INSERT INTO resource_redirects (retired_id, survivor_id) VALUES (?, ?)", (a, b))
+                        if corruption != "active-edge":
+                            db.execute("UPDATE resources SET status='retired' WHERE resource_id=?", (a,))
+                # Host FK backstops aliases; remove no data: use a foreign unaliased
+                # resource for the corrupt edge instead of changing an aliased host.
+                if corruption == "cross-host":
+                    def corrupt(db):
+                        db.execute("INSERT INTO resources (resource_id, host_id, kind, created_at) "
+                                   "VALUES ('foreign-target', 'foreign-host', 'workspace', 'ts')")
+                        db.execute("UPDATE resources SET status='retired' WHERE resource_id=?", (a,))
+                        db.execute("INSERT INTO resource_redirects (retired_id, survivor_id) VALUES (?, 'foreign-target')", (a,))
+                f.store.write(corrupt)
+                with self.assertRaises(DomainError) as raised:
+                    self.resolve(context(a), fixture=f)
+                self.assertEqual(raised.exception.code, "held")
 
     def test_initialization_checks_v1_duplicates_without_repairing_legacy_rows(self):
         from adaptive_planning.schema import SCHEMA_STATEMENTS, initialize_schema
@@ -547,115 +559,122 @@ class TestService(unittest.TestCase):
                 self.assertEqual(tuple(db.execute("SELECT * FROM resources ORDER BY resource_id")), before)
 
     def test_current_reservation_ids_resolve_losing_fk_after_reopen_and_second_merge(self):
-        left = replace(workspace("/synthetic/current-left", 903), device=None, inode=None)
-        right = replace(left, canonical_path="/synthetic/current-right")
-        a, b = self.register(left), self.register(right)
-        losing = max(a, b)
-        normal = self.owned_use(losing, self.p, use_id="current-normal", status="active")
-        orphan = self.orphan(losing)
-        peer = self.f.create(creation_id="current-peer")
-        plan_id, peer_id = self.p.committed_metadata.plan_id, peer.committed_metadata.plan_id
-        original = {view.use_id: view for view in self.f.service.read_plan(plan_id).coordination.reservations}
+        with ExitStack() as _owned_store_lifetimes:
+            left = replace(workspace("/synthetic/current-left", 903), device=None, inode=None)
+            right = replace(left, canonical_path="/synthetic/current-right")
+            a, b = self.register(left), self.register(right)
+            losing = max(a, b)
+            normal = self.owned_use(losing, self.p, use_id="current-normal", status="active")
+            orphan = self.orphan(losing)
+            peer = self.f.create(creation_id="current-peer")
+            plan_id, peer_id = self.p.committed_metadata.plan_id, peer.committed_metadata.plan_id
+            original = {view.use_id: view for view in self.f.service.read_plan(plan_id).coordination.reservations}
 
-        def immutable_rows():
-            return self.f.store.read(lambda db: {name: tuple(db.execute(f"SELECT * FROM {name} ORDER BY rowid"))
-                                                for name in ("resource_uses", "absent_host_work", "aliases", "events", "requests")})
+            def immutable_rows():
+                return self.f.store.read(lambda db: {name: tuple(db.execute(f"SELECT * FROM {name} ORDER BY rowid"))
+                                                    for name in ("resource_uses", "absent_host_work", "aliases", "events", "requests")})
 
-        def assert_preserved(before):
-            after = immutable_rows()
-            for name in before:
-                self.assertEqual(after[name][:len(before[name])], before[name], name)
+            def assert_preserved(before):
+                after = immutable_rows()
+                for name in before:
+                    self.assertEqual(after[name][:len(before[name])], before[name], name)
 
-        def assert_current(fixture, canonical, stage):
-            for selected, expected_ids in ((plan_id, (normal, orphan.use_id)), (peer_id, (orphan.use_id,))):
-                views = fixture.service.read_plan(selected).coordination.reservations
-                page = fixture.service.read_coordination(selected)
-                for reader, reservations in (("plan", views),
-                                             ("coordination", tuple(item.value for item in page.items
-                                                                    if item.kind == "reservation"))):
-                    with self.subTest(stage=stage, plan=selected, reader=reader):
-                        actual = {view.use_id: view for view in reservations}
-                        self.assertEqual(set(actual), set(expected_ids))
-                        for use_id in expected_ids:
-                            self.assertEqual(actual[use_id], replace(original[use_id], resource_ids=(canonical,)))
+            def assert_current(fixture, canonical, stage):
+                for selected, expected_ids in ((plan_id, (normal, orphan.use_id)), (peer_id, (orphan.use_id,))):
+                    views = fixture.service.read_plan(selected).coordination.reservations
+                    page = fixture.service.read_coordination(selected)
+                    for reader, reservations in (("plan", views),
+                                                 ("coordination", tuple(item.value for item in page.items
+                                                                        if item.kind == "reservation"))):
+                        with self.subTest(stage=stage, plan=selected, reader=reader):
+                            actual = {view.use_id: view for view in reservations}
+                            self.assertEqual(set(actual), set(expected_ids))
+                            for use_id in expected_ids:
+                                self.assertEqual(actual[use_id], replace(original[use_id], resource_ids=(canonical,)))
 
-        before = immutable_rows()
-        canonical = workspace("/synthetic/current-canonical", 903)
-        command = self.f.command("reconcile_resources", {"resource_ids": (a, b), "canonical_claim": canonical,
-                                 "reason": "host-attested current view equivalence"}, receipt=self.p)
-        first_receipt = self.f.service.execute(command)
-        first = first_receipt.committed["resource_id"]
-        self.assertEqual(first, min(a, b))
-        assert_current(self.f, first, "first")
-        assert_current(make_service(self.f.directory, self.f.clock), first, "first-reopen")
-        assert_preserved(before)
-        first_key = self.f.store.read(lambda db: db.execute(
-            "SELECT physical_identity FROM resources WHERE resource_id=?", (first,)).fetchone()[0])
-        third_claim = replace(left, canonical_path="/synthetic/current-third")
-        third = self.register(third_claim)
-        before_second = immutable_rows()
-        second = self.reconcile((first, third), replace(canonical, canonical_path=third_claim.canonical_path))
-        self.assertEqual(second.committed["resource_id"], third)
-        self.assertEqual(self.f.store.read(lambda db: db.execute(
-            "SELECT physical_identity FROM resources WHERE resource_id=?", (first,)).fetchone()[0]), first_key)
-        assert_current(self.f, third, "second")
-        assert_current(make_service(self.f.directory, self.f.clock), third, "second-reopen")
-        assert_preserved(before_second)
-        replay = self.f.service.execute(command)
-        self.assertTrue(replay.replayed)
-        self.assertEqual(replay.committed, first_receipt.committed)
-        self.assertEqual(replay.committed["resource_id"], first)
-        self.assertEqual(immutable_rows()["resource_uses"], before["resource_uses"])
+            before = immutable_rows()
+            canonical = workspace("/synthetic/current-canonical", 903)
+            command = self.f.command("reconcile_resources", {"resource_ids": (a, b), "canonical_claim": canonical,
+                                     "reason": "host-attested current view equivalence"}, receipt=self.p)
+            first_receipt = self.f.service.execute(command)
+            first = first_receipt.committed["resource_id"]
+            self.assertEqual(first, min(a, b))
+            assert_current(self.f, first, "first")
+            assert_current(_owned_store_lifetimes.enter_context(make_service(self.f.directory, self.f.clock)), first, "first-reopen")
+            assert_preserved(before)
+            first_key = self.f.store.read(lambda db: db.execute(
+                "SELECT physical_identity FROM resources WHERE resource_id=?", (first,)).fetchone()[0])
+            third_claim = replace(left, canonical_path="/synthetic/current-third")
+            third = self.register(third_claim)
+            before_second = immutable_rows()
+            second = self.reconcile((first, third), replace(canonical, canonical_path=third_claim.canonical_path))
+            self.assertEqual(second.committed["resource_id"], third)
+            self.assertEqual(self.f.store.read(lambda db: db.execute(
+                "SELECT physical_identity FROM resources WHERE resource_id=?", (first,)).fetchone()[0]), first_key)
+            assert_current(self.f, third, "second")
+            assert_current(_owned_store_lifetimes.enter_context(make_service(self.f.directory, self.f.clock)), third, "second-reopen")
+            assert_preserved(before_second)
+            replay = self.f.service.execute(command)
+            self.assertTrue(replay.replayed)
+            self.assertEqual(replay.committed, first_receipt.committed)
+            self.assertEqual(replay.committed["resource_id"], first)
+            self.assertEqual(immutable_rows()["resource_uses"], before["resource_uses"])
 
     def test_current_unknown_legacy_reservations_remain_visible_without_write_validation(self):
-        for index, raw in enumerate((None, "opaque-legacy", "{unsupported")):
-            rid = f"visible-legacy-{index}"
-            self.f.store.write(lambda db: db.execute(
-                "INSERT INTO resources (resource_id, host_id, kind, physical_identity, created_at) "
-                "VALUES (?, 'synthetic-host', 'workspace', ?, 'ts')", (rid, raw)))
-            use = self.owned_use(rid, self.p, use_id=f"visible-use-{index}")
-            before = self.rows()
-            for fixture in (self.f, make_service(self.f.directory, self.f.clock)):
-                current = fixture.service.read_plan(self.p.committed_metadata.plan_id).coordination.reservations
-                reservation = next(view for view in current if view.use_id == use)
-                self.assertEqual(reservation.resource_ids, (rid,))
-                self.assertTrue(reservation.writer_active)
-                self.assertTrue(reservation.unresolved)
-                page = fixture.service.read_coordination(self.p.committed_metadata.plan_id)
-                self.assertIn(reservation, tuple(item.value for item in page.items if item.kind == "reservation"))
-            self.assertEqual(self.rows(), before)
-            with self.assertRaises(DomainError) as raised:
-                self.resolve(context(rid))
-            self.assertEqual(raised.exception.code, "held")
+        with ExitStack() as _owned_store_lifetimes:
+            for index, raw in enumerate((None, "opaque-legacy", "{unsupported")):
+                rid = f"visible-legacy-{index}"
+                self.f.store.write(lambda db: db.execute(
+                    "INSERT INTO resources (resource_id, host_id, kind, physical_identity, created_at) "
+                    "VALUES (?, 'synthetic-host', 'workspace', ?, 'ts')", (rid, raw)))
+                use = self.owned_use(rid, self.p, use_id=f"visible-use-{index}")
+                before = self.rows()
+                for fixture in (self.f, _owned_store_lifetimes.enter_context(make_service(self.f.directory, self.f.clock))):
+                    current = fixture.service.read_plan(self.p.committed_metadata.plan_id).coordination.reservations
+                    reservation = next(view for view in current if view.use_id == use)
+                    self.assertEqual(reservation.resource_ids, (rid,))
+                    self.assertTrue(reservation.writer_active)
+                    self.assertTrue(reservation.unresolved)
+                    page = fixture.service.read_coordination(self.p.committed_metadata.plan_id)
+                    self.assertIn(reservation, tuple(item.value for item in page.items if item.kind == "reservation"))
+                self.assertEqual(self.rows(), before)
+                with self.assertRaises(DomainError) as raised:
+                    self.resolve(context(rid))
+                self.assertEqual(raised.exception.code, "held")
 
     def test_current_reservation_projection_fails_closed_for_corrupt_redirect_chains(self):
-        for index, corruption in enumerate(("active-edge", "retired-without-edge", "cross-kind", "cross-host")):
-            with self.subTest(corruption=corruption):
-                f = make_service(self.f.directory / f"current-corrupt-{index}", self.f.clock)
-                p = f.create()
-                rid = f.register(workspace("/synthetic/current-corrupt", 904), p)
-                def seed(db):
-                    db.execute("INSERT INTO absent_host_work (absent_work_id, host_id, resource_id, scope) "
-                               "VALUES ('current-corrupt-work', 'synthetic-host', ?, 'workspace')", (rid,))
-                    db.execute("INSERT INTO resource_uses (use_id, resource_id, absent_work_id, scope, status) "
-                               "VALUES ('current-corrupt-use', ?, 'current-corrupt-work', 'workspace', 'unresolved')", (rid,))
-                    if corruption != "active-edge":
-                        db.execute("UPDATE resources SET status='retired' WHERE resource_id=?", (rid,))
-                    if corruption != "retired-without-edge":
-                        db.execute("INSERT INTO resources (resource_id, host_id, kind, created_at) VALUES "
-                                   "('current-corrupt-target', ?, ?, 'ts')",
-                                   ("foreign-host" if corruption == "cross-host" else "synthetic-host",
-                                    "repository" if corruption == "cross-kind" else "workspace"))
-                        db.execute("INSERT INTO resource_redirects (retired_id, survivor_id) "
-                                   "VALUES (?, 'current-corrupt-target')", (rid,))
-                f.store.write(seed)
-                before = f.store.read(lambda db: tuple(db.iterdump()))
-                for reader in (f.service.read_plan, f.service.read_coordination):
-                    with self.subTest(reader=reader.__name__):
-                        with self.assertRaises(DomainError) as raised:
-                            reader(p.committed_metadata.plan_id)
-                        self.assertEqual(raised.exception.code, "held")
-                self.assertEqual(f.store.read(lambda db: tuple(db.iterdump())), before)
+        with ExitStack() as _owned_store_lifetimes:
+            for index, corruption in enumerate(("active-edge", "retired-without-edge", "cross-kind", "cross-host")):
+                with self.subTest(corruption=corruption):
+                    f = _owned_store_lifetimes.enter_context(make_service(self.f.directory / f"current-corrupt-{index}", self.f.clock))
+                    p = f.create()
+                    rid = f.register(workspace("/synthetic/current-corrupt", 904), p)
+                    def seed(db):
+                        db.execute("INSERT INTO absent_host_work (absent_work_id, host_id, resource_id, scope,declared_identity,producer_id) "
+                                   "VALUES ('current-corrupt-work', 'synthetic-host', ?, 'workspace','synthetic-corrupt-worker','migration:current-corrupt-work')", (rid,))
+                        db.execute("INSERT INTO absent_host_work_members VALUES('current-corrupt-work',?,'workspace')",(rid,))
+                        db.execute("INSERT INTO resource_uses (use_id, resource_id, absent_work_id, scope, status) "
+                                   "VALUES ('current-corrupt-use', ?, 'current-corrupt-work', 'workspace', 'unresolved')", (rid,))
+                        db.execute("UPDATE absent_host_work SET anchor_use_id='current-corrupt-use' WHERE absent_work_id='current-corrupt-work'")
+                        value=dict(format=1,producer='migration',original_parent=['current-corrupt-work','synthetic-host',rid,'workspace','synthetic-corrupt-worker','unresolved',''],members=[dict(use_id='current-corrupt-use',resource_id=rid,scope='workspace',created_at='')])
+                        db.execute("INSERT INTO host_work_declarations VALUES('migration:current-corrupt-work','current-corrupt-work','migration','synthetic-corrupt-worker','unknown',?,'')",(json.dumps(value),))
+                        if corruption != "active-edge":
+                            db.execute("UPDATE resources SET status='retired' WHERE resource_id=?", (rid,))
+                        if corruption != "retired-without-edge":
+                            db.execute("INSERT INTO resources (resource_id, host_id, kind, created_at) VALUES "
+                                       "('current-corrupt-target', ?, ?, 'ts')",
+                                       ("foreign-host" if corruption == "cross-host" else "synthetic-host",
+                                        "repository" if corruption == "cross-kind" else "workspace"))
+                            db.execute("INSERT INTO resource_redirects (retired_id, survivor_id) "
+                                       "VALUES (?, 'current-corrupt-target')", (rid,))
+                    f.store.write(seed)
+                    before = f.store.read(lambda db: tuple(db.iterdump()))
+                    for reader in (f.service.read_plan, f.service.read_coordination):
+                        with self.subTest(reader=reader.__name__):
+                            with self.assertRaises(DomainError) as raised:
+                                reader(p.committed_metadata.plan_id)
+                            self.assertEqual(raised.exception.code, "held")
+                    self.assertEqual(f.store.read(lambda db: tuple(db.iterdump())), before)
 
     def test_reconcile_rejects_missing_equivalence_contradictions_and_cycles_atomically(self):
         a = self.register(replace(workspace("/synthetic/a-unknown", 830), device=None, inode=None))
@@ -729,30 +748,31 @@ class TestService(unittest.TestCase):
         self.assertEqual(raised.exception.code, "invalid")
 
     def test_duplicate_race_database_uniqueness_and_fault_rollback(self):
-        gate = threading.Barrier(2)
-        registry = self.resources()
-        def register(index):
-            local = make_service(self.f.directory, self.f.clock)
-            gate.wait(timeout=10)
+        with ExitStack() as _owned_store_lifetimes:
+            gate = threading.Barrier(2)
+            registry = self.resources()
+            def register(index):
+                local = _owned_store_lifetimes.enter_context(make_service(self.f.directory, self.f.clock))
+                gate.wait(timeout=10)
+                with plans.service_context("http://127.0.0.1:8790", self.f.clock):
+                    return local.store.write(lambda db: registry.register_claim(db, workspace(f"/synthetic/race-{index}", 860)))
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(register, i) for i in (1, 2)]
+                values = [future.result(timeout=15) for future in futures]
+            self.assertEqual(values[0], values[1])
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.f.store.write(lambda db: db.execute(
+                    "INSERT INTO resources (resource_id, host_id, kind, repository_id, physical_identity, canonical_path, status, created_at) "
+                    "SELECT 'duplicate-physical', host_id, kind, repository_id, physical_identity, '/synthetic/duplicate', status, created_at "
+                    "FROM resources WHERE resource_id=?", (values[0],)))
+            before = self.rows()
+            def fault(db):
+                registry.register_claim(db, workspace("/synthetic/rolled-back", 861))
+                raise RuntimeError("synthetic fault after registration")
             with plans.service_context("http://127.0.0.1:8790", self.f.clock):
-                return local.store.write(lambda db: registry.register_claim(db, workspace(f"/synthetic/race-{index}", 860)))
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(register, i) for i in (1, 2)]
-            values = [future.result(timeout=15) for future in futures]
-        self.assertEqual(values[0], values[1])
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.f.store.write(lambda db: db.execute(
-                "INSERT INTO resources (resource_id, host_id, kind, repository_id, physical_identity, canonical_path, status, created_at) "
-                "SELECT 'duplicate-physical', host_id, kind, repository_id, physical_identity, '/synthetic/duplicate', status, created_at "
-                "FROM resources WHERE resource_id=?", (values[0],)))
-        before = self.rows()
-        def fault(db):
-            registry.register_claim(db, workspace("/synthetic/rolled-back", 861))
-            raise RuntimeError("synthetic fault after registration")
-        with plans.service_context("http://127.0.0.1:8790", self.f.clock):
-            with self.assertRaises(RuntimeError):
-                self.f.store.write(fault)
-        self.assertEqual(self.rows(), before)
+                with self.assertRaises(RuntimeError):
+                    self.f.store.write(fault)
+            self.assertEqual(self.rows(), before)
 
     def test_registration_does_not_stat_or_open_attested_host_paths(self):
         claim = workspace("/host-only-path-that-does-not-exist/resource", 870)

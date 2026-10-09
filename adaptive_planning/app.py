@@ -12,12 +12,12 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Mount
 
-from adaptive_planning.admin import load_service_token
+from adaptive_planning.admin import load_service_token,resolve_store_hold
 from adaptive_planning.config import Config, DEFAULT_STALE_SECONDS, RequestBoundary, http_allowlist
 
 from adaptive_planning import attempts, checkpoints, imports, plans, recovery, resources, reviews
 from adaptive_planning.ownership import command_relay, require_kind_capabilities, require_orchestrator
-from adaptive_planning.store import Store
+from adaptive_planning.store import Store,store_is_held
 from adaptive_planning.types import (
     Command,
     CoordinationPage,
@@ -33,6 +33,7 @@ from adaptive_planning.types import (
 
 # Mutations share one transaction and the same domain authentication/replay authority.
 HANDLERS: dict[str, Callable[[sqlite3.Connection, Command], MutationReceipt]] = {
+    "resolve_store_hold": resolve_store_hold,
     "create_plan": plans.create_plan,
     "import_plan": imports.import_plan,
     "revise_plan": plans.revise_plan,
@@ -121,11 +122,8 @@ class PlanningService:
             epoch, version, host_id, hold, cutoff = db.execute(
                 "SELECT epoch, schema_version, host_id, store_hold, restore_cutoff FROM installation WHERE id = 1"
             ).fetchone()
-            reasons = db.execute(
-                "SELECT EXISTS(SELECT 1 FROM store_hold_reasons WHERE epoch = ? AND resolved = 0)",
-                (epoch,)).fetchone()[0]
             return InstallationView(epoch=epoch, schema_version=version, host_id=host_id,
-                                    dashboard_url=f"{self._base_url}/", store_hold=bool(hold or reasons),
+                                    dashboard_url=f"{self._base_url}/", store_hold=store_is_held(db),
                                     restore_cutoff=cutoff)
         return self._run_read(run)  # type: ignore[return-value]
 
@@ -159,7 +157,16 @@ def build_app(config: Config) -> Starlette:
     # Credential loading precedes even Store construction: ordinary startup never initializes it.
     token = load_service_token(config)
     clock = lambda: datetime.now(timezone.utc)
-    service = PlanningService(Store(config.data_dir / "planning.sqlite", clock), base_url=config.base_url, clock=clock,
+    store = Store(config.data_dir / "planning.sqlite", clock)
+    try:
+        return _compose_app(config, token, clock, store)
+    except BaseException:
+        store.close()
+        raise
+
+
+def _compose_app(config, token, clock, store):
+    service = PlanningService(store, base_url=config.base_url, clock=clock,
                               stale_seconds=config.stale_seconds)
     from adaptive_planning.transport import MCPHttpErrors, MCPServerDiagnostics, build_mcp, mcp_server_diagnostics
     from adaptive_planning.dashboard import dashboard_routes
@@ -175,9 +182,12 @@ def build_app(config: Config) -> Starlette:
 
     @asynccontextmanager
     async def lifespan(app):
-        with mcp_server_diagnostics():
-            async with server.session_manager.run():
-                yield
+        try:
+            with mcp_server_diagnostics():
+                async with server.session_manager.run():
+                    yield
+        finally:
+            store.close()
 
     async def public_server_error(request, error):
         # Starlette can answer before re-raising to the outer RequestBoundary. Ignore
@@ -190,6 +200,7 @@ def build_app(config: Config) -> Starlette:
                     exception_handlers={500: public_server_error})
     app.state.service = service
     app.state.mcp = server
+    app.state.close = store.close
     # Starlette normally places ServerErrorMiddleware outside user middleware. Wrap the
     # complete eagerly built stack so every route and error path meets the same boundary.
     app.middleware_stack = RequestBoundary(app.build_middleware_stack(), config, token)

@@ -48,11 +48,9 @@ WORKER_TOOLS = PLANNING_TOOLS | {
     "start_step", "report_activity", "record_checkpoint", "resolve_reassessment",
     "invalidate_result", "resolve_invalidation", "record_review", "accept_step",
     "reserve_verification", "release_resource_use", "reopen_attempt",
-    "sweep_stale", "resolve_attempt", "append_late_evidence",
+    "sweep_stale", "resolve_attempt", "append_late_evidence", "resolve_store_hold",
 }
-DISABLED_FUTURE_TOOLS = {
-    "resolve_store_hold",
-}
+DISABLED_FUTURE_TOOLS = set()
 WORKER_ORIGINS = ("codex-worker", "agy-worker", "copilot-worker")
 SDK_PROTOCOLS = {"auto": "2026-07-28", "legacy": "2025-11-25"}
 

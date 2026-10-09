@@ -1,5 +1,6 @@
 """Tests for Task 22: Explicit legacy authority handoff and recovery import."""
 from __future__ import annotations
+from contextlib import ExitStack
 
 import asyncio
 import copy
@@ -45,12 +46,12 @@ class TestServiceImports(unittest.TestCase):
     def setUp(self):
         self.directory = TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.f = make_service(Path(self.directory.name))
+        self.f = self.enterContext(make_service(Path(self.directory.name)))
         self.p = self.f.create(steps=(step("setup"),))
 
     def test_first_plan_import_by_claim(self):
-        with TemporaryDirectory() as directory:
-            fresh = make_service(Path(directory))
+        with TemporaryDirectory() as directory, ExitStack() as _directory_store_lifetimes_0:
+            fresh = _directory_store_lifetimes_0.enter_context(make_service(Path(directory)))
             self.assertEqual(fresh.service.list_plans(), ())
             self.assertEqual(fresh.store.read(lambda db: db.execute("SELECT count(*) FROM resources").fetchone()[0]), 0)
             self.assertEqual(fresh.store.read(lambda db: db.execute("SELECT count(*) FROM capabilities").fetchone()[0]), 0)
@@ -84,58 +85,59 @@ class TestServiceImports(unittest.TestCase):
             self.assertEqual(fresh.store.read(lambda db: db.execute("SELECT count(*) FROM resources").fetchone()[0]), 1)
 
     def test_source_identity_not_digest_tuple_identity(self):
-        source = None
-        generation = "00000000-0000-4000-8000-000000000001"
-        for revision in range(1, 18):
-            source = prepare_publication(
-                legacy_proposal(), source, timestamp="2026-10-06T00:00:00Z",
-                generation=generation, expected_revision=revision - 1,
-                expected_generation=None if revision == 1 else generation,
-                authorization_note="synthetic legacy authorization" if revision in (1, 12) else None,
-                max_file_bytes=10 * 1024 * 1024, max_history=100,
+        with ExitStack() as _owned_store_lifetimes:
+            source = None
+            generation = "00000000-0000-4000-8000-000000000001"
+            for revision in range(1, 18):
+                source = prepare_publication(
+                    legacy_proposal(), source, timestamp="2026-10-06T00:00:00Z",
+                    generation=generation, expected_revision=revision - 1,
+                    expected_generation=None if revision == 1 else generation,
+                    authorization_note="synthetic legacy authorization" if revision in (1, 12) else None,
+                    max_file_bytes=10 * 1024 * 1024, max_history=100,
+                )
+            directory_id = self.f.register(workspace("/synthetic/legacy", 300), self.p)
+            payload = {
+                "host_id": "synthetic-host",
+                "source_directory_id": directory_id,
+                "source_directory_claim": None,
+                "original_task_id": source["taskId"],
+                "original_snapshot": source,
+                "provenance": DocumentRef("legacy.json", None, None, "v17", None),
+                "writers_stopped": "confirmed synthetic handoff",
+                "known_contexts": {},
+            }
+            original = self.f.command("import_plan", payload, key="import-one")
+            first = self.f.service.execute(original)
+            retry = self.f.service.execute(self.f.command("import_plan", payload, key="import-two"))
+            self.assertEqual(first.current_metadata.plan_id, retry.current_metadata.plan_id)
+            self.assertEqual(first.current_metadata.revision, 17)
+            self.assertEqual(first.private.orchestrator_token, retry.private.orchestrator_token)
+            reopened = _owned_store_lifetimes.enter_context(make_service(self.f.directory, self.f.clock))
+            self.assertEqual(reopened.service.execute(original).private.orchestrator_token, first.private.orchestrator_token)
+            takeover = reopened.command(
+                "takeover",
+                {"expected_ownership_version": first.current_metadata.ownership_version, "reason": "synthetic explicit takeover"},
+                receipt=first,
             )
-        directory_id = self.f.register(workspace("/synthetic/legacy", 300), self.p)
-        payload = {
-            "host_id": "synthetic-host",
-            "source_directory_id": directory_id,
-            "source_directory_claim": None,
-            "original_task_id": source["taskId"],
-            "original_snapshot": source,
-            "provenance": DocumentRef("legacy.json", None, None, "v17", None),
-            "writers_stopped": "confirmed synthetic handoff",
-            "known_contexts": {},
-        }
-        original = self.f.command("import_plan", payload, key="import-one")
-        first = self.f.service.execute(original)
-        retry = self.f.service.execute(self.f.command("import_plan", payload, key="import-two"))
-        self.assertEqual(first.current_metadata.plan_id, retry.current_metadata.plan_id)
-        self.assertEqual(first.current_metadata.revision, 17)
-        self.assertEqual(first.private.orchestrator_token, retry.private.orchestrator_token)
-        reopened = make_service(self.f.directory, self.f.clock)
-        self.assertEqual(reopened.service.execute(original).private.orchestrator_token, first.private.orchestrator_token)
-        takeover = reopened.command(
-            "takeover",
-            {"expected_ownership_version": first.current_metadata.ownership_version, "reason": "synthetic explicit takeover"},
-            receipt=first,
-        )
-        reopened.service.execute(takeover)
-        fenced = reopened.service.execute(original)
-        self.assertIsNone(fenced.private)
-        self.assertEqual(fenced.committed_metadata.revision, 17)
-        self.assertGreater(fenced.current_metadata.ownership_version, first.current_metadata.ownership_version)
-        self.assertIsNone(reopened.service.execute(reopened.command("import_plan", payload, key="import-three")).private)
-        changed = copy.deepcopy(payload)
-        changed["original_snapshot"]["objective"] = "changed after handoff"
-        before = reopened.service.read_events(first.current_metadata.plan_id)
-        with self.assertRaises(DomainError) as error:
-            reopened.service.execute(reopened.command("import_plan", changed, key="changed-source"))
-        self.assertEqual(error.exception.code, "handoff_conflict")
-        self.assertEqual(reopened.service.read_events(first.current_metadata.plan_id), before)
+            reopened.service.execute(takeover)
+            fenced = reopened.service.execute(original)
+            self.assertIsNone(fenced.private)
+            self.assertEqual(fenced.committed_metadata.revision, 17)
+            self.assertGreater(fenced.current_metadata.ownership_version, first.current_metadata.ownership_version)
+            self.assertIsNone(reopened.service.execute(reopened.command("import_plan", payload, key="import-three")).private)
+            changed = copy.deepcopy(payload)
+            changed["original_snapshot"]["objective"] = "changed after handoff"
+            before = reopened.service.read_events(first.current_metadata.plan_id)
+            with self.assertRaises(DomainError) as error:
+                reopened.service.execute(reopened.command("import_plan", changed, key="changed-source"))
+            self.assertEqual(error.exception.code, "handoff_conflict")
+            self.assertEqual(reopened.service.read_events(first.current_metadata.plan_id), before)
 
     def test_active_import_context_claim_and_attachment(self):
         for known in (True, False):
-            with self.subTest(known=known), TemporaryDirectory() as directory:
-                f = make_service(Path(directory))
+            with self.subTest(known=known), TemporaryDirectory() as directory, ExitStack() as _directory_store_lifetimes_0:
+                f = _directory_store_lifetimes_0.enter_context(make_service(Path(directory)))
                 claims = ExecutionContextClaims("non-repository", None, workspace("/synthetic/import-live", 710), False, (), True, None)
                 source = active_legacy_snapshot()
                 payload = {
@@ -430,7 +432,7 @@ class TestImportFixRound1(unittest.TestCase):
         directory = TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.directory = directory
-        self.f = make_service(Path(directory.name))
+        self.f = self.enterContext(make_service(Path(directory.name)))
         self.p = self.f.create(steps=(step("setup"),))
 
     # ----------------------------------------------------------------- helpers
@@ -570,28 +572,29 @@ class TestImportFixRound1(unittest.TestCase):
                 self.assertEqual(self.rows("SELECT started_at FROM attempts"), ((None,),))
 
     def test_known_context_namespace_is_strict_and_unknown_is_not_invented(self):
-        receipt, attempt = self.import_known("/synthetic/r1-ns-known", 1220)
-        plan_id = receipt.current_metadata.plan_id
-        generation = receipt.current_metadata.generation
-        reopened = make_service(self.f.directory, self.f.clock)
-        for fixture in (self.f, reopened):
-            namespace, owned = fixture.store.read(lambda db: resources.execution_uses(db, plan_id, attempt.attempt_id))
-            self.assertIsNone(namespace["implementation"]["writer"])
-            self.assertEqual(namespace["groups"], {})
-            self.assertEqual(len(namespace["implementation"]["members"]), 1)
-            self.assertEqual(namespace["source"]["origin_epoch"], self.f.epoch)
-            self.assertEqual(namespace["source"]["origin_generation"], generation)
-        readonly, ro_attempt = self.import_known("/synthetic/r1-ns-readonly", 1230, writes=False)
-        namespace, _ = self.f.store.read(lambda db: resources.execution_uses(
-            db, readonly.current_metadata.plan_id, ro_attempt.attempt_id))
-        self.assertEqual(namespace["implementation"]["members"], [])
-        unknown = self.do_import(self.payload(path="/synthetic/r1-ns-unknown", inode=1240))
-        unknown_attempt = self.attempt(unknown)
-        with self.assertRaises(DomainError):
-            self.f.store.read(lambda db: resources.execution_uses(db, unknown.current_metadata.plan_id, unknown_attempt.attempt_id))
-        self.assertEqual(self.rows("SELECT json_extract(payload,'$.execution_uses') FROM attempts WHERE attempt_id=?",
-                                   unknown_attempt.attempt_id), ((None,),))
-        self.assertEqual(self.rows("SELECT count(*) FROM resource_uses WHERE attempt_id=?", unknown_attempt.attempt_id), ((0,),))
+        with ExitStack() as _owned_store_lifetimes:
+            receipt, attempt = self.import_known("/synthetic/r1-ns-known", 1220)
+            plan_id = receipt.current_metadata.plan_id
+            generation = receipt.current_metadata.generation
+            reopened = _owned_store_lifetimes.enter_context(make_service(self.f.directory, self.f.clock))
+            for fixture in (self.f, reopened):
+                namespace, owned = fixture.store.read(lambda db: resources.execution_uses(db, plan_id, attempt.attempt_id))
+                self.assertIsNone(namespace["implementation"]["writer"])
+                self.assertEqual(namespace["groups"], {})
+                self.assertEqual(len(namespace["implementation"]["members"]), 1)
+                self.assertEqual(namespace["source"]["origin_epoch"], self.f.epoch)
+                self.assertEqual(namespace["source"]["origin_generation"], generation)
+            readonly, ro_attempt = self.import_known("/synthetic/r1-ns-readonly", 1230, writes=False)
+            namespace, _ = self.f.store.read(lambda db: resources.execution_uses(
+                db, readonly.current_metadata.plan_id, ro_attempt.attempt_id))
+            self.assertEqual(namespace["implementation"]["members"], [])
+            unknown = self.do_import(self.payload(path="/synthetic/r1-ns-unknown", inode=1240))
+            unknown_attempt = self.attempt(unknown)
+            with self.assertRaises(DomainError):
+                self.f.store.read(lambda db: resources.execution_uses(db, unknown.current_metadata.plan_id, unknown_attempt.attempt_id))
+            self.assertEqual(self.rows("SELECT json_extract(payload,'$.execution_uses') FROM attempts WHERE attempt_id=?",
+                                       unknown_attempt.attempt_id), ((None,),))
+            self.assertEqual(self.rows("SELECT count(*) FROM resource_uses WHERE attempt_id=?", unknown_attempt.attempt_id), ((0,),))
 
     def test_import_time_cross_plan_conflict_rolls_back_every_record(self):
         rid = self.f.register(workspace("/synthetic/r1-conflict-live", 1250), self.p)
@@ -745,32 +748,33 @@ class TestImportFixRound1(unittest.TestCase):
         self.assertEqual(self.origin()["writers_stopped"], "legacy publisher stopped")
 
     def test_concurrent_duplicate_bootstrap_commits_one_import(self):
-        other = make_service(self.f.directory, self.f.clock)
-        source = active_legacy_snapshot()
-        barrier = threading.Barrier(2)
-        results = {}
+        with ExitStack() as _owned_store_lifetimes:
+            other = _owned_store_lifetimes.enter_context(make_service(self.f.directory, self.f.clock))
+            source = active_legacy_snapshot()
+            barrier = threading.Barrier(2)
+            results = {}
 
-        def run(name, fixture, key):
-            try:
-                command = fixture.command("import_plan", self.payload(source), key=key)
-                barrier.wait(timeout=20)
-                results[name] = fixture.service.execute(command)
-            except BaseException as error:  # reported by the assertions below
-                results[name] = error
-        threads = [threading.Thread(target=run, args=("a", self.f, "r1-race-a")),
-                   threading.Thread(target=run, args=("b", other, "r1-race-b"))]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=60)
-        for outcome in results.values():
-            self.assertNotIsInstance(outcome, BaseException, repr(outcome))
-        self.assertEqual(results["a"].current_metadata.plan_id, results["b"].current_metadata.plan_id)
-        self.assertEqual(results["a"].private.orchestrator_token, results["b"].private.orchestrator_token)
-        self.assertEqual(self.rows("SELECT count(*) FROM imports"), ((1,),))
-        self.assertEqual(self.rows("SELECT count(*) FROM events WHERE kind='import_plan'"), ((1,),))
-        imported = results["a"].current_metadata.plan_id
-        self.assertEqual(self.rows("SELECT count(*) FROM capabilities WHERE plan_id=? AND role='orchestrator'", imported), ((1,),))
+            def run(name, fixture, key):
+                try:
+                    command = fixture.command("import_plan", self.payload(source), key=key)
+                    barrier.wait(timeout=20)
+                    results[name] = fixture.service.execute(command)
+                except BaseException as error:  # reported by the assertions below
+                    results[name] = error
+            threads = [threading.Thread(target=run, args=("a", self.f, "r1-race-a")),
+                       threading.Thread(target=run, args=("b", other, "r1-race-b"))]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
+            for outcome in results.values():
+                self.assertNotIsInstance(outcome, BaseException, repr(outcome))
+            self.assertEqual(results["a"].current_metadata.plan_id, results["b"].current_metadata.plan_id)
+            self.assertEqual(results["a"].private.orchestrator_token, results["b"].private.orchestrator_token)
+            self.assertEqual(self.rows("SELECT count(*) FROM imports"), ((1,),))
+            self.assertEqual(self.rows("SELECT count(*) FROM events WHERE kind='import_plan'"), ((1,),))
+            imported = results["a"].current_metadata.plan_id
+            self.assertEqual(self.rows("SELECT count(*) FROM capabilities WHERE plan_id=? AND role='orchestrator'", imported), ((1,),))
 
     # ------------------------------------------------------- P7 attachment lifecycle
     def test_attach_replay_counts_one_decision_and_never_overwrites(self):
@@ -1045,29 +1049,30 @@ class TestImportFixRound1(unittest.TestCase):
 
     # ====================================== R2 item 6: bootstrap lifecycle and bounds
     def test_import_bootstrap_lost_response_current_grant_only(self):
-        payload = self.payload()
-        command = self.f.command("import_plan", payload, key="r2-lost")
-        first = self.f.service.execute(command)
-        token = first.private.orchestrator_token
-        self.assertEqual(self.rows("SELECT key FROM requests WHERE response_payload LIKE ?", "%" + token + "%"), (("r2-lost",),))
-        error = self.refused(replace(command, epoch="r2-old-epoch"))
-        self.assertEqual(error.code, "stale_epoch")
-        again = self.f.service.execute(command)
-        self.assertTrue(again.replayed)
-        self.assertEqual(again.private.orchestrator_token, token)
-        self.assertEqual(again.current_metadata.plan_id, first.current_metadata.plan_id)
-        fresh_key = self.do_import(payload, key="r2-lost-new")
-        self.assertFalse(fresh_key.replayed)
-        self.assertEqual(fresh_key.private.orchestrator_token, token)
-        reopened = make_service(self.f.directory, self.f.clock)
-        self.assertEqual(reopened.service.execute(command).private.orchestrator_token, token)
-        self.assertEqual(self.rows("SELECT count(*) FROM imports"), ((1,),))
-        self.assertEqual(self.rows("SELECT key FROM requests WHERE response_payload LIKE ?", "%" + token + "%"), (("r2-lost",),))
-        reopened.service.execute(reopened.command("takeover", {
-            "expected_ownership_version": first.current_metadata.ownership_version,
-            "reason": "r2 explicit takeover"}, receipt=first))
-        self.assertIsNone(reopened.service.execute(command).private)
-        self.assertIsNone(reopened.service.execute(reopened.command("import_plan", payload, key="r2-lost-third")).private)
+        with ExitStack() as _owned_store_lifetimes:
+            payload = self.payload()
+            command = self.f.command("import_plan", payload, key="r2-lost")
+            first = self.f.service.execute(command)
+            token = first.private.orchestrator_token
+            self.assertEqual(self.rows("SELECT key FROM requests WHERE response_payload LIKE ?", "%" + token + "%"), (("r2-lost",),))
+            error = self.refused(replace(command, epoch="r2-old-epoch"))
+            self.assertEqual(error.code, "stale_epoch")
+            again = self.f.service.execute(command)
+            self.assertTrue(again.replayed)
+            self.assertEqual(again.private.orchestrator_token, token)
+            self.assertEqual(again.current_metadata.plan_id, first.current_metadata.plan_id)
+            fresh_key = self.do_import(payload, key="r2-lost-new")
+            self.assertFalse(fresh_key.replayed)
+            self.assertEqual(fresh_key.private.orchestrator_token, token)
+            reopened = _owned_store_lifetimes.enter_context(make_service(self.f.directory, self.f.clock))
+            self.assertEqual(reopened.service.execute(command).private.orchestrator_token, token)
+            self.assertEqual(self.rows("SELECT count(*) FROM imports"), ((1,),))
+            self.assertEqual(self.rows("SELECT key FROM requests WHERE response_payload LIKE ?", "%" + token + "%"), (("r2-lost",),))
+            reopened.service.execute(reopened.command("takeover", {
+                "expected_ownership_version": first.current_metadata.ownership_version,
+                "reason": "r2 explicit takeover"}, receipt=first))
+            self.assertIsNone(reopened.service.execute(command).private)
+            self.assertIsNone(reopened.service.execute(reopened.command("import_plan", payload, key="r2-lost-third")).private)
 
     def test_import_origin_and_page_bounds_fail_closed_with_exact_rollback(self):
         source = active_legacy_snapshot()
@@ -1406,31 +1411,32 @@ class TestImportFixRound1(unittest.TestCase):
                                      first.private.orchestrator_token)
 
     def test_exact_replay_source_proof_is_read_only_and_keeps_alias_reconciliation(self):
-        survivor, retired = self.reconciled_pair("r3-alias", 3100)
-        source = active_legacy_snapshot()
-        command = self.f.command("import_plan", self.payload(source, directory_id=retired), key="r3-alias-first")
-        first = self.f.service.execute(command)
-        token = first.private.orchestrator_token
-        before = self.state()
-        again = self.f.service.execute(command)
-        self.assertTrue(again.replayed)
-        self.assertEqual(again.private.orchestrator_token, token)
-        self.assertEqual(self.state(), before)
-        canonical = self.f.command("import_plan", self.payload(source, directory_id=survivor), key="r3-alias-survivor")
-        dedup = self.f.service.execute(canonical)
-        self.assertEqual(dedup.private.orchestrator_token, token)
-        before = self.state()
-        self.assertEqual(self.f.service.execute(canonical).private.orchestrator_token, token)
-        self.assertEqual(self.state(), before)
-        claim = self.f.command("import_plan", self.payload(source, path="/synthetic/r3-claim-src", inode=3150), key="r3-claim-first")
-        fresh = self.f.service.execute(claim)
-        self.assertNotEqual(fresh.current_metadata.plan_id, first.current_metadata.plan_id)
-        before = self.state()
-        self.assertEqual(self.f.service.execute(claim).private.orchestrator_token, fresh.private.orchestrator_token)
-        self.assertEqual(self.state(), before)
-        reopened = make_service(self.f.directory, self.f.clock)
-        self.assertEqual(reopened.service.execute(claim).private.orchestrator_token, fresh.private.orchestrator_token)
-        self.assertEqual(self.state(), before)
+        with ExitStack() as _owned_store_lifetimes:
+            survivor, retired = self.reconciled_pair("r3-alias", 3100)
+            source = active_legacy_snapshot()
+            command = self.f.command("import_plan", self.payload(source, directory_id=retired), key="r3-alias-first")
+            first = self.f.service.execute(command)
+            token = first.private.orchestrator_token
+            before = self.state()
+            again = self.f.service.execute(command)
+            self.assertTrue(again.replayed)
+            self.assertEqual(again.private.orchestrator_token, token)
+            self.assertEqual(self.state(), before)
+            canonical = self.f.command("import_plan", self.payload(source, directory_id=survivor), key="r3-alias-survivor")
+            dedup = self.f.service.execute(canonical)
+            self.assertEqual(dedup.private.orchestrator_token, token)
+            before = self.state()
+            self.assertEqual(self.f.service.execute(canonical).private.orchestrator_token, token)
+            self.assertEqual(self.state(), before)
+            claim = self.f.command("import_plan", self.payload(source, path="/synthetic/r3-claim-src", inode=3150), key="r3-claim-first")
+            fresh = self.f.service.execute(claim)
+            self.assertNotEqual(fresh.current_metadata.plan_id, first.current_metadata.plan_id)
+            before = self.state()
+            self.assertEqual(self.f.service.execute(claim).private.orchestrator_token, fresh.private.orchestrator_token)
+            self.assertEqual(self.state(), before)
+            reopened = _owned_store_lifetimes.enter_context(make_service(self.f.directory, self.f.clock))
+            self.assertEqual(reopened.service.execute(claim).private.orchestrator_token, fresh.private.orchestrator_token)
+            self.assertEqual(self.state(), before)
 
     # ====================================== R3 items 6(b)/11: retained imported history across success
     LIFECYCLE_KEYS = frozenset({"cancellation_reason", "cancelled_at", "cancelled_from"})
@@ -1485,33 +1491,34 @@ class TestImportFixRound1(unittest.TestCase):
                                  (("unresolved",),))
 
     def test_successful_full_cohort_replacement_retains_history_and_replays_exactly(self):
-        receipt, attempt = self.import_cohort("hist", 3300)
-        plan_id = receipt.current_metadata.plan_id
-        ids = {scope: rid for rid, scope in self.rows("SELECT resource_id, scope FROM resource_uses WHERE plan_id=?", plan_id)}
-        replacement = ExecutionContext("repository", ids["repository"], None, True, (), True, None)
-        before = self.retained(plan_id, attempt.attempt_id)
-        command = self.resolve(receipt, attempt, "replace", "pending", assignee="new-worker",
-                               replacement=replacement, stopped=tuple(ids.values()), key="r3-hist-replace")
-        replaced = self.f.service.execute(command)
-        after = self.retained(plan_id, attempt.attempt_id)
-        self.assert_history_retained(before, after)
-        self.assertEqual(self.rows("SELECT state, version FROM attempts WHERE attempt_id=?", attempt.attempt_id),
-                         (("released", 2),))
-        self.assertEqual(self.rows("SELECT DISTINCT status FROM resource_uses WHERE attempt_id=?", attempt.attempt_id),
-                         (("released",),))
-        successor = self.rows("SELECT attempt_id FROM attempts WHERE plan_id=? AND step_id='step-1' AND attempt_id<>?",
-                              plan_id, attempt.attempt_id)
-        self.assertEqual(len(successor), 1)
-        self.assertTrue(self.is_imported(plan_id, attempt.attempt_id))
-        self.assertFalse(self.is_imported(plan_id, successor[0][0]))
-        self.assertEqual(self.rows("SELECT count(*) FROM capabilities WHERE role='attempt'"), ((1,),))
-        settled = self.state()
-        self.assertEqual(self.f.service.execute(command).private.attempt_token, replaced.private.attempt_token)
-        self.assertEqual(self.state(), settled)
-        reopened = make_service(self.f.directory, self.f.clock)
-        self.assertEqual(reopened.service.execute(command).private.attempt_token, replaced.private.attempt_token)
-        self.assertEqual(self.state(), settled)
-        self.assert_history_retained(before, self.retained(plan_id, attempt.attempt_id))
+        with ExitStack() as _owned_store_lifetimes:
+            receipt, attempt = self.import_cohort("hist", 3300)
+            plan_id = receipt.current_metadata.plan_id
+            ids = {scope: rid for rid, scope in self.rows("SELECT resource_id, scope FROM resource_uses WHERE plan_id=?", plan_id)}
+            replacement = ExecutionContext("repository", ids["repository"], None, True, (), True, None)
+            before = self.retained(plan_id, attempt.attempt_id)
+            command = self.resolve(receipt, attempt, "replace", "pending", assignee="new-worker",
+                                   replacement=replacement, stopped=tuple(ids.values()), key="r3-hist-replace")
+            replaced = self.f.service.execute(command)
+            after = self.retained(plan_id, attempt.attempt_id)
+            self.assert_history_retained(before, after)
+            self.assertEqual(self.rows("SELECT state, version FROM attempts WHERE attempt_id=?", attempt.attempt_id),
+                             (("released", 2),))
+            self.assertEqual(self.rows("SELECT DISTINCT status FROM resource_uses WHERE attempt_id=?", attempt.attempt_id),
+                             (("released",),))
+            successor = self.rows("SELECT attempt_id FROM attempts WHERE plan_id=? AND step_id='step-1' AND attempt_id<>?",
+                                  plan_id, attempt.attempt_id)
+            self.assertEqual(len(successor), 1)
+            self.assertTrue(self.is_imported(plan_id, attempt.attempt_id))
+            self.assertFalse(self.is_imported(plan_id, successor[0][0]))
+            self.assertEqual(self.rows("SELECT count(*) FROM capabilities WHERE role='attempt'"), ((1,),))
+            settled = self.state()
+            self.assertEqual(self.f.service.execute(command).private.attempt_token, replaced.private.attempt_token)
+            self.assertEqual(self.state(), settled)
+            reopened = _owned_store_lifetimes.enter_context(make_service(self.f.directory, self.f.clock))
+            self.assertEqual(reopened.service.execute(command).private.attempt_token, replaced.private.attempt_token)
+            self.assertEqual(self.state(), settled)
+            self.assert_history_retained(before, self.retained(plan_id, attempt.attempt_id))
 
 
 if __name__ == "__main__":

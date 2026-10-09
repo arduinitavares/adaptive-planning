@@ -1,6 +1,7 @@
 """Installed distribution behavior and the persistent loopback container contract."""
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -24,7 +25,7 @@ PYTHON_IMAGE = (
 
 def environment() -> dict[str, str]:
     """Keep test children independent of local project/provider configuration."""
-    result = {name: os.environ[name] for name in ("PATH", "SYSTEMROOT", "TMPDIR") if name in os.environ}
+    result = {name: os.environ[name] for name in ("PATH", "SYSTEMROOT", "TMPDIR", "UV_PYTHON") if name in os.environ}
     result.update(UV_NO_CONFIG="1", UV_PYTHON_DOWNLOADS="never", PYTHONDONTWRITEBYTECODE="1")
     return result
 
@@ -114,6 +115,7 @@ INSTALLED_PROBE = textwrap.dedent(r'''
         assert hashlib.sha256(body).hexdigest() == expected[name], f"Asset route returned wrong bytes: {name}"
     status, headers, body = asyncio.run(get("/"))
     assert status == 200 and b'<script src="/app.js"' in body, "Installed dashboard index failed"
+    app.state.close()
     print("Installed resources, real asset routes, CLI entry, and import safety passed.")
 ''')
 
@@ -162,6 +164,54 @@ class TestService(unittest.TestCase):
         # Omitting assets from the sdist must break a fresh sdist installation too.
         self.installed_probe(".tar.gz")
 
+    def test_container_sqlite_runtime_is_pinned_verified_and_feature_complete(self):
+        # A base tag alone does not qualify its dynamically loaded SQLite.
+        recipe=(ROOT/'Dockerfile').read_text()
+        self.assertIn('FROM '+PYTHON_IMAGE+' AS sqlite-builder',recipe)
+        self.assertIn('https://www.sqlite.org/2026/sqlite-autoconf-3530400.tar.gz',recipe)
+        self.assertIn('454e45f61c6bd75b7420e7190732dea03ce6639c63ada47bbc592f67fc340338',recipe)
+        self.assertIn('0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c',recipe)
+        self.assertIn('hashlib.sha3_256',recipe)
+        self.assertLess(recipe.index('hashlib.sha3_256'),recipe.index('extractall'))
+        self.assertIn('-DSQLITE_THREADSAFE=1',recipe)
+        for flag in ('-shared','-fPIC','-Wl,-soname,libsqlite3.so.0','-lpthread','-ldl','-lm'):
+            self.assertIn(flag,recipe)
+        self.assertNotIn('SQLITE_OMIT_',recipe)
+        runtime=recipe.split('\nFROM '+PYTHON_IMAGE+'\n')[-1]
+        self.assertNotIn('apt-get',runtime)
+        self.assertNotIn('gcc ',runtime)
+        self.assertIn('ldconfig',runtime)
+        self.assertIn("sqlite3.sqlite_version == '3.53.4'",runtime)
+        self.assertIn('2026-07-24 19:02:57 bf7c7f30031888f4e796e429ab3978879485813aaca6f641c7b33e4e09459bcc',runtime)
+        self.assertIn('sqlite3.threadsafety == 3',runtime)
+        self.assertIn('PRAGMA foreign_keys=ON',runtime)
+        self.assertIn('PRAGMA journal_mode=WAL',runtime)
+        self.assertIn('.backup(',runtime)
+
+    def test_container_selects_owned_sqlite_and_proves_actual_loaded_path(self):
+        # A verified DSO on disk does not mean Python's loader selects it.
+        runtime=(ROOT/'Dockerfile').read_text().split('\nFROM '+PYTHON_IMAGE+'\n')[-1]
+        environment={}
+        probes=[]
+        for line in runtime.replace('\\\n',' ').splitlines():
+            instruction,_,value=line.strip().partition(' ')
+            if instruction=='ENV':
+                environment.update(item.split('=',1) for item in shlex.split(value))
+            elif instruction=='RUN':
+                words=shlex.split(value)
+                if 'python' in words and '-c' in words:
+                    self.assertEqual(environment.get('LD_LIBRARY_PATH'),'/usr/local/lib',
+                                     'Python must select the owned SQLite ahead of Debian ldconfig entries')
+                    probes.append(words[words.index('-c')+1])
+        self.assertEqual(environment.get('LD_LIBRARY_PATH'),'/usr/local/lib',
+                         'The owned-library selection must persist in the final runtime')
+        self.assertEqual(len(probes),1)
+        self.assertIn('/proc/self/maps',probes[0])
+        assertions=[node.test for node in ast.walk(ast.parse(probes[0])) if isinstance(node,ast.Assert)]
+        pinned_path=ast.parse("sqlite_libraries == {'/usr/local/lib/libsqlite3.so.0'}",mode='eval').body
+        self.assertIn(ast.dump(pinned_path),[ast.dump(node) for node in assertions],
+                      'The build probe must reject Python loading a different SQLite DSO')
+
     def test_container_contract(self):
         # A widened port/mount/credential boundary must fail before container activation.
         self.assertTrue((ROOT / "compose.yaml").is_file(), "Persistent loopback Compose configuration is missing")
@@ -207,8 +257,11 @@ class TestService(unittest.TestCase):
                             for command in commands), "Image must install the frozen production package")
         self.assertFalse(any("init" in command for command in commands), "Build must never initialize credentials")
         copies = [shlex.split(value) for name, value in instructions if name == "COPY"]
-        uv_copy = [copy for copy in copies if copy[0].startswith("--from=")]
+        uv_copy = [copy for copy in copies if copy[0].startswith("--from=ghcr.io/")]
         self.assertEqual(uv_copy, [["--from=ghcr.io/astral-sh/uv:0.10.12", "/uv", "/usr/local/bin/uv"]])
+        owned_copy = [copy for copy in copies if copy[0].startswith("--from=") and not copy[0].startswith("--from=ghcr.io/")]
+        self.assertEqual(owned_copy, [["--from=sqlite-builder", "/sqlite-library/libsqlite3.so.0", "/usr/local/lib/libsqlite3.so.0"]])
+        self.assertEqual([value for name,value in instructions if name=='FROM'],[PYTHON_IMAGE+' AS sqlite-builder',PYTHON_IMAGE])
         sources = {source for copy in copies if not copy[0].startswith("--from=") for source in copy[:-1]}
         self.assertEqual(sources, {"pyproject.toml", "uv.lock", "adaptive_planning", "assets/dashboard"})
         docker_environment = [item for name, value in instructions if name == "ENV" for item in shlex.split(value)]

@@ -321,8 +321,8 @@ def review_satisfied(connection: sqlite3.Connection, plan_id: PlanId, step_id: S
 
 
 def _store_hold(connection):
-    epoch, hold = connection.execute("SELECT epoch,store_hold FROM installation WHERE id=1").fetchone()
-    if hold or connection.execute("SELECT 1 FROM store_hold_reasons WHERE epoch=? AND resolved=0 LIMIT 1", (epoch,)).fetchone():
+    from adaptive_planning.store import store_is_held
+    if store_is_held(connection):
         raise DomainError("held", "Writable verification is held pending inventory resolution")
 
 
@@ -439,12 +439,8 @@ def release_resource_use(connection: sqlite3.Connection, command: Command) -> Mu
     if row[2] is None:
         if any(value is not None for value in (command.attempt_id, command.attempt_version, command.definition_version)):
             raise DomainError("invalid", "Orphan release has no owned attempt target for supplied assertions")
-        orphan = connection.execute("SELECT resource_id,host_id FROM absent_host_work WHERE absent_work_id=? AND scope=?",
-                                    (row[4], row[5])).fetchone()
-        host = connection.execute("SELECT host_id FROM installation WHERE id=1").fetchone()[0]
-        if row[3] is not None or orphan is None or orphan[1] != host or resources.resolve_resource_id(connection, orphan[0]) != resources.resolve_resource_id(connection, row[1]):
-            raise DomainError("invalid", "Release has no exact coherent orphan ownership proof")
-        expected = {resources.resolve_resource_id(connection, row[1])}
+        cohort,ids=resources.select_orphan_stop(connection,row[0],payload['resource_ids'])
+        expected=set(cohort['resource_ids'])
     else:
         namespace, owned = resources.execution_uses(connection, plan.plan_id, row[3])
         attempt = attempts._attempt_row(connection, plan.plan_id, row[3])

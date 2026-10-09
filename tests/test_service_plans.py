@@ -1,5 +1,6 @@
 """Durable creation, semantic planning CRUD, safe retries, and bounded coordination reads."""
 from __future__ import annotations
+from contextlib import ExitStack
 
 import base64
 import dataclasses
@@ -74,11 +75,15 @@ def insert_orphan_use(store, use_id: str = "use-orphan", status: str = "unresolv
         db.execute("INSERT OR IGNORE INTO resources (resource_id, host_id, kind, status, created_at) "
                    "VALUES ('res-1', 'synthetic-host', 'workspace', 'active', 'ts')")
         db.execute("INSERT OR IGNORE INTO absent_host_work (absent_work_id, host_id, resource_id, scope, "
-                   "declared_identity, status, created_at) VALUES ('absent-1', 'synthetic-host', 'res-1', "
-                   "'workspace', 'worker-gone', 'unresolved', 'ts')")
+                   "declared_identity, status, created_at,producer_id) VALUES ('absent-1', 'synthetic-host', 'res-1', "
+                   "'workspace', 'worker-gone', 'unresolved', 'ts','migration:absent-1')")
+        db.execute("INSERT INTO absent_host_work_members VALUES('absent-1','res-1','workspace')")
         db.execute("INSERT INTO resource_uses (use_id, resource_id, plan_id, attempt_id, absent_work_id, scope, "
                    "status, created_at) VALUES (?, 'res-1', NULL, NULL, 'absent-1', 'workspace', ?, 'ts')",
                    (use_id, status))
+        db.execute("UPDATE absent_host_work SET anchor_use_id=? WHERE absent_work_id='absent-1'",(use_id,))
+        declaration=dict(format=1,producer='migration',original_parent=['absent-1','synthetic-host','res-1','workspace','worker-gone','unresolved','ts'],members=[dict(use_id=use_id,resource_id='res-1',scope='workspace',created_at='ts')])
+        db.execute("INSERT INTO host_work_declarations VALUES('migration:absent-1','absent-1','migration','worker-gone','unknown',?,'ts')",(json.dumps(declaration),))
     store.write(run)
 
 
@@ -131,7 +136,7 @@ class PlanServiceTestCase(unittest.TestCase):
     def setUp(self):
         self._directory = TemporaryDirectory()
         self.addCleanup(self._directory.cleanup)
-        self.f = make_service(Path(self._directory.name))
+        self.f = self.enterContext(make_service(Path(self._directory.name)))
         self.p = self.f.create()
         self.plan_id = self.p.current_metadata.plan_id
 
@@ -165,8 +170,8 @@ class TestCreation(PlanServiceTestCase):
         self.assertEqual(len(self.f.service.list_plans()), 1)
 
     def test_empty_store_epoch_bootstrap(self):
-        with TemporaryDirectory() as directory:
-            fresh = make_service(Path(directory))
+        with TemporaryDirectory() as directory, ExitStack() as _directory_store_lifetimes_0:
+            fresh = _directory_store_lifetimes_0.enter_context(make_service(Path(directory)))
             self.assertEqual(fresh.service.list_plans(), ())
             info = fresh.service.read_service_info()
             command = fresh.command("create_plan", {"creation_id": "bootstrap", "draft": draft(),
@@ -221,42 +226,44 @@ class TestCreation(PlanServiceTestCase):
         self.assertEqual(ctx.exception.code, "duplicate_candidate")
 
     def test_concurrent_creation_id_yields_one_plan(self):
-        from adaptive_planning.app import PlanningService
-        from adaptive_planning.store import Store
-        other = PlanningService(Store(self.f.store.path, self.f.clock, host_id="synthetic-host"),
-                                base_url="http://127.0.0.1:8790", clock=self.f.clock)
-        barrier = threading.Barrier(2)
-        results, errors = [], []
+        with ExitStack() as _owned_store_lifetimes:
+            from adaptive_planning.app import PlanningService
+            from adaptive_planning.store import Store
+            other = PlanningService(_owned_store_lifetimes.enter_context(Store(self.f.store.path, self.f.clock, host_id="synthetic-host")),
+                                    base_url="http://127.0.0.1:8790", clock=self.f.clock)
+            barrier = threading.Barrier(2)
+            results, errors = [], []
 
-        def run(service, key):
-            command = self.f.command("create_plan", {"creation_id": "race", "draft": dataclasses.replace(
-                draft(), objective="Racing objective"), "new_plan_intent": "race"}, key=key)
-            barrier.wait()
-            try:
-                results.append(service.execute(command))
-            except Exception as error:
-                errors.append(error)
+            def run(service, key):
+                command = self.f.command("create_plan", {"creation_id": "race", "draft": dataclasses.replace(
+                    draft(), objective="Racing objective"), "new_plan_intent": "race"}, key=key)
+                barrier.wait()
+                try:
+                    results.append(service.execute(command))
+                except Exception as error:
+                    errors.append(error)
 
-        threads = [threading.Thread(target=run, args=(s, k)) for s, k in
-                   ((self.f.service, "race-1"), (other, "race-2"))]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        self.assertEqual(errors, [])
-        self.assertEqual(len({r.current_metadata.plan_id for r in results}), 1)
-        self.assertEqual(sorted(r.replayed for r in results), [False, True])
-        self.assertEqual(len(self.f.service.list_plans()), 2)
+            threads = [threading.Thread(target=run, args=(s, k)) for s, k in
+                       ((self.f.service, "race-1"), (other, "race-2"))]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(errors, [])
+            self.assertEqual(len({r.current_metadata.plan_id for r in results}), 1)
+            self.assertEqual(sorted(r.replayed for r in results), [False, True])
+            self.assertEqual(len(self.f.service.list_plans()), 2)
 
     def test_reopen_preserves_idempotency(self):
-        command = self.f.command("create_plan", {"creation_id": "reopen", "draft": dataclasses.replace(
-            draft(), objective="Reopen objective"), "new_plan_intent": "reopen"})
-        first = self.f.service.execute(command)
-        reopened = make_service(Path(self._directory.name))
-        replay = reopened.service.execute(command)
-        self.assertTrue(replay.replayed)
-        self.assertEqual(replay.committed_metadata, first.committed_metadata)
-        self.assertEqual(len(reopened.service.list_plans()), 2)
+        with ExitStack() as _owned_store_lifetimes:
+            command = self.f.command("create_plan", {"creation_id": "reopen", "draft": dataclasses.replace(
+                draft(), objective="Reopen objective"), "new_plan_intent": "reopen"})
+            first = self.f.service.execute(command)
+            reopened = _owned_store_lifetimes.enter_context(make_service(Path(self._directory.name)))
+            replay = reopened.service.execute(command)
+            self.assertTrue(replay.replayed)
+            self.assertEqual(replay.committed_metadata, first.committed_metadata)
+            self.assertEqual(len(reopened.service.list_plans()), 2)
 
 
 class TestRevisionsAndRetries(PlanServiceTestCase):
@@ -340,7 +347,7 @@ class TestRevisionsAndRetries(PlanServiceTestCase):
         before = counts(self.f.store)
         with self.assertRaises(DomainError) as ctx:
             self.f.service.execute(command)
-        self.assertEqual(ctx.exception.code, "unsupported")
+        self.assertEqual(ctx.exception.code, "invalid")
         self.assertEqual(counts(self.f.store), before)
 
     def test_revise_cannot_tamper_authorization(self):

@@ -22,8 +22,13 @@ class _Parser(argparse.ArgumentParser):
 
 
 def build_server(config: Config) -> uvicorn.Server:
-    return uvicorn.Server(uvicorn.Config(build_app(config), host="0.0.0.0", port=urlsplit(config.base_url).port,
-                                        access_log=False, proxy_headers=False, lifespan="on"))
+    app = build_app(config)
+    try:
+        return uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=urlsplit(config.base_url).port,
+                                            access_log=False, proxy_headers=False, lifespan="on"))
+    except BaseException:
+        app.state.close()
+        raise
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -36,7 +41,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             initialize_installation(config)
             print("Installation initialized.")
         else:
-            build_server(config).run()
+            server = build_server(config)
+            try:
+                server.run()
+            finally:
+                server.config.app.state.close()
     except DomainError as error:
         code = error.code if error.code in {"not_initialized", "insecure_credential", "invalid_credential",
                                            "invalid_config", "init_failed"} else "startup_failed"

@@ -305,12 +305,10 @@ def _aggregates(connection: sqlite3.Connection, plan_id: PlanId) -> _Aggregates:
         return connection.execute(sql, args).fetchone()[0]
 
     install = connection.execute("SELECT store_hold, restore_cutoff FROM installation WHERE id = 1").fetchone()
-    epoch = _installation_epoch(connection)
-    unresolved_reason = one(
-        "SELECT EXISTS(SELECT 1 FROM store_hold_reasons WHERE epoch = ? AND resolved = 0)", epoch)
+    from adaptive_planning.store import store_is_held
     plan = _load_plan(connection, plan_id)
     holds, claims = _eligibility_facts(connection, plan)
-    store_hold = bool(install[0]) or bool(unresolved_reason)
+    store_hold = store_is_held(connection)
     counts = {
         "attempts": one("SELECT COUNT(*) FROM attempts WHERE plan_id = ?", plan_id),
         "reservations": sum(view.plan_id == plan_id for view in reservation_projections(connection, plan_id)[0].values()),
@@ -471,7 +469,11 @@ SELECT prio, kind_rank, rid, kind FROM (
            'attempt' AS kind FROM attempts WHERE plan_id = :p
     UNION ALL
     SELECT CASE WHEN status != 'released' THEN 0 ELSE 1 END, 1, rowid, 'reservation'
-      FROM resource_uses WHERE plan_id = :p OR (plan_id IS NULL AND status != 'released')
+      FROM resource_uses WHERE plan_id = :p
+    UNION ALL
+    SELECT 0,1,u.rowid,'reservation' FROM resource_uses u JOIN absent_host_work w ON w.anchor_use_id=u.use_id
+      WHERE u.plan_id IS NULL AND EXISTS(SELECT 1 FROM resource_uses remaining
+      WHERE remaining.absent_work_id=w.absent_work_id AND remaining.status!='released')
     UNION ALL
     SELECT 0, 2, rowid, 'hold' FROM holds WHERE plan_id = :p AND active = 1
     UNION ALL

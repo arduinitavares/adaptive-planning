@@ -1,5 +1,6 @@
 """Artifact/cycle-bound observations and retained exclusive verification uses."""
 from __future__ import annotations
+from contextlib import ExitStack
 
 import asyncio
 import json
@@ -22,7 +23,7 @@ from tests.service_fixtures import (
 
 class TestService(unittest.TestCase):
     def setUp(self):
-        self.f = make_service()
+        self.f = self.enterContext(make_service())
         self.addCleanup(self.f.cleanup)
         self.p = self.f.create(steps=(step("a", review_required=True), step("b"), step("c", ("a",))))
         self.plan_id = self.p.current_metadata.plan_id
@@ -680,7 +681,7 @@ class TestService(unittest.TestCase):
     def creation_case(self, *, accepted=False, handoff=False, later_writer=False):
         # Each corruption starts from its own coherent history, so a broken RED refusal
         # cannot mutate a subsequent case's group, rows or writer state.
-        self.f = make_service()
+        self.f = self.enterContext(make_service())
         self.addCleanup(self.f.cleanup)
         self.p = self.f.create(steps=(step("a", review_required=True),))
         self.plan_id, self.value = self.p.current_metadata.plan_id, checkpoint()
@@ -993,55 +994,56 @@ class TestService(unittest.TestCase):
         self.assertEqual(self.state(), before)
 
     def test_independent_connection_contention_preserves_source_on_commit_and_rollback(self):
-        for failing in (False, True):
-            with self.subTest(failing=failing):
-                f = make_service()
-                self.addCleanup(f.cleanup)
-                p = f.create(steps=(step("a", review_required=True),))
-                rid = f.register(workspace("/synthetic/contention", 924), p)
-                assigned = f.service.execute(f.command("assign_step", {"step_id": "a", "assignee": "worker-a", "context": context(rid)}, receipt=p))
-                active = f.start(p, assigned)
-                f.submit(p, active, self.value)
-                source = f.service.read_plan(p.current_metadata.plan_id).coordination.reservations[0]
-                third = f.create(steps=(step("a"),), creation_id="contention-third")
-                other_store = Store(f.store.path, f.clock, host_id="synthetic-host")
-                other = PlanningService(other_store, base_url="http://127.0.0.1:8790", clock=f.clock)
-                handoff = f.command("reserve_verification", {"step_id": "a", "verifier": "reviewer", "context": context(rid),
-                                   "handoff_from": source.use_id, "stopped_reason": "Actor stopped across source"}, receipt=p)
-                assign = f.command("assign_step", {"step_id": "a", "assignee": "third", "context": context(rid)}, receipt=third)
-                entered, release = threading.Event(), threading.Event()
-                real_projection, real_connect = plans._commit_projection, other_store._connect
-                def barrier_projection(db, pid, previous):
-                    self.assertEqual(db.execute("SELECT status FROM resource_uses WHERE use_id=?", (source.use_id,)).fetchone()[0], "active")
-                    entered.set()
-                    if not release.wait(10):
-                        raise RuntimeError("Contention synchronization timed out")
-                    if failing:
-                        raise RuntimeError("Injected handoff rollback")
-                    return real_projection(db, pid, previous)
-                def no_wait_connect():
-                    db = real_connect()
-                    db.execute("PRAGMA busy_timeout=0")
-                    return db
-                with ThreadPoolExecutor(max_workers=1) as pool, patch.object(plans, "_commit_projection", barrier_projection), patch.object(other_store, "_connect", no_wait_connect):
-                    future = pool.submit(f.service.execute, handoff)
-                    try:
-                        self.assertTrue(entered.wait(10))
-                        with self.assertRaises(DomainError) as error:
-                            other.execute(assign)
-                        self.assertEqual(error.exception.code, "busy")
-                        self.assertTrue(error.exception.message.startswith("Database is busy:"))  # Actual BEGIN IMMEDIATE, beyond connection setup.
-                    finally:
-                        release.set()
-                    if failing:
-                        with self.assertRaises(RuntimeError):
+        with ExitStack() as _owned_store_lifetimes:
+            for failing in (False, True):
+                with self.subTest(failing=failing):
+                    f = _owned_store_lifetimes.enter_context(make_service())
+                    self.addCleanup(f.cleanup)
+                    p = f.create(steps=(step("a", review_required=True),))
+                    rid = f.register(workspace("/synthetic/contention", 924), p)
+                    assigned = f.service.execute(f.command("assign_step", {"step_id": "a", "assignee": "worker-a", "context": context(rid)}, receipt=p))
+                    active = f.start(p, assigned)
+                    f.submit(p, active, self.value)
+                    source = f.service.read_plan(p.current_metadata.plan_id).coordination.reservations[0]
+                    third = f.create(steps=(step("a"),), creation_id="contention-third")
+                    other_store = _owned_store_lifetimes.enter_context(Store(f.store.path, f.clock, host_id="synthetic-host"))
+                    other = PlanningService(other_store, base_url="http://127.0.0.1:8790", clock=f.clock)
+                    handoff = f.command("reserve_verification", {"step_id": "a", "verifier": "reviewer", "context": context(rid),
+                                       "handoff_from": source.use_id, "stopped_reason": "Actor stopped across source"}, receipt=p)
+                    assign = f.command("assign_step", {"step_id": "a", "assignee": "third", "context": context(rid)}, receipt=third)
+                    entered, release = threading.Event(), threading.Event()
+                    real_projection, real_connect = plans._commit_projection, other_store._connect
+                    def barrier_projection(db, pid, previous):
+                        self.assertEqual(db.execute("SELECT status FROM resource_uses WHERE use_id=?", (source.use_id,)).fetchone()[0], "active")
+                        entered.set()
+                        if not release.wait(10):
+                            raise RuntimeError("Contention synchronization timed out")
+                        if failing:
+                            raise RuntimeError("Injected handoff rollback")
+                        return real_projection(db, pid, previous)
+                    def no_wait_connect():
+                        db = real_connect()
+                        db.execute("PRAGMA busy_timeout=0")
+                        return db
+                    with ThreadPoolExecutor(max_workers=1) as pool, patch.object(plans, "_commit_projection", barrier_projection), patch.object(other_store, "_connect", no_wait_connect):
+                        future = pool.submit(f.service.execute, handoff)
+                        try:
+                            self.assertTrue(entered.wait(10))
+                            with self.assertRaises(DomainError) as error:
+                                other.execute(assign)
+                            self.assertEqual(error.exception.code, "busy")
+                            self.assertTrue(error.exception.message.startswith("Database is busy:"))  # Actual BEGIN IMMEDIATE, beyond connection setup.
+                        finally:
+                            release.set()
+                        if failing:
+                            with self.assertRaises(RuntimeError):
+                                future.result(timeout=10)
+                        else:
                             future.result(timeout=10)
-                    else:
-                        future.result(timeout=10)
-                with self.assertRaises(DomainError) as error:
-                    other.execute(assign)
-                self.assertEqual(error.exception.code, "resource_conflict")
-                self.assertEqual(f.store.read(lambda db: db.execute("SELECT status FROM resource_uses WHERE use_id=?", (source.use_id,)).fetchone()[0]), "active")
+                    with self.assertRaises(DomainError) as error:
+                        other.execute(assign)
+                    self.assertEqual(error.exception.code, "resource_conflict")
+                    self.assertEqual(f.store.read(lambda db: db.execute("SELECT status FROM resource_uses WHERE use_id=?", (source.use_id,)).fetchone()[0]), "active")
 
     def test_transport_exposes_exact_semantic_review_operations(self):
         from adaptive_planning.transport import build_mcp
@@ -1058,27 +1060,28 @@ class TestService(unittest.TestCase):
         self.assertTrue(self.satisfied())
 
     def test_failed_review_retirement_preserves_evidence(self):
-        self.f.cleanup()
-        self.f = make_service()
-        self.addCleanup(self.f.cleanup)
-        self.p = self.f.create("first-step", steps=(step("a", review_required=True),), creation_id="failed-review")
-        self.plan_id = self.p.current_metadata.plan_id
-        rid = self.f.register(workspace("/synthetic/failed-review", 500), self.p)
-        self.live(context(rid))
-        self.review(verdict="failed", findings=("synthetic defect",))
-        before = self.view()
-        self.f.service.execute(self.command("revise_plan", {
-            "draft": before.draft, "reason": "replace unsuccessful review route", "authorization_change": None,
-            "retire_steps": (RetirementRequest("a", "preserve failed result"),)}))
-        after = self.view()
-        self.assertEqual(after.legacy_snapshot["steps"][0]["status"], "retired")
-        self.assertEqual(after.legacy_snapshot["steps"][0]["evidence"], before.legacy_snapshot["steps"][0]["evidence"])
-        self.assertEqual(after.coordination.reviews, before.coordination.reviews)
-        self.assertTrue(after.coordination.reservations)
-        self.assertEqual(after.draft.authorization, before.draft.authorization)
-        self.assertEqual(after.draft.authorization.claimed, "a")
-        self.refused(lambda: self.f.service.execute(self.command("report_activity", {
-            "origin_worker": "worker-a", "relay": None, "observed_activity": "late mutation"}, attempt=self.a)), "fenced")
+        with ExitStack() as _owned_store_lifetimes:
+            self.f.cleanup()
+            self.f = _owned_store_lifetimes.enter_context(make_service())
+            self.addCleanup(self.f.cleanup)
+            self.p = self.f.create("first-step", steps=(step("a", review_required=True),), creation_id="failed-review")
+            self.plan_id = self.p.current_metadata.plan_id
+            rid = self.f.register(workspace("/synthetic/failed-review", 500), self.p)
+            self.live(context(rid))
+            self.review(verdict="failed", findings=("synthetic defect",))
+            before = self.view()
+            self.f.service.execute(self.command("revise_plan", {
+                "draft": before.draft, "reason": "replace unsuccessful review route", "authorization_change": None,
+                "retire_steps": (RetirementRequest("a", "preserve failed result"),)}))
+            after = self.view()
+            self.assertEqual(after.legacy_snapshot["steps"][0]["status"], "retired")
+            self.assertEqual(after.legacy_snapshot["steps"][0]["evidence"], before.legacy_snapshot["steps"][0]["evidence"])
+            self.assertEqual(after.coordination.reviews, before.coordination.reviews)
+            self.assertTrue(after.coordination.reservations)
+            self.assertEqual(after.draft.authorization, before.draft.authorization)
+            self.assertEqual(after.draft.authorization.claimed, "a")
+            self.refused(lambda: self.f.service.execute(self.command("report_activity", {
+                "origin_worker": "worker-a", "relay": None, "observed_activity": "late mutation"}, attempt=self.a)), "fenced")
 
 
 if __name__ == "__main__":

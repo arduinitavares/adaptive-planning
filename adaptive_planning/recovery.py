@@ -121,6 +121,14 @@ def _native_origin(connection, plan, row, data):
         "AND json_extract(payload,'$.generation')=?", (epoch, plan.plan_id, row[0], plan.generation)).fetchall()
     if len(grants) != 1 or not isinstance(grants[0][0], str) or re.fullmatch(r"[0-9a-f]{64}", grants[0][0]) is None:
         raise DomainError("unsupported", "This recovery origin has no unique current native grant")
+    constructors=[]
+    for raw, in connection.execute("SELECT payload FROM events WHERE plan_id=? AND kind='assign_step'",(plan.plan_id,)):
+        event=attempts._object(raw,'native assignment constructor')
+        if event.get('attempt_id')==row[0]:
+            constructors.append(event)
+    if (len(constructors)!=1 or any(constructors[0].get(key)!=value for key,value in
+            dict(step_id=row[1],assignee=row[2],version=1,definition_version=row[5],definition=data['definition']).items())):
+        raise DomainError('unsupported','Native recovery lacks its exact assignment constructor')
     _to_execution_context(data.get("context"))
     resources.execution_uses(connection, plan.plan_id, row[0])
     return step
@@ -361,6 +369,194 @@ def is_imported_attempt(connection: sqlite3.Connection, plan_id: PlanId, attempt
     return True
 
 
+def has_restored_origin(connection, plan_id, attempt_id):
+    return bool(connection.execute('SELECT 1 FROM restore_attempt_origins a JOIN restore_origins r USING(restore_id) WHERE a.plan_id=? AND a.attempt_id=? AND r.new_epoch=(SELECT epoch FROM installation)',(plan_id,attempt_id)).fetchone())
+
+
+def restore_origin(connection,restore_id):
+    """Bind normalized source metadata to the one retained public restore producer."""
+    try:
+        row=connection.execute('SELECT prior_epoch,new_epoch,host_id,source_digest,source_cutoff,payload FROM restore_origins WHERE restore_id=?',(restore_id,)).fetchone()
+        if row is None:
+            raise DomainError('invalid','Restore origin is absent')
+        origin=attempts._object(row[5],'restore origin')
+        source=origin['source_metadata']
+        if (origin['format']!=1 or origin['restore_id']!=restore_id or source['epoch']!=row[0] or source['host_id']!=row[2] or source['restore_cutoff']!=row[4] or origin['source_digest']!=row[3]
+                or not re.fullmatch('[0-9a-f]{64}',row[3])):
+            raise DomainError('invalid','Restore origin metadata is contradictory')
+        expected=dict(restore_id=restore_id,epoch=row[1],backup_cutoff=row[4],origin_digest=hashlib.sha256(json.dumps(origin,sort_keys=True).encode()).hexdigest())
+        matches=[]
+        for actor,raw in connection.execute("SELECT actor,payload FROM events WHERE plan_id IS NULL AND plan_revision IS NULL AND kind='database_restored'"):
+            event=attempts._object(raw,'restore producer')
+            if event.get('restore_id')==restore_id:
+                matches.append((actor,event))
+        if matches!=[('local-administrator',expected)]:
+            raise DomainError('invalid','Restore origin contradicts its immutable producer')
+        return origin
+    except (KeyError,TypeError,ValueError) as error:
+        raise DomainError('invalid','Restore origin is malformed') from error
+
+
+def _immutable_namespace(value):
+    return dict(v=value['v'],source=value['source'],implementation_members=value['implementation']['members'],
+                groups={anchor:{key:item for key,item in group.items() if key!='writer'} for anchor,group in value['groups'].items()})
+
+
+def _restore_record(connection,restore_id,plan_id,attempt_id,visited=None):
+    visited=set() if visited is None else visited
+    if restore_id in visited:
+        raise DomainError('invalid','Restore ancestry is cyclic')
+    visited.add(restore_id)
+    origin=restore_origin(connection,restore_id)
+    saved=connection.execute('SELECT payload FROM restore_attempt_origins WHERE restore_id=? AND plan_id=? AND attempt_id=?',(restore_id,plan_id,attempt_id)).fetchall()
+    if len(saved)!=1:
+        raise DomainError('invalid','Restore ancestry is missing or ambiguous')
+    record=attempts._object(saved[0][0],'restore attempt origin')
+    transition=record.get('transition')
+    if not isinstance(transition,dict) or type(transition.get('event_id')) is not int:
+        raise DomainError('invalid','Restore producer transition is malformed')
+    unsigned={key:value for key,value in record.items() if key!='transition'}
+    digest=hashlib.sha256(json.dumps(unsigned,sort_keys=True).encode()).hexdigest()
+    event=connection.execute('SELECT kind,actor,payload FROM events WHERE plan_id=? AND sequence=?',(plan_id,transition['event_id'])).fetchone()
+    expected={key:value for key,value in transition.items() if key!='event_id'}
+    if (event is None or event[:2]!=('restore_attempt','local-administrator') or
+            attempts._object(event[2],'restore transition')!=expected or transition.get('record_digest')!=digest or
+            transition.get('restore_id')!=restore_id or transition.get('attempt_id')!=attempt_id):
+        raise DomainError('invalid','Restore producer contradicts its retained transition')
+    if record.get('kind') not in ('native','imported') or not isinstance(record.get('source'),dict):
+        raise DomainError('invalid','Restore producer source is malformed')
+    source=record['source']
+    original=source.get('attempt_row')
+    restored=record.get('restored_row')
+    if (not isinstance(original,list) or len(original)!=10 or original[:2]!=[plan_id,attempt_id] or
+            not isinstance(restored,list) or len(restored)!=10 or restored[:4]!=original[:4] or
+            restored[6:9]!=original[6:9] or restored[4]!='stale' or
+            restored[5]!=original[5]+int(original[4]!='stale')):
+        raise DomainError('invalid','Restore producer full attempt row is incoherent')
+    parent=record.get('prior_restore_id')
+    if parent is not None:
+        prior=_restore_record(connection,parent,plan_id,attempt_id,visited)
+        same=prior['restored_row']==original
+        if not same and record['kind']==prior['kind']=='native':
+            before=prior['restored_row']
+            old_data=attempts._object(before[9],'prior native restore')
+            new_data=attempts._object(original[9],'native restored role transition')
+            old_namespace=old_data.get(resources._USE_NAMESPACE)
+            new_namespace=new_data.get(resources._USE_NAMESPACE)
+            immutable=lambda data:{key:value for key,value in data.items() if key!=resources._USE_NAMESPACE}
+            same=(before[:9]==original[:9] and immutable(old_data)==immutable(new_data) and
+                  old_namespace is not None and new_namespace is not None and
+                  _immutable_namespace(old_namespace)==_immutable_namespace(new_namespace))
+            if same:
+                namespace,_=resources.execution_uses(connection,plan_id,attempt_id)
+                same=_immutable_namespace(namespace)==_immutable_namespace(new_namespace)
+                for anchor,group in new_namespace['groups'].items():
+                    resources._writer_proof(connection,new_namespace['source'],group['writer'],'verification',anchor,[member['use_id'] for member in group['members']])
+                resources._writer_proof(connection,new_namespace['source'],new_namespace['implementation']['writer'],'implementation',None,[member['use_id'] for member in new_namespace['implementation']['members']])
+        if not same and record['kind']==prior['kind']=='imported':
+            before=prior['restored_row']
+            old_data=attempts._object(before[9],'prior imported restore')
+            new_data=attempts._object(original[9],'attached imported restore')
+            immutable=lambda data:{key:value for key,value in data.items() if key not in ('context',resources._USE_NAMESPACE)}
+            attachment=[]
+            for sequence,raw in connection.execute("SELECT sequence,payload FROM events WHERE plan_id=? AND kind='resolve_attempt'",(plan_id,)):
+                event=attempts._object(raw,'imported attachment lineage')
+                if event.get('attempt_id')==attempt_id and event.get('resolution')=='attach-context':
+                    attachment.append((sequence,event))
+            same=(before[:5]==original[:5] and before[6:9]==original[6:9] and original[5]==before[5]+1 and
+                  old_data.get('context') is None and new_data.get('context') is not None and immutable(old_data)==immutable(new_data) and
+                  len(attachment)==1 and prior['transition']['event_id']<attachment[0][0]<transition['event_id'] and
+                  attachment[0][1].get('before_version')==before[5] and attachment[0][1].get('version')==original[5] and
+                  attachment[0][1].get('attached_context')==new_data['context'])
+            if same:
+                _imported_proof(connection,plan_id,attempt_id)
+        if not same or prior['kind']!=record['kind']:
+            raise DomainError('invalid','Restore ancestry does not retain the exact prior source')
+    if record['kind']=='native':
+        grants=source.get('capabilities')
+        if not isinstance(grants,list) or len(grants)!=1:
+            raise DomainError('invalid','Native restore has no exact retained constructor grant')
+        for grant in grants:
+            actual=connection.execute('SELECT * FROM capabilities WHERE capability_id=?',(grant[0],)).fetchone()
+            expected=list(grant)
+            expected[6]=1
+            if actual is None or list(actual)!=expected:
+                raise DomainError('invalid','Retained native grant history is absent or altered')
+    return record
+
+
+def restored_proof(connection, plan_id, attempt_id):
+    row=attempts._attempt_row(connection,plan_id,attempt_id)
+    saved=connection.execute('SELECT a.restore_id,r.host_id,r.payload FROM restore_attempt_origins a JOIN restore_origins r USING(restore_id) WHERE a.plan_id=? AND a.attempt_id=? AND r.new_epoch=(SELECT epoch FROM installation)',(plan_id,attempt_id)).fetchall()
+    if row is None or len(saved)!=1:
+        raise DomainError('invalid','Restored attempt lacks a unique current producer')
+    record=_restore_record(connection,saved[0][0],plan_id,attempt_id)
+    origin=attempts._object(saved[0][2],'restore origin')
+    generation=connection.execute('SELECT generation FROM plans WHERE plan_id=?',(plan_id,)).fetchone()[0]
+    if saved[0][1]!=connection.execute('SELECT host_id FROM installation').fetchone()[0] or origin['generations'][plan_id][1]!=generation:
+        raise DomainError('invalid','Restore producer is not current authority')
+    data=attempts._object(row[7],'restored attempt')
+    if record.get('kind') not in ('native','imported') or not isinstance(record.get('source'),dict):
+        raise DomainError('invalid','Restored attempt producer is malformed')
+    holds=[record['hold'],*record['source']['owned_holds']]
+    complete=list(connection.execute('SELECT * FROM attempts WHERE plan_id=? AND attempt_id=?',(plan_id,attempt_id)).fetchone())
+    baseline=record['restored_row']
+    if complete[:4]!=baseline[:4] or complete[6:9]!=baseline[6:9]:
+        raise DomainError('invalid','Restored attempt full identity has changed')
+    if record['kind']=='imported':
+        _imported_proof(connection,plan_id,attempt_id)
+    else:
+        expected=attempts._object(baseline[9],'restored source payload')
+        terminal=row[3] in ('released','rejected')
+        allowed=('cancellation_reason','cancelled_from','cancelled_at',resources._USE_NAMESPACE) if terminal else (resources._USE_NAMESPACE,)
+        actual={key:value for key,value in data.items() if key not in allowed}
+        immutable_expected={key:value for key,value in expected.items() if key!=resources._USE_NAMESPACE}
+        if actual!=immutable_expected or complete[4] not in ('stale','released','rejected') or complete[5]!=baseline[5]+int(terminal):
+            raise DomainError('invalid','Restored payload or lifecycle differs from the immutable source')
+        namespace,_=resources.execution_uses(connection,plan_id,attempt_id)
+        source_namespace=expected.get(resources._USE_NAMESPACE)
+        if source_namespace is not None and _immutable_namespace(namespace)!=_immutable_namespace(source_namespace):
+            raise DomainError('invalid','Restored role membership differs from its frozen source namespace')
+        actual_uses=[list(item) for item in connection.execute('SELECT rowid,* FROM resource_uses WHERE plan_id=? AND attempt_id=? ORDER BY rowid',(plan_id,attempt_id))]
+        source_uses=record['source']['uses']
+        if (len(actual_uses)!=len(source_uses) or any(actual[:7]!=source[:7] or actual[8:]!=source[8:] for actual,source in zip(actual_uses,source_uses))):
+            raise DomainError('invalid','Restored physical cohort differs from its retained source')
+    if row[3] in ('released','rejected'):
+        matches=[]
+        for sequence,raw in connection.execute("SELECT sequence,payload FROM events WHERE plan_id=? AND kind='resolve_attempt'",(plan_id,)):
+            event=attempts._object(raw,'terminal restore decision')
+            if event.get('attempt_id')==attempt_id and event.get('resolution') in ('release','reject','replace'):
+                matches.append((sequence,event))
+        valid=(len(matches)==1 and matches[0][0]>record['transition']['event_id'] and
+                matches[0][1].get('before_version')==complete[5]-1 and matches[0][1].get('version')==complete[5] and
+                matches[0][1].get('definition')==data['definition'] and matches[0][1].get('reason')==data.get('cancellation_reason') and
+                (row[3]=='rejected')==(matches[0][1]['resolution']=='reject'))
+        if not matches and row[3]=='released':
+            retirements=[]
+            for sequence,published,raw in connection.execute("SELECT sequence,published_at,payload FROM events WHERE plan_id=? AND kind='revise_plan'",(plan_id,)):
+                event=attempts._object(raw,'restored retirement publication')
+                if any(item==dict(step_id=row[1],reason=data.get('cancellation_reason')) for item in event.get('retired_steps',())):
+                    retirements.append((sequence,published))
+            valid=len(retirements)==1 and retirements[0][0]>record['transition']['event_id'] and retirements[0][1]==data.get('cancelled_at')
+        if (not valid or
+                data.get('cancelled_from')!='stale' or not attempts._nonblank(data.get('cancelled_at'))):
+            raise DomainError('invalid','Terminal restore state has no exact published ownership decision')
+    for identity,raw in holds:
+        found=connection.execute('SELECT reason,active FROM holds WHERE plan_id=? AND hold_id=?',(plan_id,identity)).fetchone()
+        if found is None or found[0]!=raw or found[1] != int(row[3]=='stale'):
+            raise DomainError('invalid','Restore source-owned hold is missing or contradictory')
+    return row,data,record,holds,record['kind']
+
+
+def clear_restored_stale(connection,plan_id,attempt_id):
+    _,_,record,holds,kind=restored_proof(connection,plan_id,attempt_id)
+    if kind=='imported':
+        clear_imported_stale(connection,plan_id,attempt_id)
+    else:
+        for identity,raw in holds:
+            connection.execute('UPDATE holds SET active=0 WHERE plan_id=? AND hold_id=? AND reason=?',(plan_id,identity,raw))
+
+
 def _reserve_known_context(connection, plan_id, attempt_id, execution, ts):
     """Register one known context's strict original cohort; every failure rolls back with the caller."""
     row = attempts._attempt_row(connection, plan_id, attempt_id)
@@ -464,7 +660,11 @@ def _attach_context(connection: sqlite3.Connection, plan, command: Command) -> M
         raise DomainError("invalid", "Context attachment requires attached_context without replacement fields")
     row, data = _target(connection, plan, command)
     try:
-        _, _, _, (_, identity_id) = _imported_proof(connection, plan.plan_id, command.attempt_id)
+        if has_restored_origin(connection,plan.plan_id,command.attempt_id):
+            _,_,_,_,kind=restored_proof(connection,plan.plan_id,command.attempt_id)
+            if kind!='imported':
+                raise DomainError('unsupported','This restored native source had a known constructor context')
+        _, _, import_origin, (_, identity_id) = _imported_proof(connection, plan.plan_id, command.attempt_id)
     except (DomainError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
         raise DomainError("unsupported", "Tokenless and restored origins require their producer recovery contract") from None
     if row[3] != "stale":
@@ -484,7 +684,7 @@ def _attach_context(connection: sqlite3.Connection, plan, command: Command) -> M
     if identity_id is not None:
         # Only the proven identity reason/hold of this exact obligation; the stale hold stays until a terminal decision.
         if connection.execute("UPDATE store_hold_reasons SET resolved = 1 WHERE epoch = ? AND reason_id = ? AND resolved = 0",
-                              (plans._installation_epoch(connection), identity_id)).rowcount != 1:
+                              (import_origin['request_epoch'], identity_id)).rowcount != 1:
             raise DomainError("invalid", "The proven identity reason is no longer unresolved")
         connection.execute("UPDATE holds SET active=0 WHERE hold_id=? AND plan_id=?", (identity_id, plan.plan_id))
 
@@ -584,8 +784,18 @@ def _resolve_logical(connection, plan, command):
         raise DomainError("invalid", "Only replacement may declare a new assignee and context")
     if resolution == "reject" and payload["next_step_state"] != "blocked":
         raise DomainError("invalid", "Rejection leaves its logical step blocked")
-    imported = is_imported_attempt(connection, plan.plan_id, command.attempt_id)
-    if imported:
+    restored=has_restored_origin(connection,plan.plan_id,command.attempt_id)
+    imported = False if restored else is_imported_attempt(connection, plan.plan_id, command.attempt_id)
+    if restored:
+        row,data,record,_,kind=restored_proof(connection,plan.plan_id,command.attempt_id)
+        _target(connection,plan,command)
+        if row[3]!='stale':
+            raise DomainError('stale','Restored recovery requires stale ownership')
+        if data.get('context') is None:
+            raise DomainError('held','Unknown restored identity must be attached first')
+        step=next(node for node in plan.steps if node.step_id==row[1])
+        marker=dict(restore_id=record['transition']['restore_id'],hold_id=record['hold'][0])
+    elif imported:
         row, data = _target(connection, plan, command)
         if row[3] != "stale":
             raise DomainError("stale", "Recovery requires ownership recorded stale")
@@ -616,7 +826,9 @@ def _resolve_logical(connection, plan, command):
         connection.execute("UPDATE steps SET state=? WHERE plan_id=? AND step_id=?",
                            (payload["next_step_state"], plan.plan_id, step.step_id))
         previous = plans._commit_projection(connection, plan.plan_id, previous)
-    if imported:
+    if restored:
+        pass  # cancel_attempt already discharged its exact positive restore holds.
+    elif imported:
         clear_imported_stale(connection, plan.plan_id, row[0])
     elif marker and "hold_id" in marker:
         checkpoints._clear_holds(connection, [marker["hold_id"]])

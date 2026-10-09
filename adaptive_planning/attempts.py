@@ -757,8 +757,14 @@ def cancel_attempt(connection: sqlite3.Connection, plan_id: PlanId, attempt_id: 
     except (ValueError, TypeError):
         raise DomainError("invalid", "The attempt has no coherent frozen definition") from None
     epoch = plans._installation_epoch(connection)
+    from adaptive_planning import recovery
+    restored=recovery.has_restored_origin(connection,plan_id,attempt_id)
+    if restored:
+        _,_,_,_,kind=recovery.restored_proof(connection,plan_id,attempt_id)
+        if data.get('context') is None:
+            raise DomainError('held','Restored unknown identity must be attached before cancellation')
     if (not isinstance(data, dict) or data.get("definition") != step.definition
-            or data.get("epoch") != epoch or data.get("generation") != plan.generation
+            or (not restored and (data.get("epoch") != epoch or data.get("generation") != plan.generation))
             or row[5] != step.definition["definition_version"]):
         raise DomainError("invalid", "The attempt has no coherent frozen definition")
     capability_ids = []
@@ -773,7 +779,9 @@ def cancel_attempt(connection: sqlite3.Connection, plan_id: PlanId, attempt_id: 
                 and binding.get("generation") == plan.generation and isinstance(secret_hash, str)
                 and len(secret_hash) == 64):
             capability_ids.append(cid)
-    if not capability_ids:
+    if restored:
+        recovery.clear_restored_stale(connection,plan_id,attempt_id)
+    elif not capability_ids:
         from adaptive_planning import recovery
         if recovery.is_imported_attempt(connection, plan_id, attempt_id):
             if data.get("context") is None:

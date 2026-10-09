@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import stat
 import threading
 import uuid
+import time
+import fcntl
+import hashlib
+import json
+from contextlib import closing, contextmanager
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Callable, TypeVar
 
 from adaptive_planning.schema import SCHEMA_VERSION, initialize_schema
@@ -15,26 +22,298 @@ T = TypeVar("T")
 
 # Process-wide lock to serialize temporary umask mutations across threads
 _UMASK_LOCK = threading.Lock()
+GATE_FILENAME = ".planning-operation.lock"
+MANIFEST_FILENAME = ".planning-maintenance.json"
+LOCK_SECONDS = 2.0
+
+
+def store_is_held(connection: sqlite3.Connection) -> bool:
+    """Every unresolved durable reason applies, including historical epochs."""
+    return bool(connection.execute('SELECT store_hold OR EXISTS(SELECT 1 FROM store_hold_reasons WHERE resolved=0) FROM installation WHERE id=1').fetchone()[0])
+
+
+def _descriptor(path: Path, *, directory: bool = False) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if directory:
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+        info = os.fstat(descriptor)
+        if (directory and not stat.S_ISDIR(info.st_mode)) or (not directory and not stat.S_ISREG(info.st_mode)):
+            os.close(descriptor)
+            raise DomainError("invalid", "Coordination inode has the wrong type")
+        return descriptor
+    except OSError as error:
+        raise DomainError("invalid", "Installation coordination is unavailable") from error
+
+
+def _flock(descriptor: int, mode: int, seconds: float = LOCK_SECONDS) -> None:
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
+            return
+        except BlockingIOError as error:
+            if time.monotonic() >= deadline:
+                raise DomainError("busy", "Installation coordination is busy") from error
+            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+        except OSError as error:
+            raise DomainError("unsupported_filesystem", "Filesystem does not support required flock coordination") from error
+
+
+@contextmanager
+def maintenance_ownership(directory: Path):
+    """Cold maintenance owns the same installation inode as every Store."""
+    directory = Path(directory).resolve()
+    descriptor = _descriptor(directory, directory=True)
+    gate_fd = None
+    try:
+        _flock(descriptor, fcntl.LOCK_EX, seconds=0)
+        info = directory.stat()
+        held = os.fstat(descriptor)
+        if (info.st_dev, info.st_ino) != (held.st_dev, held.st_ino):
+            raise DomainError("fenced", "Installation directory changed")
+        gate = directory / GATE_FILENAME
+        if gate.exists():
+            gate_fd = _descriptor(gate)
+            _flock(gate_fd, fcntl.LOCK_EX, seconds=0)
+        yield
+    finally:
+        if gate_fd is not None:
+            os.close(gate_fd)
+        os.close(descriptor)
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _inspect_clone(clone: Path, versions, authority_kind, host_id) -> dict:
+    with closing(sqlite3.connect(clone)) as db:
+        if db.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            raise DomainError("invalid", "Installation integrity check failed")
+        if db.execute("PRAGMA foreign_key_check").fetchall():
+            raise DomainError("invalid", "Installation foreign key check failed")
+        rows = db.execute("SELECT id,epoch,schema_version,host_id,authority_kind,"
+                          "store_hold,restore_cutoff FROM installation").fetchall()
+        if (len(rows) != 1 or rows[0][0] != 1 or
+                not all(isinstance(rows[0][i], str) and rows[0][i] for i in (1, 3)) or
+                type(rows[0][2]) is not int or rows[0][5] not in (0, 1)):
+            raise DomainError("invalid", "Installation singleton metadata is malformed")
+        _, epoch, version, host, kind, hold, cutoff = rows[0]
+        if version not in versions:
+            code = "schema_newer" if version > max(versions) else "schema_old"
+            raise DomainError(code, "Installation schema is unsupported")
+        if kind != authority_kind:
+            raise DomainError("backup_source" if kind == "backup" else "invalid",
+                              "Installation image has the wrong authority kind")
+        if host_id is not None and host != host_id:
+            raise DomainError("invalid", "Installation host does not match")
+        if version == SCHEMA_VERSION:
+            # A supported marker cannot authorize rebuilding missing authority
+            # tables during ordinary startup.
+            with closing(sqlite3.connect(':memory:')) as reference:
+                initialize_schema(reference)
+                for (table,) in reference.execute("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+                    quoted = '"' + table.replace('"', '""') + '"'
+                    if db.execute(f'PRAGMA table_info({quoted})').fetchall() != reference.execute(f'PRAGMA table_info({quoted})').fetchall():
+                        raise DomainError('invalid', 'Installation authority layout is incomplete or unsupported')
+        sequence = db.execute("SELECT coalesce(max(sequence),0) FROM events").fetchone()[0]
+        return dict(epoch=epoch, schema_version=version, host_id=host,
+                    authority_kind=kind, store_hold=bool(hold), restore_cutoff=cutoff,
+                    sequence=sequence)
+
+
+@contextmanager
+def admitted_image(path: Path, *, versions: tuple[int, ...] = (SCHEMA_VERSION,),
+                   authority_kind: str = "authority", host_id: str | None = None):
+    """Retain the same recovered, admitted private snapshot for materialization.
+
+    The caller must quiesce the original file set. SHM is bound as original
+    evidence but never copied as authority: SQLite rebuilds its private cache.
+    Source bindings describe the bytes before recovery touches the clone.
+    """
+    path = Path(path)
+    with TemporaryDirectory(prefix="planning-admission-") as name:
+        directory = Path(name)
+        clone = directory / "image.sqlite"
+        try:
+            os.chmod(directory, 0o700)
+            if not path.is_file() or path.is_symlink() or path.stat().st_size == 0:
+                raise DomainError("invalid", "Installation image is not a nonempty regular file")
+            files = []
+            for suffix in ('', '-journal', '-shm', '-wal'):
+                source = Path(str(path) + suffix)
+                if not source.exists():
+                    continue
+                if source.is_symlink() or not source.is_file():
+                    raise DomainError("invalid", "Installation sidecar is not regular")
+                if suffix != '-shm':
+                    target = Path(str(clone) + suffix)
+                    shutil.copyfile(source, target)
+                    os.chmod(target, 0o600)
+                else:
+                    target = source
+                files.append(dict(suffix=suffix, bytes=target.stat().st_size, sha256=_file_digest(target)))
+            if len(files) == 1:
+                source_digest = files[0]['sha256']
+                binding = dict(encoding='raw-main-sha256', files=files)
+            else:
+                encoded = json.dumps(files, sort_keys=True, separators=(',', ':')).encode()
+                source_digest = hashlib.sha256(b'adaptive-planning-source-file-set-v1\0' + encoded).hexdigest()
+                binding = dict(encoding='file-set-v1', files=files)
+            metadata = _inspect_clone(clone, versions, authority_kind, host_id)
+        except (OSError, sqlite3.DatabaseError) as error:
+            raise DomainError("invalid", "Installation image cannot be admitted") from error
+        yield clone, metadata, source_digest, binding
+
+
+def inspect_image(path: Path, *, versions: tuple[int, ...] = (SCHEMA_VERSION,),
+                  authority_kind: str = "authority", host_id: str | None = None) -> dict:
+    """Inspect a disposable quiesced clone; never open SQLite on the source."""
+    with admitted_image(path, versions=versions, authority_kind=authority_kind, host_id=host_id) as (_, metadata, _, _):
+        return metadata
 
 
 class Store:
     """Atomic SQLite planning authority, epochs, and event projection."""
 
     def __init__(self, path: Path | str, clock: Clock, host_id: str | None = None) -> None:
+        if Path(path).is_symlink():
+            raise DomainError("invalid", "Installation main image cannot be a symlink")
         self.path = Path(path).resolve()
         self.clock = clock
         self._requested_host_id = host_id
         self._listeners: list[Callable[[int], None]] = []
         self._lock = threading.Lock()
+        self._closed = False
+        self._closing = False
+        self._active = 0
+        self._lifecycle = threading.Condition()
+        self._operation_local = threading.local()
+        self._birth_pid = os.getpid()
+        self._lease_fd = None
+        if not self.path.parent.exists():
+            self.path.parent.mkdir(mode=0o700, parents=True)
+        try:
+            # Bootstrap is serialized on the existing directory inode. Refuse
+            # existing invalid images before introducing even the gate entry.
+            bootstrap_deadline = time.monotonic() + LOCK_SECONDS
+            while True:
+                descriptor = _descriptor(self.path.parent, directory=True)
+                self._lease_fd = descriptor
+                gate = self.path.parent / GATE_FILENAME
+                if not gate.exists():
+                    try:
+                        _flock(descriptor, fcntl.LOCK_EX, seconds=0)
+                    except DomainError as error:
+                        if error.code != 'busy':
+                            raise
+                        os.close(descriptor)
+                        self._lease_fd = None
+                        # Another bootstrap may have published the gate and
+                        # already retained a shared lifetime lease. Restart
+                        # admission instead of waiting behind that live Store.
+                        if gate.exists():
+                            continue
+                        if time.monotonic() >= bootstrap_deadline:
+                            raise
+                        time.sleep(min(0.01, max(0, bootstrap_deadline - time.monotonic())))
+                        continue
+                    if not gate.exists():
+                        self._admit_source()
+                        fd = os.open(gate, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                                     getattr(os, "O_NOFOLLOW", 0), 0o600)
+                        os.close(fd)
+                    os.close(descriptor)
+                    self._lease_fd = None
+                    continue
+                _flock(descriptor, fcntl.LOCK_SH)
+                self._directory_identity = (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino)
+                gate_fd = _descriptor(gate)
+                try:
+                    _flock(gate_fd, fcntl.LOCK_EX)
+                    self._check_identity()
+                    self._admit_source()
+                    self._ensure_storage_environment()
+                    self._init_installation()
+                finally:
+                    os.close(gate_fd)
+                break
+        except BaseException:
+            if self._lease_fd is not None:
+                os.close(self._lease_fd)
+                self._lease_fd = None
+            self._closed = True
+            raise
 
-        # Enforce directory permissions (0700) with umask 0077 under process lock
-        self._ensure_storage_environment()
+    def _admit_source(self) -> None:
+        if (self.path.parent / ".planning-maintenance.json").exists():
+            raise DomainError("maintenance_pending", "Explicit maintenance recovery is required")
+        if self.path.exists():
+            inspect_image(self.path, host_id=self._requested_host_id)
+        elif any(Path(str(self.path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")):
+            raise DomainError("invalid", "Installation main image is missing")
 
-        # Initialize or load installation metadata atomically
-        self._epoch: Epoch
-        self._host_id: str
-        self._schema_version: int
-        self._init_installation()
+    def _check_open(self) -> None:
+        if os.getpid() != self._birth_pid:
+            raise DomainError("fenced", "Store belongs to another process")
+        if self._closed or (self._closing and not getattr(self._operation_local, "depth", 0)):
+            raise DomainError("closed", "Store is closed")
+
+    def _check_identity(self) -> None:
+        info = self.path.parent.stat()
+        if (info.st_dev, info.st_ino) != self._directory_identity:
+            raise DomainError("fenced", "Installation directory identity changed")
+
+    @contextmanager
+    def operation(self):
+        with self._lifecycle:
+            self._check_open()
+            self._active += 1
+            self._operation_local.depth = getattr(self._operation_local, "depth", 0) + 1
+        descriptor = None
+        try:
+            self._check_identity()
+            descriptor = _descriptor(self.path.parent / GATE_FILENAME)
+            _flock(descriptor, fcntl.LOCK_SH)
+            self._check_open()
+            yield
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            with self._lifecycle:
+                self._active -= 1
+                self._operation_local.depth -= 1
+                self._lifecycle.notify_all()
+
+    def close(self) -> None:
+        if os.getpid() != self._birth_pid:
+            raise DomainError("fenced", "Store belongs to another process")
+        if getattr(self._operation_local, "depth", 0):
+            raise DomainError("busy", "Cannot close a Store from its own operation or callback")
+        with self._lifecycle:
+            if self._closed:
+                return
+            self._closing = True
+            while self._active:
+                self._lifecycle.wait()
+            if self._closed:
+                return
+            self._closed = True
+            os.close(self._lease_fd)
+            self._lease_fd = None
+
+    def __enter__(self):
+        self._check_open()
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
     def _ensure_storage_environment(self) -> None:
         with _UMASK_LOCK:
@@ -175,16 +454,19 @@ class Store:
 
     def installation_epoch(self) -> Epoch:
         """Return the immutable installation epoch."""
+        self._check_open()
         return self._epoch
 
     @property
     def host_id(self) -> str:
         """Return the host ID."""
+        self._check_open()
         return self._host_id
 
     @property
     def schema_version(self) -> int:
         """Return the recorded schema version."""
+        self._check_open()
         return self._schema_version
 
     def add_listener(self, listener: Callable[[int], None]) -> None:
@@ -215,6 +497,10 @@ class Store:
         return self.read(lambda db: self.get_store_sequence(db))
 
     def write(self, operation: Callable[[sqlite3.Connection], T]) -> T:
+        with self.operation():
+            return self._write(operation)
+
+    def _write(self, operation: Callable[[sqlite3.Connection], T]) -> T:
         """Execute a short write operation in an exclusive transaction."""
         conn: sqlite3.Connection | None = None
         committed = False
@@ -276,6 +562,10 @@ class Store:
         return result
 
     def read(self, operation: Callable[[sqlite3.Connection], T]) -> T:
+        with self.operation():
+            return self._read(operation)
+
+    def _read(self, operation: Callable[[sqlite3.Connection], T]) -> T:
         """Execute a read operation in a single consistent SQLite snapshot."""
         conn: sqlite3.Connection | None = None
         try:

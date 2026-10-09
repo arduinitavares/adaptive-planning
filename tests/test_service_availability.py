@@ -1,5 +1,6 @@
 """Consumer-scoped accepted inputs and authenticated semantic worker progress."""
 from __future__ import annotations
+from contextlib import ExitStack
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -19,7 +20,7 @@ from tests.service_fixtures import context, make_service, seed_accepted_result, 
 
 class TestService(unittest.TestCase):
     def setUp(self):
-        self.f = make_service()
+        self.f = self.enterContext(make_service())
         self.addCleanup(self.f.cleanup)
         self.p = self.f.create()
         self.plan_id = self.p.current_metadata.plan_id
@@ -184,20 +185,21 @@ class TestService(unittest.TestCase):
         self.assertEqual(self.attempt(assigned).state, "active")
 
     def test_two_consumers_keep_different_bases_after_reopen(self):
-        self.p = self.f.create(steps=(step("a"), step("c", ("a",)), step("d", ("a",))), creation_id="two-consumers")
-        self.plan_id = self.p.current_metadata.plan_id
-        result = self.seed()
-        c, d = self.assign("c"), self.assign("d")
-        self.bind(c, (self.binding(result, base="base-c"),), "base-c")
-        c_payload, c_version = self.payload(c), self.attempt(c).version
-        self.bind(d, (self.binding(result, base="base-d"),), "base-d")
-        self.assertTrue(self.payload(c) == c_payload, "Another consumer overwrote retained bindings")
-        self.assertEqual(self.attempt(c).version, c_version)
-        self.f.service = PlanningService(Store(self.f.store.path, self.f.clock),
-                                        base_url="http://127.0.0.1:8790", clock=self.f.clock)
-        self.execute(self.worker(d))
-        self.execute(self.worker(c))
-        self.assertEqual((self.attempt(c).context.checked_base, self.attempt(d).context.checked_base), ("base-c", "base-d"))
+        with ExitStack() as _owned_store_lifetimes:
+            self.p = self.f.create(steps=(step("a"), step("c", ("a",)), step("d", ("a",))), creation_id="two-consumers")
+            self.plan_id = self.p.current_metadata.plan_id
+            result = self.seed()
+            c, d = self.assign("c"), self.assign("d")
+            self.bind(c, (self.binding(result, base="base-c"),), "base-c")
+            c_payload, c_version = self.payload(c), self.attempt(c).version
+            self.bind(d, (self.binding(result, base="base-d"),), "base-d")
+            self.assertTrue(self.payload(c) == c_payload, "Another consumer overwrote retained bindings")
+            self.assertEqual(self.attempt(c).version, c_version)
+            self.f.service = PlanningService(_owned_store_lifetimes.enter_context(Store(self.f.store.path, self.f.clock)),
+                                            base_url="http://127.0.0.1:8790", clock=self.f.clock)
+            self.execute(self.worker(d))
+            self.execute(self.worker(c))
+            self.assertEqual((self.attempt(c).context.checked_base, self.attempt(d).context.checked_base), ("base-c", "base-d"))
 
     def test_global_availability_row_is_not_consumer_authority(self):
         result = self.seed()
@@ -263,33 +265,35 @@ class TestService(unittest.TestCase):
         self.denied(command, ("held",))
 
     def test_all_integration_methods_preserve_exact_artifact_versions(self):
-        for method in ("ancestor", "merge", "cherry-pick", "equivalent", "observation"):
-            with self.subTest(method=method):
-                f = make_service()
-                self.addCleanup(f.cleanup)
-                self.f, self.p = f, f.create()
-                self.plan_id = self.p.current_metadata.plan_id
-                artifact = self.artifact("observation" if method == "observation" else "code", digest="original-bytes")
-                result = self.seed(artifact=artifact)
-                consumer = self.assign("c")
-                supplied = replace(artifact, identity="equivalent-delivery", version="integrated-v2", digest="different-bytes") if method == "equivalent" else artifact
-                binding = self.binding(result, method=method, artifact=supplied,
-                                       digest=supplied.digest if method == "equivalent" else None)
-                self.bind(consumer, (binding,))
-                self.execute(self.worker(consumer))
-                self.assertEqual(self.attempt(consumer).state, "active")
+        with ExitStack() as _owned_store_lifetimes:
+            for method in ("ancestor", "merge", "cherry-pick", "equivalent", "observation"):
+                with self.subTest(method=method):
+                    f = _owned_store_lifetimes.enter_context(make_service())
+                    self.addCleanup(f.cleanup)
+                    self.f, self.p = f, f.create()
+                    self.plan_id = self.p.current_metadata.plan_id
+                    artifact = self.artifact("observation" if method == "observation" else "code", digest="original-bytes")
+                    result = self.seed(artifact=artifact)
+                    consumer = self.assign("c")
+                    supplied = replace(artifact, identity="equivalent-delivery", version="integrated-v2", digest="different-bytes") if method == "equivalent" else artifact
+                    binding = self.binding(result, method=method, artifact=supplied,
+                                           digest=supplied.digest if method == "equivalent" else None)
+                    self.bind(consumer, (binding,))
+                    self.execute(self.worker(consumer))
+                    self.assertEqual(self.attempt(consumer).state, "active")
 
     def test_observation_accepts_document_data_and_observation_results(self):
-        for kind in ("document", "data", "observation"):
-            with self.subTest(kind=kind):
-                self.f = make_service()
-                self.addCleanup(self.f.cleanup)
-                self.p = self.f.create()
-                self.plan_id = self.p.current_metadata.plan_id
-                result = self.seed(artifact=self.artifact(kind))
-                consumer = self.assign("c")
-                self.bind(consumer, (self.binding(result, result_kind="observation"),))
-                self.execute(self.worker(consumer))
+        with ExitStack() as _owned_store_lifetimes:
+            for kind in ("document", "data", "observation"):
+                with self.subTest(kind=kind):
+                    self.f = _owned_store_lifetimes.enter_context(make_service())
+                    self.addCleanup(self.f.cleanup)
+                    self.p = self.f.create()
+                    self.plan_id = self.p.current_metadata.plan_id
+                    result = self.seed(artifact=self.artifact(kind))
+                    consumer = self.assign("c")
+                    self.bind(consumer, (self.binding(result, result_kind="observation"),))
+                    self.execute(self.worker(consumer))
 
     def test_malformed_attestations_cannot_supply_availability(self):
         result = self.seed(artifact=self.artifact("code", digest="original"))
@@ -385,7 +389,7 @@ class TestService(unittest.TestCase):
         self.denied(command)
 
     def event_pointer_history(self, missing_copies):
-        self.f = make_service()
+        self.f = self.enterContext(make_service())
         self.addCleanup(self.f.cleanup)
         self.p = self.f.create(steps=(step("a", review_required=True), step("b"), step("c", ("a",))),
                                creation_id="event-only-accepted-proof")
@@ -596,45 +600,47 @@ class TestService(unittest.TestCase):
         self.assertTrue(self.snapshot() == before, "Binding replay refreshed liveness or context")
 
     def test_default_inactivity_boundary_is_inclusive_and_has_no_hidden_writes(self):
-        for elapsed, succeeds in ((899, True), (900, False), (901, False)):
-            with self.subTest(elapsed=elapsed):
-                self.f = make_service()
-                self.addCleanup(self.f.cleanup)
-                self.p = self.f.create()
-                self.plan_id = self.p.current_metadata.plan_id
-                assigned = self.assign()
-                self.f.clock.advance(elapsed)
-                command = self.worker(assigned)
-                if succeeds:
-                    self.execute(command)
-                    self.assertEqual(self.attempt(assigned).last_activity, self.f.clock().isoformat())
-                else:
-                    self.denied(command, ("stale",))
-                    self.assertEqual(self.attempt(assigned).state, "assigned")
+        with ExitStack() as _owned_store_lifetimes:
+            for elapsed, succeeds in ((899, True), (900, False), (901, False)):
+                with self.subTest(elapsed=elapsed):
+                    self.f = _owned_store_lifetimes.enter_context(make_service())
+                    self.addCleanup(self.f.cleanup)
+                    self.p = self.f.create()
+                    self.plan_id = self.p.current_metadata.plan_id
+                    assigned = self.assign()
+                    self.f.clock.advance(elapsed)
+                    command = self.worker(assigned)
+                    if succeeds:
+                        self.execute(command)
+                        self.assertEqual(self.attempt(assigned).last_activity, self.f.clock().isoformat())
+                    else:
+                        self.denied(command, ("stale",))
+                        self.assertEqual(self.attempt(assigned).state, "assigned")
 
     def test_configured_activity_boundary_includes_submitted_and_is_isolated(self):
-        for state in ("assigned", "active", "submitted"):
-            with self.subTest(state=state):
-                self.f = make_service()
-                self.addCleanup(self.f.cleanup)
-                self.p = self.f.create()
-                self.plan_id = self.p.current_metadata.plan_id
-                short = self.configured_service(10)
-                longer = self.configured_service(20)
-                self.f.service = short
-                assigned = self.assign()
-                self.f.store.write(lambda db: db.execute("UPDATE attempts SET state=? WHERE plan_id=? AND attempt_id=?",
-                                                       (state, self.plan_id, assigned.committed["attempt_id"])))
-                self.f.clock.advance(10)
-                command = self.worker(assigned, "report_activity")
-                self.denied(command, ("stale",))
-                self.f.service = longer
-                self.execute(command)
-                self.assertEqual(self.attempt(assigned).state, state)
-                self.assertEqual(self.attempt(assigned).version, 2)
-                self.f.service = short
-                self.f.clock.advance(10)
-                self.denied(self.worker(assigned, "report_activity"), ("stale",))
+        with ExitStack() as _owned_store_lifetimes:
+            for state in ("assigned", "active", "submitted"):
+                with self.subTest(state=state):
+                    self.f = _owned_store_lifetimes.enter_context(make_service())
+                    self.addCleanup(self.f.cleanup)
+                    self.p = self.f.create()
+                    self.plan_id = self.p.current_metadata.plan_id
+                    short = self.configured_service(10)
+                    longer = self.configured_service(20)
+                    self.f.service = short
+                    assigned = self.assign()
+                    self.f.store.write(lambda db: db.execute("UPDATE attempts SET state=? WHERE plan_id=? AND attempt_id=?",
+                                                           (state, self.plan_id, assigned.committed["attempt_id"])))
+                    self.f.clock.advance(10)
+                    command = self.worker(assigned, "report_activity")
+                    self.denied(command, ("stale",))
+                    self.f.service = longer
+                    self.execute(command)
+                    self.assertEqual(self.attempt(assigned).state, state)
+                    self.assertEqual(self.attempt(assigned).version, 2)
+                    self.f.service = short
+                    self.f.clock.advance(10)
+                    self.denied(self.worker(assigned, "report_activity"), ("stale",))
 
     def test_configured_threshold_just_before_equal_after_and_positive_validation(self):
         for invalid in (0, -1, True, "10", 1.5):
@@ -699,33 +705,34 @@ class TestService(unittest.TestCase):
                 self.denied(self.worker(assigned, "report_activity"))
 
     def test_start_rechecks_scope_store_plan_and_prerequisite_holds(self):
-        for guard in ("store", "global", "consumer", "prerequisite", "stop", "block", "scope", "stale-sibling"):
-            with self.subTest(guard=guard):
-                self.f = make_service()
-                self.addCleanup(self.f.cleanup)
-                self.p = self.f.create()
-                self.plan_id = self.p.current_metadata.plan_id
-                result = self.seed()
-                consumer = self.assign("c")
-                self.bind(consumer, (self.binding(result),))
-                if guard == "store":
-                    self.f.store.write(lambda db: db.execute("UPDATE installation SET store_hold=1"))
-                elif guard in ("global", "consumer", "prerequisite"):
-                    self.hold(None if guard == "global" else "c" if guard == "consumer" else "a")
-                elif guard == "stale-sibling":
-                    sibling = self.assign("b")
-                    self.f.store.write(lambda db: db.execute("UPDATE attempts SET state='stale' WHERE plan_id=? AND attempt_id=?",
-                                                           (self.plan_id, sibling.committed["attempt_id"])))
-                else:
-                    def change(db):
-                        payload = json.loads(db.execute("SELECT payload FROM plans WHERE plan_id=?", (self.plan_id,)).fetchone()[0])
-                        if guard == "scope":
-                            payload["draft"]["authorization"]["mode"] = "plan-only"
-                        else:
-                            payload["draft"][guard + "_reason"] = "Explicit stop/block instruction"
-                        db.execute("UPDATE plans SET payload=? WHERE plan_id=?", (json.dumps(payload), self.plan_id))
-                    self.f.store.write(change)
-                self.denied(self.worker(consumer), ("held", "forbidden"))
+        with ExitStack() as _owned_store_lifetimes:
+            for guard in ("store", "global", "consumer", "prerequisite", "stop", "block", "scope", "stale-sibling"):
+                with self.subTest(guard=guard):
+                    self.f = _owned_store_lifetimes.enter_context(make_service())
+                    self.addCleanup(self.f.cleanup)
+                    self.p = self.f.create()
+                    self.plan_id = self.p.current_metadata.plan_id
+                    result = self.seed()
+                    consumer = self.assign("c")
+                    self.bind(consumer, (self.binding(result),))
+                    if guard == "store":
+                        self.f.store.write(lambda db: db.execute("UPDATE installation SET store_hold=1"))
+                    elif guard in ("global", "consumer", "prerequisite"):
+                        self.hold(None if guard == "global" else "c" if guard == "consumer" else "a")
+                    elif guard == "stale-sibling":
+                        sibling = self.assign("b")
+                        self.f.store.write(lambda db: db.execute("UPDATE attempts SET state='stale' WHERE plan_id=? AND attempt_id=?",
+                                                               (self.plan_id, sibling.committed["attempt_id"])))
+                    else:
+                        def change(db):
+                            payload = json.loads(db.execute("SELECT payload FROM plans WHERE plan_id=?", (self.plan_id,)).fetchone()[0])
+                            if guard == "scope":
+                                payload["draft"]["authorization"]["mode"] = "plan-only"
+                            else:
+                                payload["draft"][guard + "_reason"] = "Explicit stop/block instruction"
+                            db.execute("UPDATE plans SET payload=? WHERE plan_id=?", (json.dumps(payload), self.plan_id))
+                        self.f.store.write(change)
+                    self.denied(self.worker(consumer), ("held", "forbidden"))
 
     def test_activity_records_observation_without_clearing_holds_or_reopening(self):
         assigned = self.assign()
@@ -879,26 +886,27 @@ class TestService(unittest.TestCase):
         self.assertEqual(self.attempt(assigned).context.workspace_id, ws)
 
     def test_start_rejects_unresolved_missing_released_foreign_and_orphan_use(self):
-        for conflict in ("unresolved", "missing", "released", "foreign", "orphan"):
-            with self.subTest(conflict=conflict):
-                self.f = make_service()
-                self.addCleanup(self.f.cleanup)
-                self.p = self.f.create()
-                self.plan_id = self.p.current_metadata.plan_id
-                ws = self.f.register(workspace("/synthetic/writer", 82), self.p)
-                assigned = self.assign(execution=context(ws))
-                if conflict == "missing":
-                    self.f.store.write(lambda db: db.execute("DELETE FROM resource_uses WHERE plan_id=?", (self.plan_id,)))
-                elif conflict in ("released", "unresolved"):
-                    self.f.store.write(lambda db: db.execute("UPDATE resource_uses SET status=? WHERE plan_id=?", (conflict, self.plan_id)))
-                elif conflict == "orphan":
-                    seed_orphan_use(self.f, ws)
-                else:
-                    sibling = self.assign("b")
-                    self.f.store.write(lambda db: db.execute(
-                        "INSERT INTO resource_uses(use_id,resource_id,plan_id,attempt_id,scope,status) VALUES('foreign-use',?,?,?,'workspace','active')",
-                        (ws, self.plan_id, sibling.committed["attempt_id"])))
-                self.denied(self.worker(assigned), ("resource_conflict",))
+        with ExitStack() as _owned_store_lifetimes:
+            for conflict in ("unresolved", "missing", "released", "foreign", "orphan"):
+                with self.subTest(conflict=conflict):
+                    self.f = _owned_store_lifetimes.enter_context(make_service())
+                    self.addCleanup(self.f.cleanup)
+                    self.p = self.f.create()
+                    self.plan_id = self.p.current_metadata.plan_id
+                    ws = self.f.register(workspace("/synthetic/writer", 82), self.p)
+                    assigned = self.assign(execution=context(ws))
+                    if conflict == "missing":
+                        self.f.store.write(lambda db: db.execute("DELETE FROM resource_uses WHERE plan_id=?", (self.plan_id,)))
+                    elif conflict in ("released", "unresolved"):
+                        self.f.store.write(lambda db: db.execute("UPDATE resource_uses SET status=? WHERE plan_id=?", (conflict, self.plan_id)))
+                    elif conflict == "orphan":
+                        seed_orphan_use(self.f, ws)
+                    else:
+                        sibling = self.assign("b")
+                        self.f.store.write(lambda db: db.execute(
+                            "INSERT INTO resource_uses(use_id,resource_id,plan_id,attempt_id,scope,status) VALUES('foreign-use',?,?,?,'workspace','active')",
+                            (ws, self.plan_id, sibling.committed["attempt_id"])))
+                    self.denied(self.worker(assigned), ("resource_conflict",))
 
     def test_identity_uncertainty_after_assignment_blocks_start(self):
         ws = self.f.register(workspace("/synthetic/identity", 83), self.p)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION: int = 1
+SCHEMA_VERSION: int = 2
 
 # Identity indexes decode only the strictly shaped v1 attestation. CASE, rather
 # than AND evaluation order, keeps historical opaque/malformed text readable.
@@ -39,6 +39,24 @@ _RESOURCE_V1 = f"""
 """
 
 SCHEMA_STATEMENTS: tuple[str, ...] = (
+    """CREATE TABLE IF NOT EXISTS restore_origins (
+    restore_id TEXT PRIMARY KEY,
+    prior_epoch TEXT NOT NULL,
+    new_epoch TEXT NOT NULL UNIQUE,
+    host_id TEXT NOT NULL,
+    source_digest TEXT NOT NULL,
+    source_cutoff TEXT NOT NULL,
+    payload TEXT NOT NULL
+);""",
+    """CREATE TABLE IF NOT EXISTS restore_attempt_origins (
+    restore_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY(restore_id,plan_id,attempt_id),
+    FOREIGN KEY(restore_id) REFERENCES restore_origins(restore_id) ON DELETE RESTRICT,
+    FOREIGN KEY(plan_id,attempt_id) REFERENCES attempts(plan_id,attempt_id) ON DELETE RESTRICT
+);""",
     # 1. installation singleton
     """CREATE TABLE IF NOT EXISTS installation (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -223,10 +241,44 @@ END;""",
     declared_identity TEXT,
     status TEXT NOT NULL DEFAULT 'unresolved',
     created_at TEXT NOT NULL DEFAULT '',
+    anchor_use_id TEXT,
+    producer_id TEXT,
     UNIQUE (absent_work_id, scope),
     FOREIGN KEY (resource_id) REFERENCES resources (resource_id) ON DELETE RESTRICT
 );""",
     """CREATE INDEX IF NOT EXISTS idx_absent_host_work_host ON absent_host_work (host_id);""",
+    """CREATE TABLE IF NOT EXISTS absent_host_work_members (
+    absent_work_id TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    scope TEXT NOT NULL CHECK(scope IN ('repository','workspace','external')),
+    PRIMARY KEY(absent_work_id,resource_id,scope),
+    FOREIGN KEY(absent_work_id) REFERENCES absent_host_work(absent_work_id) ON DELETE RESTRICT,
+    FOREIGN KEY(resource_id) REFERENCES resources(resource_id) ON DELETE RESTRICT
+);""",
+    """CREATE TRIGGER IF NOT EXISTS trg_absent_member_insert
+BEFORE INSERT ON absent_host_work_members BEGIN
+    SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM resources r JOIN absent_host_work w
+    ON w.absent_work_id=NEW.absent_work_id WHERE r.resource_id=NEW.resource_id
+    AND r.host_id=w.host_id AND r.kind=NEW.scope)
+    THEN RAISE(ABORT,'Orphan member host or kind mismatch') END;
+END;""",
+    """CREATE TRIGGER IF NOT EXISTS trg_absent_member_update
+BEFORE UPDATE ON absent_host_work_members BEGIN
+    SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM resources r JOIN absent_host_work w
+    ON w.absent_work_id=NEW.absent_work_id WHERE r.resource_id=NEW.resource_id
+    AND r.host_id=w.host_id AND r.kind=NEW.scope)
+    THEN RAISE(ABORT,'Orphan member host or kind mismatch') END;
+END;""",
+    """CREATE TABLE IF NOT EXISTS host_work_declarations (
+    producer_id TEXT PRIMARY KEY,
+    absent_work_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    state TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(absent_work_id) REFERENCES absent_host_work(absent_work_id) ON DELETE RESTRICT
+);""",
     # 10. store_hold_reasons
     """CREATE TABLE IF NOT EXISTS store_hold_reasons (
     reason_id TEXT PRIMARY KEY,
@@ -248,7 +300,7 @@ END;""",
     created_at TEXT NOT NULL DEFAULT '',
     FOREIGN KEY (resource_id) REFERENCES resources (resource_id) ON DELETE RESTRICT,
     FOREIGN KEY (plan_id, attempt_id) REFERENCES attempts (plan_id, attempt_id) ON DELETE RESTRICT,
-    FOREIGN KEY (absent_work_id, scope) REFERENCES absent_host_work (absent_work_id, scope) ON DELETE RESTRICT,
+    FOREIGN KEY (absent_work_id, resource_id, scope) REFERENCES absent_host_work_members (absent_work_id, resource_id, scope) ON DELETE RESTRICT,
     CHECK (
         (plan_id IS NOT NULL AND attempt_id IS NOT NULL AND absent_work_id IS NULL)
         OR
@@ -265,9 +317,8 @@ WHEN NEW.absent_work_id IS NOT NULL
 BEGIN
     SELECT CASE
         WHEN EXISTS (
-            SELECT 1 FROM absent_host_work
-            WHERE absent_work_id = NEW.absent_work_id
-              AND scope != NEW.scope
+            SELECT 1 FROM resources r JOIN absent_host_work w ON w.absent_work_id=NEW.absent_work_id
+            WHERE r.resource_id=NEW.resource_id AND (r.host_id != w.host_id OR r.kind != NEW.scope)
         )
         THEN RAISE(ABORT, 'Orphan resource_use scope must match absent_host_work scope')
     END;
@@ -278,9 +329,8 @@ WHEN NEW.absent_work_id IS NOT NULL
 BEGIN
     SELECT CASE
         WHEN EXISTS (
-            SELECT 1 FROM absent_host_work
-            WHERE absent_work_id = NEW.absent_work_id
-              AND scope != NEW.scope
+            SELECT 1 FROM resources r JOIN absent_host_work w ON w.absent_work_id=NEW.absent_work_id
+            WHERE r.resource_id=NEW.resource_id AND (r.host_id != w.host_id OR r.kind != NEW.scope)
         )
         THEN RAISE(ABORT, 'Orphan resource_use scope must match absent_host_work scope')
     END;

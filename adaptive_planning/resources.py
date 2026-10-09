@@ -6,6 +6,7 @@ only; neither registration nor reconciliation alters an execution use.
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import uuid
 from dataclasses import dataclass, replace
@@ -745,6 +746,110 @@ def _writer_active(connection, plan_id, writer, rows):
             or writer["generation"] != authority)
 
 
+def _inventory_declaration(connection, producer_id, work_id, actor, host, visited=None):
+    from adaptive_planning import recovery
+    visited=set() if visited is None else visited
+    if producer_id in visited:
+        raise DomainError('invalid','Orphan producer ancestry is cyclic')
+    visited.add(producer_id)
+    saved=connection.execute('SELECT kind,actor,state,payload FROM host_work_declarations WHERE producer_id=? AND absent_work_id=?',(producer_id,work_id)).fetchone()
+    if saved is None or saved[0]!='inventory' or saved[1]!=actor:
+        raise DomainError('invalid','Orphan producer ancestry is absent or contradictory')
+    record=_json_object(saved[3],'orphan inventory producer')
+    origin=connection.execute('SELECT new_epoch,host_id FROM restore_origins WHERE restore_id=?',(record['restore_id'],)).fetchone()
+    recovery.restore_origin(connection,record['restore_id'])
+    if (record.get('format')!=1 or record.get('producer')!='inventory' or origin!=(record['epoch'],host) or
+            record['work']['work_id']!=work_id or record['work']['actor']!=actor or record['work']['state']!=saved[2]):
+        raise DomainError('invalid','Inventory orphan has no exact restore/source binding')
+    matches=[]
+    for event_actor,raw in connection.execute("SELECT actor,payload FROM events WHERE plan_id IS NULL AND plan_revision IS NULL AND kind='host_work_declared'"):
+        event=_json_object(raw,'host work producer event')
+        if event.get('producer_id')==producer_id:
+            matches.append((event_actor,event))
+    expected=dict(producer_id=producer_id,absent_work_id=work_id,actor=actor,record_digest=hashlib.sha256(saved[3].encode()).hexdigest())
+    if matches!=[('local-administrator',expected)]:
+        raise DomainError('invalid','Inventory producer contradicts its retained event')
+    prior=record.get('prior_producer_id')
+    if prior is not None:
+        previous=_inventory_declaration(connection,prior,work_id,actor,host,visited)
+        if (record['members'][:len(previous['members'])]!=previous['members'] or
+                record.get('identity_reason_id')!=previous.get('identity_reason_id')):
+            raise DomainError('invalid','Inventory attachment removed its original producer obligation')
+    else:
+        identity=record.get('identity_reason_id')
+        if identity is not None:
+            reason=connection.execute('SELECT epoch,kind,details FROM store_hold_reasons WHERE reason_id=?',(identity,)).fetchone()
+            expected=json.dumps(dict(restore_id=record['restore_id'],work_id=work_id,actor=actor,producer_id=producer_id),sort_keys=True)
+            if reason!=(record['epoch'],'absent-identity',expected):
+                raise DomainError('invalid','Orphan identity reason is not its exact original producer obligation')
+    return record
+
+
+def orphan_cohort(connection, work_id):
+    """Prove one actual historical work cohort before projection or release."""
+    try:
+        parent=connection.execute('SELECT absent_work_id,host_id,resource_id,scope,declared_identity,status,created_at,anchor_use_id,producer_id FROM absent_host_work WHERE absent_work_id=?',(work_id,)).fetchone()
+        host=connection.execute('SELECT host_id FROM installation').fetchone()[0]
+        if parent is None or parent[1]!=host or not parent[4] or not parent[8]:
+            raise DomainError('invalid','Orphan parent has no coherent local producer')
+        declarations=connection.execute('SELECT kind,actor,state,payload FROM host_work_declarations WHERE producer_id=? AND absent_work_id=?',(parent[8],work_id)).fetchall()
+        if len(declarations)!=1 or declarations[0][1]!=parent[4]:
+            raise DomainError('invalid','Orphan declaration is absent or contradictory')
+        kind,actor,state,raw=declarations[0]
+        record=_json_object(raw,'orphan producer')
+        if record.get('format')!=1 or record.get('producer')!=kind:
+            raise DomainError('invalid','Orphan producer format is unsupported')
+        if kind=='migration':
+            original=record['original_parent']
+            if original[:5]!=list(parent[:5]) or original[6]!=parent[6]:
+                raise DomainError('invalid','Migration orphan parent differs from retained history')
+        elif kind=='inventory':
+            record=_inventory_declaration(connection,parent[8],work_id,actor,host)
+        else:
+            raise DomainError('invalid','Orphan producer kind is unsupported')
+        rows=connection.execute('SELECT use_id,resource_id,plan_id,attempt_id,absent_work_id,scope,status,created_at,rowid FROM resource_uses WHERE absent_work_id=? ORDER BY rowid,use_id',(work_id,)).fetchall()
+        actual=[dict(use_id=row[0],resource_id=row[1],scope=row[5],created_at=row[7]) for row in rows]
+        if actual!=record['members'] or any(row[2] is not None or row[3] is not None for row in rows):
+            raise DomainError('invalid','Orphan physical rows differ from immutable membership')
+        members=connection.execute('SELECT resource_id,scope FROM absent_host_work_members WHERE absent_work_id=?',(work_id,)).fetchall()
+        if set(members)!={(row[1],row[5]) for row in rows}:
+            raise DomainError('invalid','Orphan member relation is incomplete or contradictory')
+        for row in rows:
+            if connection.execute('SELECT host_id,kind FROM resources WHERE resource_id=?',(row[1],)).fetchone()!=(host,row[5]):
+                raise DomainError('invalid','Orphan raw member belongs to another host or scope')
+            resolve_resource_id(connection,row[1])
+        if (rows and parent[7]!=rows[0][0]) or (not rows and parent[7] is not None):
+            raise DomainError('invalid','Orphan stable anchor is not its retained first use')
+        remaining=[row for row in rows if row[6]!='released']
+        canonical=tuple(sorted({resolve_resource_id(connection,row[1]) for row in remaining}))
+        return dict(parent=parent,record=record,rows=rows,remaining=remaining,resource_ids=canonical,
+                    anchor=rows[0] if rows else None,actor=actor,identity_reason_id=record.get('identity_reason_id'))
+    except DomainError:
+        raise
+    except (KeyError,TypeError,ValueError,IndexError) as error:
+        raise DomainError('invalid','Orphan cohort producer is malformed') from error
+
+
+def select_orphan_stop(connection,use_id,resource_ids):
+    """Select a declared writer's complete remaining cohort by any real member."""
+    row=connection.execute('SELECT absent_work_id FROM resource_uses WHERE use_id=?',(use_id,)).fetchone()
+    if row is None or row[0] is None:
+        raise DomainError('invalid','Stop target has no actual absent work owner')
+    work=orphan_cohort(connection,row[0])
+    identity=work['identity_reason_id']
+    if identity is not None:
+        reason=connection.execute('SELECT resolved FROM store_hold_reasons WHERE reason_id=?',(identity,)).fetchone()
+        if reason is None or reason[0]!=1:
+            raise DomainError('held','Unidentified orphan work cannot be physically released')
+    canonical=[resolve_resource_id(connection,rid) for rid in resource_ids]
+    if len(set(canonical))!=len(canonical):
+        raise DomainError('invalid','Orphan stop selectors must be distinct canonical identities')
+    selected=set(canonical)
+    if not selected or selected!=set(work['resource_ids']):
+        raise DomainError('invalid','Stop requires the full remaining canonical writer cohort')
+    return work,[member[0] for member in work['remaining']]
+
+
 def reservation_projections(connection, plan_id):
     """One coherent verifier anchor or conservative physical fallback, shared by counts and pages."""
     rows = tuple(connection.execute(
@@ -759,8 +864,19 @@ def reservation_projections(connection, plan_id):
             except (DomainError, ValueError, TypeError, KeyError, RecursionError):
                 failed.add(row[3])
     result = {}
+    orphan_work=set()
     for row in rows:
         actor, writer, selected = row[9] or "", row[6] != "released", [row]
+        if row[2] is None:
+            if row[4] in orphan_work:
+                continue
+            orphan_work.add(row[4])
+            cohort=orphan_cohort(connection,row[4])
+            anchor=cohort['anchor']
+            result[anchor[8]]=ReservationView(anchor[0],None,None,row[4],cohort['resource_ids'],cohort['actor'],
+                                            bool(cohort['remaining']),bool(cohort['remaining']),
+                                            any(item[5]=='repository' for item in cohort['remaining']))
+            continue
         if row[2] is not None:
             actor = ""
             if row[3] in decoded:

@@ -1,5 +1,6 @@
 """Durable checkpoint publication, authenticated replay and atomic provisional holds."""
 from __future__ import annotations
+from contextlib import ExitStack
 
 import asyncio
 import copy
@@ -25,7 +26,7 @@ from tests.service_fixtures import (
 
 class TestService(unittest.TestCase):
     def setUp(self):
-        self.f = make_service()
+        self.f = self.enterContext(make_service())
         self.addCleanup(self.f.cleanup)
         self.p = self.f.create(steps=(step("a"), step("b"), step("c", ("b",)), step("d", ("c",))))
         self.plan_id = self.p.current_metadata.plan_id
@@ -107,42 +108,43 @@ class TestService(unittest.TestCase):
             self.fail("Task15 checkpoint domain is not implemented")
 
     def test_checkpoint_evidence_outcome_reassessment(self):
-        active = self.active()
-        value = checkpoint()
-        self.denied(self.command(active, replace(value, evidence=())))
-        raw = plans.to_jsonable(self.command(active))
-        del raw["payload"]["checkpoint"]["reassessment"]
-        before = self.snapshot()
-        with self.assertRaises(DomainError) as missing:
-            parse_command(raw)
-        self.assertEqual(missing.exception.code, "invalid")
-        self.assertTrue(self.snapshot() == before)
-        oversized = replace(value, evidence=value.evidence * 51)
-        self.denied(self.command(active, oversized), "limit_exceeded")
-        failure = replace(checkpoint("failed"), evidence=(replace(checkpoint("failed").evidence[0],
-                          summary="Essential failing check: second document page is missing",
-                          limitations=("Temporary screenshot path will expire",),
-                          blockers=("Missing second page must be fixed",)),))
-        receipt = self.execute(self.command(active, failure))
-        self.assertEqual(self.attempt(active).state, "submitted")
-        self.assertEqual(self.attempt(active).version, 3)
-        self.assertEqual(self.node("a")["status"], "blocked")
-        self.assertNotIn("a", self.f.service.read_plan(self.plan_id).coordination.result_versions)
-        reopened = make_service(self.f.directory, self.f.clock)
-        row = reopened.store.read(lambda db: db.execute(
-            "SELECT sequence,outcome,check_name,evidence,origin_worker,relay,artifact,reassessment FROM checkpoints "
-            "WHERE plan_id=? AND attempt_id=?", (self.plan_id, active.committed["attempt_id"])).fetchone())
-        self.assertEqual(str(row[0]), receipt.committed["checkpoint_id"])
-        durable = _to_checkpoint({"outcome": row[1], "check": row[2], "evidence": json.loads(row[3]),
-                                  "origin_worker": row[4], "relay": row[5],
-                                  "artifact": json.loads(row[6]), "reassessment": json.loads(row[7])})
-        self.assertEqual(durable, failure)
-        event = next(e for e in reopened.service.read_events(self.plan_id) if e.sequence == row[0])
-        self.assertEqual(_to_checkpoint(event.payload["checkpoint"]), failure)
-        self.assertEqual(self.node("a", reopened.service)["evidence"], [
-            "Essential failing check: second document page is missing | check: Synthetic checkpoint check | result: failed"
-            " | artifact: synthetic-artifact version v1 (code: Synthetic artifact output)"
-            " | limitations: Temporary screenshot path will expire | blockers: Missing second page must be fixed"])
+        with ExitStack() as _owned_store_lifetimes:
+            active = self.active()
+            value = checkpoint()
+            self.denied(self.command(active, replace(value, evidence=())))
+            raw = plans.to_jsonable(self.command(active))
+            del raw["payload"]["checkpoint"]["reassessment"]
+            before = self.snapshot()
+            with self.assertRaises(DomainError) as missing:
+                parse_command(raw)
+            self.assertEqual(missing.exception.code, "invalid")
+            self.assertTrue(self.snapshot() == before)
+            oversized = replace(value, evidence=value.evidence * 51)
+            self.denied(self.command(active, oversized), "limit_exceeded")
+            failure = replace(checkpoint("failed"), evidence=(replace(checkpoint("failed").evidence[0],
+                              summary="Essential failing check: second document page is missing",
+                              limitations=("Temporary screenshot path will expire",),
+                              blockers=("Missing second page must be fixed",)),))
+            receipt = self.execute(self.command(active, failure))
+            self.assertEqual(self.attempt(active).state, "submitted")
+            self.assertEqual(self.attempt(active).version, 3)
+            self.assertEqual(self.node("a")["status"], "blocked")
+            self.assertNotIn("a", self.f.service.read_plan(self.plan_id).coordination.result_versions)
+            reopened = _owned_store_lifetimes.enter_context(make_service(self.f.directory, self.f.clock))
+            row = reopened.store.read(lambda db: db.execute(
+                "SELECT sequence,outcome,check_name,evidence,origin_worker,relay,artifact,reassessment FROM checkpoints "
+                "WHERE plan_id=? AND attempt_id=?", (self.plan_id, active.committed["attempt_id"])).fetchone())
+            self.assertEqual(str(row[0]), receipt.committed["checkpoint_id"])
+            durable = _to_checkpoint({"outcome": row[1], "check": row[2], "evidence": json.loads(row[3]),
+                                      "origin_worker": row[4], "relay": row[5],
+                                      "artifact": json.loads(row[6]), "reassessment": json.loads(row[7])})
+            self.assertEqual(durable, failure)
+            event = next(e for e in reopened.service.read_events(self.plan_id) if e.sequence == row[0])
+            self.assertEqual(_to_checkpoint(event.payload["checkpoint"]), failure)
+            self.assertEqual(self.node("a", reopened.service)["evidence"], [
+                "Essential failing check: second document page is missing | check: Synthetic checkpoint check | result: failed"
+                " | artifact: synthetic-artifact version v1 (code: Synthetic artifact output)"
+                " | limitations: Temporary screenshot path will expire | blockers: Missing second page must be fixed"])
 
     def test_pass_submits_without_completing_or_satisfying_dependency(self):
         active = self.active("b")
@@ -304,86 +306,87 @@ class TestService(unittest.TestCase):
         self.assertTrue(self.snapshot() == before)
 
     def test_checkpoint_hold_serializes_with_concurrent_start(self):
-        from adaptive_planning.app import HANDLERS
-        self.assertIn("record_checkpoint", HANDLERS, "Task15 checkpoint publication is not enabled")
-        active, assigned = self.active(), self.assign("b")
-        publish = self.command(active, checkpoint(affected=("b",)))
-        start = self.f.command("start_step", {"origin_worker": "worker-a", "relay": None,
-                              "observed_activity": "Concurrent start contender"}, receipt=self.p, attempt=assigned)
-        start = replace(start, expected_revision=None, ownership_version=None)
-        other_store = Store(self.f.store.path, self.f.clock, host_id="synthetic-host")
-        other = PlanningService(other_store, base_url="http://127.0.0.1:8790", clock=self.f.clock)
-        boundary = threading.Barrier(2)
-        release = threading.Event()
-        connect, other_connect = self.f.store._connect, other_store._connect
-        paused = False
+        with ExitStack() as _owned_store_lifetimes:
+            from adaptive_planning.app import HANDLERS
+            self.assertIn("record_checkpoint", HANDLERS, "Task15 checkpoint publication is not enabled")
+            active, assigned = self.active(), self.assign("b")
+            publish = self.command(active, checkpoint(affected=("b",)))
+            start = self.f.command("start_step", {"origin_worker": "worker-a", "relay": None,
+                                  "observed_activity": "Concurrent start contender"}, receipt=self.p, attempt=assigned)
+            start = replace(start, expected_revision=None, ownership_version=None)
+            other_store = _owned_store_lifetimes.enter_context(Store(self.f.store.path, self.f.clock, host_id="synthetic-host"))
+            other = PlanningService(other_store, base_url="http://127.0.0.1:8790", clock=self.f.clock)
+            boundary = threading.Barrier(2)
+            release = threading.Event()
+            connect, other_connect = self.f.store._connect, other_store._connect
+            paused = False
 
-        def publishing_connection():
-            db = connect()
-            def pause_before_hold():
-                nonlocal paused
-                if not paused:
-                    paused = True
-                    self.assertEqual(db.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0], 1)
-                    self.assertEqual(db.execute("SELECT COUNT(*) FROM holds").fetchone()[0], 0)
+            def publishing_connection():
+                db = connect()
+                def pause_before_hold():
+                    nonlocal paused
+                    if not paused:
+                        paused = True
+                        self.assertEqual(db.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0], 1)
+                        self.assertEqual(db.execute("SELECT COUNT(*) FROM holds").fetchone()[0], 0)
+                        boundary.wait(timeout=10)
+                        if not release.wait(timeout=10):
+                            raise RuntimeError("Owned contention release timed out")
+                    return 1
+                db.create_function("owned_checkpoint_boundary", 0, pause_before_hold)
+                return db
+
+            def contender_connection():
+                db = other_connect()
+                # Only this test-owned connection fails immediately on the publisher's real write lock.
+                db.execute("PRAGMA busy_timeout = 0")
+                return db
+
+            self.f.store.write(lambda db: db.execute(
+                "CREATE TRIGGER owned_checkpoint_boundary_trigger BEFORE INSERT ON holds "
+                "BEGIN SELECT owned_checkpoint_boundary(); END"))
+            before_revision = self.f.service.read_plan(self.plan_id).metadata.revision
+            before_publication = self.snapshot()
+            with patch.object(self.f.store, "_connect", publishing_connection), \
+                    patch.object(other_store, "_connect", contender_connection), ThreadPoolExecutor(max_workers=2) as pool:
+                publisher = pool.submit(self.execute, publish)
+                try:
                     boundary.wait(timeout=10)
-                    if not release.wait(timeout=10):
-                        raise RuntimeError("Owned contention release timed out")
-                return 1
-            db.create_function("owned_checkpoint_boundary", 0, pause_before_hold)
-            return db
-
-        def contender_connection():
-            db = other_connect()
-            # Only this test-owned connection fails immediately on the publisher's real write lock.
-            db.execute("PRAGMA busy_timeout = 0")
-            return db
-
-        self.f.store.write(lambda db: db.execute(
-            "CREATE TRIGGER owned_checkpoint_boundary_trigger BEFORE INSERT ON holds "
-            "BEGIN SELECT owned_checkpoint_boundary(); END"))
-        before_revision = self.f.service.read_plan(self.plan_id).metadata.revision
-        before_publication = self.snapshot()
-        with patch.object(self.f.store, "_connect", publishing_connection), \
-                patch.object(other_store, "_connect", contender_connection), ThreadPoolExecutor(max_workers=2) as pool:
-            publisher = pool.submit(self.execute, publish)
-            try:
-                boundary.wait(timeout=10)
-                # Independent WAL read sees the old complete state, never a checkpoint without its holds.
-                view = other.read_plan(self.plan_id)
-                self.assertEqual(view.metadata.revision, before_revision)
-                self.assertEqual(view.coordination.holds, ())
-                self.assertEqual(other_store.read(lambda db: db.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]), 0)
-                self.assertEqual(other_store.read(lambda db: db.execute("PRAGMA busy_timeout").fetchone()[0]), 0)
-                contender = pool.submit(other.execute, start)
-                # Publication stays paused until SQLite itself has rejected the conflicting BEGIN IMMEDIATE.
-                with self.assertRaises(DomainError) as busy:
-                    contender.result(timeout=10)
-                self.assertEqual(busy.exception.code, "busy")
-                sqlite_error = busy.exception.__cause__
-                self.assertIsInstance(sqlite_error, sqlite3.OperationalError)
-                self.assertEqual(sqlite_error.sqlite_errorcode, sqlite3.SQLITE_BUSY)
-                self.assertEqual(sqlite_error.sqlite_errorname, "SQLITE_BUSY")
-                self.assertFalse(release.is_set())
-                self.assertFalse(publisher.done())
-                self.assertTrue(other_store.read(lambda db: tuple(db.iterdump())) == before_publication,
-                                "Contended start published an attempt, revision, event or request")
-            finally:
-                release.set()
-            receipt = publisher.result(timeout=10)
-            before_retry = self.snapshot()
-            with self.assertRaises(DomainError) as denied:
-                other.execute(start)
-            self.assertTrue(self.snapshot() == before_retry, "Held retry changed persisted state")
-        self.assertEqual(denied.exception.code, "held")
-        self.assertEqual(self.attempt(assigned).state, "assigned")
-        self.assertEqual(len(self.rows("checkpoints")), 1)
-        self.assertEqual(len(self.rows("holds")), 3)
-        self.assertEqual(self.f.service.read_plan(self.plan_id).metadata.revision, receipt.committed_metadata.revision)
-        print(json.dumps({"task15_contention": "actual SQLite write-lock rejection before publisher release",
-                          "sqlite_errorcode": sqlite_error.sqlite_errorcode, "sqlite_errorname": sqlite_error.sqlite_errorname,
-                          "contender_domain": busy.exception.code, "identical_retry_domain": denied.exception.code},
-                         sort_keys=True))
+                    # Independent WAL read sees the old complete state, never a checkpoint without its holds.
+                    view = other.read_plan(self.plan_id)
+                    self.assertEqual(view.metadata.revision, before_revision)
+                    self.assertEqual(view.coordination.holds, ())
+                    self.assertEqual(other_store.read(lambda db: db.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]), 0)
+                    self.assertEqual(other_store.read(lambda db: db.execute("PRAGMA busy_timeout").fetchone()[0]), 0)
+                    contender = pool.submit(other.execute, start)
+                    # Publication stays paused until SQLite itself has rejected the conflicting BEGIN IMMEDIATE.
+                    with self.assertRaises(DomainError) as busy:
+                        contender.result(timeout=10)
+                    self.assertEqual(busy.exception.code, "busy")
+                    sqlite_error = busy.exception.__cause__
+                    self.assertIsInstance(sqlite_error, sqlite3.OperationalError)
+                    self.assertEqual(sqlite_error.sqlite_errorcode, sqlite3.SQLITE_BUSY)
+                    self.assertEqual(sqlite_error.sqlite_errorname, "SQLITE_BUSY")
+                    self.assertFalse(release.is_set())
+                    self.assertFalse(publisher.done())
+                    self.assertTrue(other_store.read(lambda db: tuple(db.iterdump())) == before_publication,
+                                    "Contended start published an attempt, revision, event or request")
+                finally:
+                    release.set()
+                receipt = publisher.result(timeout=10)
+                before_retry = self.snapshot()
+                with self.assertRaises(DomainError) as denied:
+                    other.execute(start)
+                self.assertTrue(self.snapshot() == before_retry, "Held retry changed persisted state")
+            self.assertEqual(denied.exception.code, "held")
+            self.assertEqual(self.attempt(assigned).state, "assigned")
+            self.assertEqual(len(self.rows("checkpoints")), 1)
+            self.assertEqual(len(self.rows("holds")), 3)
+            self.assertEqual(self.f.service.read_plan(self.plan_id).metadata.revision, receipt.committed_metadata.revision)
+            print(json.dumps({"task15_contention": "actual SQLite write-lock rejection before publisher release",
+                              "sqlite_errorcode": sqlite_error.sqlite_errorcode, "sqlite_errorname": sqlite_error.sqlite_errorname,
+                              "contender_domain": busy.exception.code, "identical_retry_domain": denied.exception.code},
+                             sort_keys=True))
 
     def test_interleaved_sibling_updates_preserved(self):
         a, b = self.active(), self.active("b", assignee="worker-b")
@@ -535,22 +538,23 @@ class TestService(unittest.TestCase):
         self.assertEqual(len(self.rows("holds")), 1)
 
     def test_checkpoint_id_is_actual_global_event_sequence_after_restart(self):
-        active = self.active()
-        other = self.f.create(steps=(step("x"),), creation_id="interleaved-other-plan")
-        self.f.service.execute(self.f.command("revise_plan", {"draft": self.f.service.read_plan(other.current_metadata.plan_id).draft, "reason": "Other event",
-                                  "authorization_change": None, "retire_steps": ()}, receipt=other))
-        receipt = self.execute(self.command(active, checkpoint(affected=("b",))))
-        reopened = make_service(self.f.directory, self.f.clock)
-        event = next(e for e in reopened.service.read_events(self.plan_id) if e.kind == "record_checkpoint")
-        row = reopened.store.read(lambda db: db.execute("SELECT sequence,attempt_id FROM checkpoints WHERE plan_id=?",
-                                                       (self.plan_id,)).fetchone())
-        self.assertEqual(receipt.committed["checkpoint_id"], str(event.sequence))
-        self.assertEqual(row, (event.sequence, active.committed["attempt_id"]))
-        self.assertEqual(event.payload["attempt_id"], active.committed["attempt_id"])
-        self.assertEqual(event.payload["step_id"], "a")
-        self.assertEqual(event.payload["definition_version"], "v1")
-        self.assertEqual(event.payload["checkpoint_id"], str(event.sequence))
-        self.assertEqual({h.source_id for h in reopened.service.read_plan(self.plan_id).coordination.holds}, {str(event.sequence)})
+        with ExitStack() as _owned_store_lifetimes:
+            active = self.active()
+            other = self.f.create(steps=(step("x"),), creation_id="interleaved-other-plan")
+            self.f.service.execute(self.f.command("revise_plan", {"draft": self.f.service.read_plan(other.current_metadata.plan_id).draft, "reason": "Other event",
+                                      "authorization_change": None, "retire_steps": ()}, receipt=other))
+            receipt = self.execute(self.command(active, checkpoint(affected=("b",))))
+            reopened = _owned_store_lifetimes.enter_context(make_service(self.f.directory, self.f.clock))
+            event = next(e for e in reopened.service.read_events(self.plan_id) if e.kind == "record_checkpoint")
+            row = reopened.store.read(lambda db: db.execute("SELECT sequence,attempt_id FROM checkpoints WHERE plan_id=?",
+                                                           (self.plan_id,)).fetchone())
+            self.assertEqual(receipt.committed["checkpoint_id"], str(event.sequence))
+            self.assertEqual(row, (event.sequence, active.committed["attempt_id"]))
+            self.assertEqual(event.payload["attempt_id"], active.committed["attempt_id"])
+            self.assertEqual(event.payload["step_id"], "a")
+            self.assertEqual(event.payload["definition_version"], "v1")
+            self.assertEqual(event.payload["checkpoint_id"], str(event.sequence))
+            self.assertEqual({h.source_id for h in reopened.service.read_plan(self.plan_id).coordination.holds}, {str(event.sequence)})
 
     def test_closure_is_transitive_consumers_in_current_graph_order(self):
         module = self.checkpoint_module()

@@ -82,6 +82,29 @@ Build-system requirements use the pinned Hatchling backend; their transitive
 build dependencies are not hash-constrained by the service lockfile. These pins
 do not promise byte-identical image rebuilds.
 
+The base's Debian `libsqlite3-0` 3.40.1-2+deb12u2 lacks the upstream WAL-reset fix.
+A separate builder uses the **same pinned Python base**, downloads the upstream
+[SQLite3.53.4 amalgamation](https://www.sqlite.org/2026/sqlite-autoconf-3530400.tar.gz),
+and checks SHA3-256
+`454e45f61c6bd75b7420e7190732dea03ce6639c63ada47bbc592f67fc340338`
+and SHA256
+`0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c`
+before extraction. GCC builds the shared library with `-O2 -fPIC -shared`,
+SONAME `libsqlite3.so.0`, `SQLITE_THREADSAFE=1`, and pthread/dl/math linkage;
+no SQLite features are omitted. Only that library enters `/usr/local/lib` in
+the final image; compiler, source and build packages stay in the builder.
+`ldconfig` selects it for ordinary Python `sqlite3`, with no Python package or
+lockfile substitution. The build asserts actual Python3.13.16, SQLite3.53.4,
+serialized thread safety, source ID
+`2026-07-24 19:02:57 bf7c7f30031888f4e796e429ab3978879485813aaca6f641c7b33e4e09459bcc`,
+and WAL/FK/JSON/backup functionality. Record actual loaded runtime/library and
+compile options for each target architecture; source/build flags alone do not
+establish runtime qualification. The installation maintainer owns future SQLite
+security/fix pin updates and requalification. SQLite's
+[compile guide](https://www.sqlite.org/howtocompile.html) and
+[compile options](https://www.sqlite.org/compile.html) describe the amalgamation
+and feature choices.
+
 Verify each deployment platform separately. For `linux/arm64` and `linux/amd64`,
 record the built image ID, digest when available, and platform; the running
 container's `uname` and Python version; UID, mount, host port, and restart policy;
@@ -94,6 +117,162 @@ an unavailable platform as a verification gap.
 Docker's documentation describes [named-volume persistence and copy behavior](https://docs.docker.com/engine/storage/volumes/),
 [loopback port publication](https://docs.docker.com/engine/network/port-publishing/),
 and the [`unless-stopped` restart policy](https://docs.docker.com/reference/compose-file/services/#restart).
+
+## Local maintenance and schema upgrades
+
+The authority schema is version2. Startup refuses older/newer schemas, marked
+backups, corrupt or empty existing files, symlinks, and pending maintenance before
+opening SQLite on the original image or changing its permissions. Inspecting an
+existing image costs O(database size) temporary disk space and I/O: a private
+`0700` OS temporary directory outside the installation holds a disposable `0600`
+copy of the database and any WAL/rollback journal. Only that copy undergoes
+SQLite recovery and validation, and it is explicitly removed on exit.
+
+Every usable `Store` owns a shared lifetime lock on its installation directory.
+Operations hold independent shared `flock` gate descriptors, including committed
+listener callbacks. Cold migration, restore and recovery require exclusive
+ownership; a closed-but-not-disposed app, sibling Store, or another process can
+block them. Use `with Store(...) as store:` or call `store.close()` explicitly.
+Close is idempotent, drains operations/callbacks, and rejects further use. An app
+created with `build_app` closes its Store on lifespan exit; call
+`app.state.close()` when disposing an app whose lifespan never started. A Store
+inherited across `fork` is fenced; construct a fresh one in the child.
+
+These guarantees require cooperative local processes and a filesystem supporting
+POSIX `flock`, SQLite locking, private regular files, hard links, same-filesystem
+rename and directory fsync. Unsupported locking refuses. They do not coordinate
+arbitrary SQL writers, directory replacement, network filesystems or external
+workers. Lock/SQLite contention is bounded (two seconds), and online backup has
+a ten-second progress deadline. Blocking kernel filesystem calls or callbacks
+that never return remain outside those cooperative deadlines. Qualify the actual
+Python/SQLite runtime before WAL concurrency; use a SQLite release containing the
+[documented WAL-reset fix](https://www.sqlite.org/wal.html#wal_reset_bug), including
+3.51.3 or newer, or the 3.50.7 backport.
+
+The explicit local command is `python -m adaptive_planning.admin`. In a checkout,
+use its frozen runner. Choose new destinations in private existing directories:
+
+```sh
+uv run --frozen python -B -m adaptive_planning.admin backup --data-dir /private/planning --destination /private/backups/snapshot.sqlite
+uv run --frozen python -B -m adaptive_planning.admin export --data-dir /private/planning --destination /private/backups/public.json
+```
+
+Backup uses SQLite's coherent backup API; its epoch, event sequence and opaque
+cutoff come from the completed image. It is a private marked backup, never a
+serving authority. Export reads one snapshot and writes an explicit public JSON
+projection. It excludes credentials, capabilities, private request/grant receipts,
+and imported/restored private origins; unknown event kinds retain only their
+public envelopes. Neither command overwrites a destination or an authority,
+credential, gate or maintenance-manifest alias. A published valid file remains
+available if directory fsync reports `durability_uncertain`; inspect that exact
+destination rather than retrying over it.
+
+Stop serving and dispose **all** Store owners before cold operations:
+
+```sh
+uv run --frozen python -B -m adaptive_planning.admin migrate --data-dir /private/planning --backup-directory /private/backups
+uv run --frozen python -B -m adaptive_planning.admin restore --data-dir /private/planning --source /private/backups/snapshot.sqlite --preserve-current /private/backups/before-restore.sqlite
+```
+
+Migration supports genuine1→2 images, retaining a marked pre-migration backup
+before transforming a private stage. It preserves epochs, generations, native
+grants, private receipts, import maps, event high-water sequence, rowids and every
+physical use history. Unprovable legacy orphan parent/member identity refuses
+with the original untouched and pre-backup retained. A valid current2 migration
+is a no-op that creates no backup or manifest. The local
+`migrate_database(store, backup_directory)` wrapper consumes/closes its supplied
+Store even if a sibling owner subsequently blocks migration.
+
+Restore requires an admitted existing schema2 authority and a closed marked
+same-host backup (schema1 may upgrade inside the stage). A quiesced source can
+include committed WAL or a rollback journal: restore materializes the same
+admitted private clone through bounded SQLite backup into a closed standalone
+stage and retains the source's exact existing cutoff. The original main file,
+sidecars, permissions and directory entries remain untouched. Restore lineage
+binds every original file before clone recovery; SHM is recorded as cache
+evidence and SQLite rebuilds it privately. A standalone source keeps its raw
+main-file SHA-256. For a source with sidecars, the digest is SHA-256 of the bytes
+`adaptive-planning-source-file-set-v1` followed by one NUL byte and UTF-8 JSON of
+the ordered existing suffixes `""`, `"-journal"`, `"-shm"`, `"-wal"`. Each JSON
+entry has `suffix`, `bytes` and `sha256`; keys are sorted and separators are
+`,` and `:` without spaces. The private origin records this `file-set-v1`
+binding and seals it with the restore event. It retains
+`preserve_current` solely as private reconciliation evidence; it does not recover
+post-backup registry entries or reconstruct absent workers. Restore rotates the
+installation epoch and every plan generation and revokes retained capabilities.
+It preserves native/imported constructor history and records exact private
+restore lineage. Nonterminal ownership becomes stale/unresolved, including an
+explicit transition and source-owned hold for already-stale native attempts.
+Accepted history remains terminal. Old worker commands/replays are fenced.
+
+Publication records the exact operation, original/preserved/staged image
+identities and prepared/normalized/published phases in the private durable
+`.planning-maintenance.json`. SQLite checkpoint/journal normalization precedes
+closed-stage replacement; main-file rename and WAL changes are not one atomic
+file-set transaction. Any pending manifest prevents normal startup. Preserve it
+and its recorded files after interruption. Read its `operation_id` privately and
+choose one explicit recovery decision:
+
+```sh
+uv run --frozen python -B -m adaptive_planning.admin recover --data-dir /private/planning --operation-id EXACT_RECORDED_ID --decision finish
+uv run --frozen python -B -m adaptive_planning.admin recover --data-dir /private/planning --operation-id EXACT_RECORDED_ID --decision rollback
+```
+
+Recovery validates only that manifest and its exact images/adjacent crash phase;
+it never guesses a newest backup. Rollback restores the recorded preserved epoch
+and history while pending maintenance has blocked serving. An interrupted
+rollback decision remains bound to its recorded stage and can resume. If current
+authority is corrupt or contradicts the manifest, automatic restore/recovery
+refuses. Keep the service offline, preserve a forensic copy of the entire private
+directory (database, sidecars, credential, manifest and recorded images), and
+have the installation owner explicitly select a verified image and manual offline
+reconstruction procedure. Do not delete sidecars or initialize over the evidence.
+
+## Restored inventory and ownership reconciliation
+
+A current owner first rereads service epoch and plan generation, then takes over
+using fresh request identity and exact current ownership/CAS assertions. An
+inspection plan can be bootstrapped while held. Old-epoch creation retries fail;
+an explicit new-epoch creation using an old creation ID creates a separate plan.
+Resume existing plans by their plan ID and current generation.
+
+The typed MCP `resolve_store_hold` command takes the exact restored
+`backup_cutoff`, explicit `inventory_complete`, `absent_work_inventory`,
+`resource_resolutions` and an observation `reason`. This is an administrator's
+assertion about local absent work, not process discovery. Every `HostWork`
+supplies its real `work_id`, actor, running/unknown/stopped state, canonical IDs
+and/or complete host-attested claims, plus observation evidence. One work can
+contain repository, workspace and external members. Declarations retain their
+producer, previous members and actual physical history; completeness never
+implies stopped. Resource-less/unknown identity keeps an exact source-owned
+reason. Only the same work ID/actor with full claims and evidence can attach its
+identity. Omitting a retained obligation rejects complete inventory.
+
+Complete known inventory clears only the current restore reason and positively
+covered ancestor inventory reasons. The shared store hold remains true for a
+flag or any independent unresolved reason, including older imported identities.
+Imported unknown context must attach through its genuine source before terminal
+recovery; that resolves only its exact historical reason. Restored native/imported
+logical release, reject, replace or retirement uses positive retained lineage
+and clears only exact source-owned stale holds. It does not infer physical stops.
+
+Known absent work stays physically unresolved after inventory clears, so an
+overlapping assignment still conflicts. `ResourceResolution` selects exactly
+one actual use/work; empty IDs select its full remaining orphan cohort, while
+nonempty IDs select a distinct canonical subset. `stopped` is an explicit
+assertion; `unresolved` keeps the obligation, and `isolated` is unsupported.
+Existing `release_resource_use` accepts a retained real orphan member/anchor
+only with the **full** remaining cohort and explicit stopped assertion. Subset
+stops retain the stable original anchor and unselected conflicts. Inventory
+cannot release another plan's ordinary uses. Global sequence changes invalidate
+foreign coordination cursors without manufacturing foreign plan revisions.
+
+`tests/service_admin_linux_exercise.py` provides `exercise` and
+`verify-restart` phases for a coordinator-owned synthetic named volume. Run them
+in different nonroot10001 Linux containers with network disabled and the tests
+mounted read-only. Their concise JSON records actual runtime and domain checks;
+the synthetic private state file stays `0600` in `/data`. This exercise does not
+activate installed clients or accept/deploy an existing installation.
 
 ## Three-client planning gate
 
