@@ -774,7 +774,12 @@ def cancel_attempt(connection: sqlite3.Connection, plan_id: PlanId, attempt_id: 
                 and len(secret_hash) == 64):
             capability_ids.append(cid)
     if not capability_ids:
-        raise DomainError("invalid", "The claimed attempt has no bound worker capability")
+        from adaptive_planning import recovery
+        if recovery.is_imported_attempt(connection, plan_id, attempt_id):
+            if data.get("context") is None:
+                raise DomainError("held", "Imported attempts with unknown context cannot be cancelled until context is attached")
+        else:
+            raise DomainError("invalid", "The claimed attempt has no bound worker capability")
     data.update(cancellation_reason=reason.strip(), cancelled_from=row[3], cancelled_at=plans._timestamp())
     connection.execute("UPDATE attempts SET state='released',version=version+1,payload=? WHERE plan_id=? AND attempt_id=?",
                        (json.dumps(data, sort_keys=True, ensure_ascii=False), plan_id, attempt_id))

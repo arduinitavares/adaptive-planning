@@ -42,7 +42,7 @@ from tests.test_service_http import CapturedLogs, SYNTHETIC_TOKEN
 
 PLANNING_FACTS = ("Creator SDK planning fact", "Second SDK planning fact", "Third SDK planning fact")
 PLANNING_TOOLS = {"read_service_info", "list_plans", "read_plan", "read_events", "list_ready",
-                  "read_coordination", "create_plan", "revise_plan", "takeover"}
+                  "read_coordination", "create_plan", "import_plan", "revise_plan", "takeover"}
 WORKER_TOOLS = PLANNING_TOOLS | {
     "register_resource", "reconcile_resources", "assign_step", "bind_availability",
     "start_step", "report_activity", "record_checkpoint", "resolve_reassessment",
@@ -51,7 +51,7 @@ WORKER_TOOLS = PLANNING_TOOLS | {
     "sweep_stale", "resolve_attempt", "append_late_evidence",
 }
 DISABLED_FUTURE_TOOLS = {
-    "import_plan", "resolve_store_hold",
+    "resolve_store_hold",
 }
 WORKER_ORIGINS = ("codex-worker", "agy-worker", "copilot-worker")
 SDK_PROTOCOLS = {"auto": "2026-07-28", "legacy": "2025-11-25"}

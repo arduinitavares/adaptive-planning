@@ -592,7 +592,7 @@ class TestService(unittest.TestCase):
             server = build_mcp(self.f.service)
             names = {tool.name for tool in await server.list_tools()}
             self.assertTrue({"sweep_stale", "resolve_attempt", "append_late_evidence"} <= names)
-            self.assertFalse({"recovery_warnings", "read_recovery_warnings", "import_plan", "resolve_store_hold"} & names)
+            self.assertFalse({"recovery_warnings", "read_recovery_warnings", "resolve_store_hold"} & names)
             sweep = self.command("sweep_stale", {})
             result = await server.call_tool("sweep_stale", {"command": plans.to_jsonable(sweep)})
             self.assertFalse(result.is_error)

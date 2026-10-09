@@ -10,7 +10,17 @@ import uuid
 
 from adaptive_planning import attempts, checkpoints, plans, resources
 from adaptive_planning.ownership import current_ownership, current_private
-from adaptive_planning.types import AttemptId, Command, DomainError, MutationReceipt, PlanId, RetirementRequest, _to_execution_context
+from adaptive_planning.types import (
+    AttemptId,
+    Command,
+    DomainError,
+    ExecutionContext,
+    MutationReceipt,
+    PlanId,
+    RetirementRequest,
+    StepId,
+    _to_execution_context,
+)
 
 
 def _policy(now: datetime, threshold_seconds: int) -> None:
@@ -174,14 +184,249 @@ def swept_target(connection, plan, command):
     return row, data, step, marker
 
 
+def is_imported_attempt(connection: sqlite3.Connection, plan_id: PlanId, attempt_id: AttemptId) -> bool:
+    row = connection.execute(
+        "SELECT step_id, assignee, state, version, definition_version, payload FROM attempts WHERE plan_id=? AND attempt_id=?",
+        (plan_id, attempt_id),
+    ).fetchone()
+    if row is None:
+        return False
+    step_id, assignee, state, version, def_ver, raw = row
+    if not assignee.startswith(f"legacy-unresolved:{step_id}"):
+        return False
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    if data.get("recovery_required") is not True:
+        return False
+    import_source = data.get("import_source")
+    if not isinstance(import_source, dict):
+        return False
+    import_id = import_source.get("import_id")
+    if not import_id:
+        return False
+    imp_count = connection.execute(
+        "SELECT count(*) FROM imports WHERE import_id=? AND plan_id=?", (import_id, plan_id)
+    ).fetchone()[0]
+    if imp_count != 1:
+        return False
+    cap_count = connection.execute(
+        "SELECT count(*) FROM capabilities WHERE plan_id=? AND json_extract(payload, '$.attempt_id')=?",
+        (plan_id, attempt_id),
+    ).fetchone()[0]
+    if cap_count != 0:
+        return False
+    return True
+
+
+def create_unresolved_attempt(
+    connection: sqlite3.Connection,
+    plan_id: PlanId,
+    step_id: StepId,
+    context: ExecutionContext | None,
+    *,
+    source: str,
+) -> AttemptId:
+    plan = plans._load_plan(connection, plan_id)
+    step = next((s for s in plan.steps if s.step_id == step_id), None)
+    if step is None:
+        raise DomainError("not_found", f"Step {step_id!r} not found in plan {plan_id!r}")
+    epoch = plans._installation_epoch(connection)
+    attempt_id = str(uuid.uuid4())
+    ts = plans._timestamp(plan.updated_at)
+    assignee = f"legacy-unresolved:{step_id}"
+
+    import_id = source.split(":", 1)[1] if source.startswith("import:") else source
+    payload = {
+        "epoch": epoch,
+        "generation": plan.generation,
+        "definition": step.definition,
+        "context": plans.to_jsonable(context) if context is not None else None,
+        "started_at": None,
+        "last_activity": None,
+        "recovery_required": True,
+        "prior_state": "active",
+        "import_source": {
+            "source": source,
+            "import_id": import_id,
+            "step_id": step_id,
+        },
+    }
+
+    connection.execute(
+        "INSERT INTO attempts(plan_id, attempt_id, step_id, assignee, state, version, definition_version, started_at, stopped_at, payload) "
+        "VALUES(?, ?, ?, ?, 'stale', 1, ?, NULL, NULL, ?)",
+        (plan_id, attempt_id, step_id, assignee, step.definition["definition_version"],
+         json.dumps(payload, sort_keys=True, ensure_ascii=False)),
+    )
+
+    if context is not None:
+        if context.writes:
+            resource_ids = resources.resolve_context(connection, context)
+            conflicts = resources.conflicting_uses(connection, resource_ids, context.repository_exclusive)
+            if conflicts:
+                raise DomainError("resource_conflict", "Writable execution overlaps another unresolved resource use")
+            members = []
+            for resource_id in resource_ids:
+                scope = connection.execute("SELECT kind FROM resources WHERE resource_id=?", (resource_id,)).fetchone()[0]
+                use_id = str(uuid.uuid4())
+                connection.execute(
+                    "INSERT INTO resource_uses(use_id, resource_id, plan_id, attempt_id, scope, status, created_at) "
+                    "VALUES(?, ?, ?, ?, ?, 'unresolved', ?)",
+                    (use_id, resource_id, plan_id, attempt_id, scope, ts),
+                )
+                members.append({"use_id": use_id, "resource_id": resource_id, "scope": scope, "created_at": ts})
+            source_dict = {
+                "plan_id": plan_id,
+                "attempt_id": attempt_id,
+                "step_id": step_id,
+                "assignee": assignee,
+                "definition_version": step.definition["definition_version"],
+                "definition": step.definition,
+                "origin_epoch": epoch,
+                "origin_generation": plan.generation,
+            }
+            namespace = {
+                "v": 1,
+                "source": source_dict,
+                "implementation": {"members": members, "writer": None},
+                "groups": {},
+            }
+            payload[resources._USE_NAMESPACE] = namespace
+            connection.execute(
+                "UPDATE attempts SET payload = ? WHERE plan_id = ? AND attempt_id = ?",
+                (json.dumps(payload, sort_keys=True, ensure_ascii=False), plan_id, attempt_id),
+            )
+    else:
+        hold_id = str(uuid.uuid4())
+        details = json.dumps({"plan_id": plan_id, "attempt_id": attempt_id, "step_id": step_id, "source": source}, sort_keys=True)
+        connection.execute(
+            "INSERT INTO store_hold_reasons(reason_id, epoch, kind, details, resolved, created_at) VALUES (?, ?, 'identity', ?, 0, ?)",
+            (hold_id, epoch, details, ts),
+        )
+        hold_reason = {
+            "kind": "identity",
+            "step_id": step_id,
+            "source_id": f"{source}:{attempt_id}",
+            "hold_id": hold_id,
+            "reason": "Missing required execution identity requires explicit attachment",
+        }
+        connection.execute(
+            "INSERT INTO holds(hold_id, plan_id, reason, active, created_at) VALUES (?, ?, ?, 1, ?)",
+            (hold_id, plan_id, json.dumps(hold_reason, sort_keys=True), ts),
+        )
+        payload["identity_hold_id"] = hold_id
+        connection.execute(
+            "UPDATE attempts SET payload = ? WHERE plan_id = ? AND attempt_id = ?",
+            (json.dumps(payload, sort_keys=True, ensure_ascii=False), plan_id, attempt_id),
+        )
+
+    return attempt_id
+
+
+def _attach_context(connection: sqlite3.Connection, plan, command: Command) -> MutationReceipt:
+    from adaptive_planning.imports import resolve_context_claims
+    payload = command.payload
+    if (payload["replacement_assignee"] is not None or payload["replacement_context"] is not None
+            or payload["attached_context"] is None):
+        raise DomainError("invalid", "Context attachment requires attached_context without replacement fields")
+    row, data = _target(connection, plan, command)
+    if not is_imported_attempt(connection, plan.plan_id, command.attempt_id):
+        raise DomainError("unsupported", "Tokenless and restored origins require their producer recovery contract")
+    if row[3] != "stale":
+        raise DomainError("stale", "Recovery requires ownership recorded stale")
+    if data.get("context") is not None:
+        raise DomainError("invalid", "Context is already attached to this attempt")
+
+    execution = resolve_context_claims(connection, payload["attached_context"])
+    now = plans._now()
+    ts = plans._timestamp(plan.updated_at)
+    epoch = plans._installation_epoch(connection)
+    members = []
+    if execution.writes:
+        resource_ids = resources.resolve_context(connection, execution)
+        conflicts = resources.conflicting_uses(connection, resource_ids, execution.repository_exclusive)
+        if conflicts:
+            raise DomainError("resource_conflict", "Writable execution overlaps another unresolved resource use")
+        for resource_id in resource_ids:
+            scope = connection.execute("SELECT kind FROM resources WHERE resource_id=?", (resource_id,)).fetchone()[0]
+            use_id = str(uuid.uuid4())
+            connection.execute(
+                "INSERT INTO resource_uses(use_id, resource_id, plan_id, attempt_id, scope, status, created_at) "
+                "VALUES(?, ?, ?, ?, ?, 'unresolved', ?)",
+                (use_id, resource_id, plan.plan_id, row[0], scope, ts),
+            )
+            members.append({"use_id": use_id, "resource_id": resource_id, "scope": scope, "created_at": ts})
+        source_dict = {
+            "plan_id": plan.plan_id,
+            "attempt_id": row[0],
+            "step_id": row[1],
+            "assignee": row[2],
+            "definition_version": row[5],
+            "definition": data["definition"],
+            "origin_epoch": epoch,
+            "origin_generation": plan.generation,
+        }
+        namespace = {
+            "v": 1,
+            "source": source_dict,
+            "implementation": {"members": members, "writer": None},
+            "groups": {},
+        }
+        data[resources._USE_NAMESPACE] = namespace
+
+    version = row[4] + 1
+    data["context"] = plans.to_jsonable(execution)
+    connection.execute(
+        "UPDATE attempts SET version=?, payload=? WHERE plan_id=? AND attempt_id=?",
+        (version, json.dumps(data, sort_keys=True, ensure_ascii=False), plan.plan_id, row[0]),
+    )
+
+    hold_id = data.get("identity_hold_id")
+    if hold_id:
+        connection.execute(
+            "UPDATE store_hold_reasons SET resolved = 1 WHERE epoch = ? AND reason_id = ?",
+            (epoch, hold_id),
+        )
+        checkpoints._clear_holds(connection, [hold_id])
+
+    previous = plans.project_plan(connection, plan.plan_id)
+    revision = plan.revision + 1
+    committed = {
+        "attempt_id": row[0],
+        "step_id": row[1],
+        "version": version,
+        "definition_version": row[5],
+        "resolution": "attach-context",
+    }
+    event = {
+        **committed,
+        "before_version": row[4],
+        "reason": payload["reason"],
+        "attached_context": plans.to_jsonable(execution),
+        "context": plans.to_jsonable(execution),
+        "next_step_state": payload["next_step_state"],
+    }
+    checkpoints._event_limits(event)
+    plans._insert_event(connection, plan.plan_id, revision, command.kind, command.actor, ts, event)
+    connection.execute("UPDATE plans SET revision=?, updated_at=? WHERE plan_id=?", (revision, ts, plan.plan_id))
+    view = plans._commit_projection(connection, plan.plan_id, previous)
+    return MutationReceipt(committed, view.metadata, view.metadata, False, None)
+
+
 def resolve_attempt(connection: sqlite3.Connection, command: Command) -> MutationReceipt:
     plan = checkpoints._owner_target(connection, command, "resolve_attempt")
     payload = command.payload
     checkpoints._text(payload["reason"], "Recovery ownership observation")
     if payload["resolution"] == "attach-context":
-        raise DomainError("unsupported", "Tokenless and restored origins require their producer recovery contract")
+        return _attach_context(connection, plan, command)
     if payload["resolution"] != "confirm-owner":
         return _resolve_logical(connection, plan, command)
+    if is_imported_attempt(connection, plan.plan_id, command.attempt_id):
+        raise DomainError("forbidden", "Imported attempts cannot be confirmed native")
     if (payload["next_step_state"] != "pending" or payload["stopped_resource_ids"]
             or payload["replacement_assignee"] is not None or payload["replacement_context"] is not None
             or payload["attached_context"] is not None):
@@ -246,7 +491,19 @@ def _resolve_logical(connection, plan, command):
         raise DomainError("invalid", "Only replacement may declare a new assignee and context")
     if resolution == "reject" and payload["next_step_state"] != "blocked":
         raise DomainError("invalid", "Rejection leaves its logical step blocked")
-    row, data, step, marker = swept_target(connection, plan, command)
+    imported = is_imported_attempt(connection, plan.plan_id, command.attempt_id)
+    if imported:
+        row, data = _target(connection, plan, command)
+        if row[3] != "stale":
+            raise DomainError("stale", "Recovery requires ownership recorded stale")
+        if data.get("context") is None:
+            raise DomainError("held", "Unknown context imported attempt must be attached before resolution")
+        step = next((node for node in plan.steps if node.step_id == row[1]), None)
+        if step is None:
+            raise DomainError("not_found", "The step does not exist in this plan")
+        marker = data.get("import_source", {})
+    else:
+        row, data, step, marker = swept_target(connection, plan, command)
     release_targets = _original_stops(connection, plan, row, payload["stopped_resource_ids"])
     for use_id, rid in release_targets:
         reviews.release_resource_use(connection, _internal_command(connection, command, "release_resource_use", {
@@ -266,7 +523,8 @@ def _resolve_logical(connection, plan, command):
         connection.execute("UPDATE steps SET state=? WHERE plan_id=? AND step_id=?",
                            (payload["next_step_state"], plan.plan_id, step.step_id))
         previous = plans._commit_projection(connection, plan.plan_id, previous)
-    checkpoints._clear_holds(connection, [marker["hold_id"]])
+    if marker and "hold_id" in marker:
+        checkpoints._clear_holds(connection, [marker["hold_id"]])
     previous = plans._commit_projection(connection, plan.plan_id, previous)
     assignment, assignment_event = None, None
     if resolution == "replace":

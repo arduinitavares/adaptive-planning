@@ -28,7 +28,7 @@ _ARGUMENTS = {
     "read_service_info": frozenset(), "list_plans": frozenset({"include_terminal"}),
     "read_plan": frozenset({"plan_id"}), "read_events": frozenset({"plan_id", "after", "limit"}),
     "list_ready": frozenset({"plan_id"}), "read_coordination": frozenset({"plan_id", "after", "limit"}),
-    "create_plan": frozenset({"command"}), "revise_plan": frozenset({"command"}), "takeover": frozenset({"command"}),
+    "create_plan": frozenset({"command"}), "import_plan": frozenset({"command"}), "revise_plan": frozenset({"command"}), "takeover": frozenset({"command"}),
     "register_resource": frozenset({"command"}), "reconcile_resources": frozenset({"command"}),
     "assign_step": frozenset({"command"}),
     "bind_availability": frozenset({"command"}), "start_step": frozenset({"command"}),
@@ -203,6 +203,17 @@ class _ResourceClaimInput(_InputModel):
     case_insensitive: bool
     repository_id: str | None
     external_identity: str | None = Field(repr=False)
+
+
+class _ImportPayload(_InputModel):
+    host_id: str
+    source_directory_id: str | None = None
+    source_directory_claim: _ResourceClaimInput | None = None
+    original_task_id: str
+    original_snapshot: dict[str, Any]
+    provenance: dict[str, Any] | None = None
+    writers_stopped: str
+    known_contexts: dict[str, Any] = Field(default_factory=dict)
 
 
 class _RegisterResourcePayload(_InputModel):
@@ -401,6 +412,11 @@ class CreatePlanInput(_Envelope):
     payload: _CreatePayload
 
 
+class ImportPlanInput(_Envelope):
+    kind: Literal["import_plan"]
+    payload: _ImportPayload
+
+
 class RevisePlanInput(_Envelope):
     kind: Literal["revise_plan"]
     payload: _RevisePayload
@@ -501,14 +517,14 @@ class AppendLateEvidenceInput(_Envelope):
     payload: _AppendLateEvidencePayload
 
 
-CommandInput = Annotated[CreatePlanInput | RevisePlanInput | TakeoverInput | RegisterResourceInput | ReconcileResourcesInput | AssignStepInput
+CommandInput = Annotated[CreatePlanInput | ImportPlanInput | RevisePlanInput | TakeoverInput | RegisterResourceInput | ReconcileResourcesInput | AssignStepInput
                          | BindAvailabilityInput | StartStepInput | ReportActivityInput | RecordCheckpointInput
                          | ResolveReassessmentInput | InvalidateResultInput | ResolveInvalidationInput
                          | RecordReviewInput | AcceptStepInput | ReserveVerificationInput | ReleaseResourceUseInput | ReopenAttemptInput
                          | SweepStaleInput | ResolveAttemptInput | AppendLateEvidenceInput,
                          Field(discriminator="kind")]
 _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_fields,
-                           *_CreatePayload.model_fields, *_RevisePayload.model_fields, *_TakeoverPayload.model_fields,
+                           *_CreatePayload.model_fields, *_ImportPayload.model_fields, *_RevisePayload.model_fields, *_TakeoverPayload.model_fields,
                            *_ResourceClaimInput.model_fields, *_RegisterResourcePayload.model_fields,
                            *_ReconcileResourcesPayload.model_fields,
                            *_ExecutionContextInput.model_fields, *_AssignStepPayload.model_fields,
@@ -643,6 +659,11 @@ def build_mcp(service: PlanningService) -> MCPServer:
     def create_plan(command: CommandInput) -> dict[str, Any]:
         """Create an authorized plan and return its private bootstrap receipt."""
         return execute("create_plan", command)
+
+    @server.tool(annotations=write)
+    def import_plan(command: CommandInput) -> dict[str, Any]:
+        """Import an authorized legacy plan with explicit publisher authority handoff."""
+        return execute("import_plan", command)
 
     @server.tool(annotations=write)
     def revise_plan(command: CommandInput) -> dict[str, Any]:
