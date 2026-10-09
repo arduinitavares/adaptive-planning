@@ -374,27 +374,57 @@ def has_restored_origin(connection, plan_id, attempt_id):
 
 
 def restore_origin(connection,restore_id):
-    """Bind normalized source metadata to the one retained public restore producer."""
+    """Positively bind the sealed origin and its complete, bounded ancestry."""
     try:
-        row=connection.execute('SELECT prior_epoch,new_epoch,host_id,source_digest,source_cutoff,payload FROM restore_origins WHERE restore_id=?',(restore_id,)).fetchone()
-        if row is None:
-            raise DomainError('invalid','Restore origin is absent')
-        origin=attempts._object(row[5],'restore origin')
-        source=origin['source_metadata']
-        if (origin['format']!=1 or origin['restore_id']!=restore_id or source['epoch']!=row[0] or source['host_id']!=row[2] or source['restore_cutoff']!=row[4] or origin['source_digest']!=row[3]
-                or not re.fullmatch('[0-9a-f]{64}',row[3])):
-            raise DomainError('invalid','Restore origin metadata is contradictory')
-        expected=dict(restore_id=restore_id,epoch=row[1],backup_cutoff=row[4],origin_digest=hashlib.sha256(json.dumps(origin,sort_keys=True).encode()).hexdigest())
-        matches=[]
-        for actor,raw in connection.execute("SELECT actor,payload FROM events WHERE plan_id IS NULL AND plan_revision IS NULL AND kind='database_restored'"):
-            event=attempts._object(raw,'restore producer')
-            if event.get('restore_id')==restore_id:
-                matches.append((actor,event))
-        if matches!=[('local-administrator',expected)]:
-            raise DomainError('invalid','Restore origin contradicts its immutable producer')
-        return origin
+        producers=[(actor,attempts._object(raw,'restore producer')) for actor,raw in connection.execute("SELECT actor,payload FROM events WHERE plan_id IS NULL AND plan_revision IS NULL AND kind='database_restored'")]
+        head=None;visited=set();expected_link=None
+        while True:
+            if restore_id in visited or len(visited)>128:
+                raise DomainError('invalid','Restore ancestry is cyclic or exceeds 128 ancestors')
+            visited.add(restore_id)
+            row=connection.execute('SELECT prior_epoch,new_epoch,host_id,source_digest,source_cutoff,payload FROM restore_origins WHERE restore_id=?',(restore_id,)).fetchone()
+            if row is None:
+                raise DomainError('invalid','Restore origin is absent')
+            origin=attempts._object(row[5],'restore origin')
+            source=origin['source_metadata'];lineage=origin['lineage_restore_ids']
+            if (origin['format']!=1 or origin['restore_id']!=restore_id or source['epoch']!=row[0] or source['host_id']!=row[2] or source['restore_cutoff']!=row[4] or origin['source_digest']!=row[3]
+                    or not all(isinstance(value,str) and value.strip() for value in row[:3]) or row[0]==row[1]
+                    or not isinstance(row[4],str) or not row[4].strip() or not re.fullmatch('[0-9a-f]{64}',row[3])):
+                raise DomainError('invalid','Restore origin metadata is contradictory')
+            if (not isinstance(lineage,list) or len(lineage)>128 or
+                    not all(isinstance(identity,str) and identity.strip() for identity in lineage) or
+                    len(set(lineage))!=len(lineage) or restore_id in lineage or
+                    origin['inherited_inventory']!=['restore-inventory:'+identity for identity in lineage]):
+                raise DomainError('invalid','Restore ancestry is malformed or cyclic')
+            if expected_link is not None and (row[1],row[2],lineage)!=expected_link:
+                raise DomainError('invalid','Restore ancestry contradicts its epoch, host or lineage link')
+            expected=dict(restore_id=restore_id,epoch=row[1],backup_cutoff=row[4],origin_digest=hashlib.sha256(json.dumps(origin,sort_keys=True).encode()).hexdigest())
+            if [(actor,event) for actor,event in producers if event.get('restore_id')==restore_id]!=[('local-administrator',expected)]:
+                raise DomainError('invalid','Restore origin contradicts its immutable producer')
+            if head is None:
+                head=origin
+            if not lineage:
+                if (connection.execute('SELECT 1 FROM restore_origins WHERE new_epoch=?',(row[0],)).fetchone() or
+                        any(event.get('epoch')==row[0] for _,event in producers)):
+                    raise DomainError('invalid','Restore ancestry omits its prior origin')
+                return head
+            expected_link=(row[0],row[2],lineage[1:]);restore_id=lineage[0]
     except (KeyError,TypeError,ValueError) as error:
         raise DomainError('invalid','Restore origin is malformed') from error
+
+
+def current_restore_origin(connection,epoch,host_id):
+    """Return the unique positively validated source origin, or a first restore."""
+    rows=connection.execute('SELECT restore_id,host_id FROM restore_origins WHERE new_epoch=?',(epoch,)).fetchall()
+    if not rows:
+        if (connection.execute('SELECT 1 FROM restore_origins').fetchone() or
+                connection.execute("SELECT 1 FROM events WHERE kind='database_restored' AND plan_id IS NULL").fetchone()):
+            raise DomainError('invalid','Current restore origin is absent')
+        return None
+    if len(rows)!=1 or rows[0][1]!=host_id:
+        raise DomainError('invalid','Current restore origin is ambiguous or belongs to another host')
+    identity=rows[0][0]
+    return identity,restore_origin(connection,identity)
 
 
 def _immutable_namespace(value):

@@ -444,12 +444,14 @@ def _restore_stage(stage: Path, source_metadata: dict, source_digest: str, sourc
     now=datetime.now(timezone.utc).isoformat()
     with closing(sqlite3.connect(stage)) as db,db:
         generations={pid:[generation,'generation-'+uuid.uuid4().hex] for pid,generation in db.execute('SELECT plan_id,generation FROM plans')}
-        previous=db.execute('SELECT restore_id,payload FROM restore_origins WHERE new_epoch=?',(source_metadata['epoch'],)).fetchone()
+        previous=recovery.current_restore_origin(db,source_metadata['epoch'],source_metadata['host_id'])
         inherited=[]
         lineage=[]
         if previous is not None:
-            prior=json.loads(previous[1])
-            lineage=[previous[0],*prior.get('lineage_restore_ids',[])]
+            prior=previous[1]
+            lineage=[previous[0],*prior['lineage_restore_ids']]
+            if len(lineage)>128:
+                raise DomainError('invalid','Restore ancestry exceeds 128 ancestors')
             inherited=['restore-inventory:'+identity for identity in lineage]
         origin=dict(format=1,restore_id=restore_id,source_metadata=source_metadata,
                     source_digest=source_digest,source_binding=source_binding,generations=generations,created_at=now,inherited_inventory=inherited,lineage_restore_ids=lineage)
@@ -519,6 +521,7 @@ def _restore_stage(stage: Path, source_metadata: dict, source_digest: str, sourc
 
 
 def restore_database(config: Config, source: Path, *, preserve_current: Path) -> dict:
+    from adaptive_planning import recovery
     from adaptive_planning.store import admitted_image,inspect_image,maintenance_ownership
     authority=config.data_dir.resolve()/'planning.sqlite'
     source=Path(source)
@@ -530,6 +533,11 @@ def restore_database(config: Config, source: Path, *, preserve_current: Path) ->
             raise DomainError('maintenance_pending','Explicit maintenance recovery is required')
         metadata=inspect_image(authority)
         with admitted_image(source,versions=(1,2),authority_kind='backup',host_id=metadata['host_id']) as (clone,source_metadata,source_digest,source_binding):
+            if source_metadata['schema_version']==2:
+                with closing(sqlite3.connect(clone)) as db:
+                    previous=recovery.current_restore_origin(db,source_metadata['epoch'],source_metadata['host_id'])
+                    if previous is not None and len(previous[1]['lineage_restore_ids'])>=128:
+                        raise DomainError('invalid','Restore ancestry exceeds 128 ancestors')
             preserve_current=_destination(authority,preserve_current)
             _cold_backup(authority,preserve_current)
             stage=_stage(authority.parent,'.planning-restore-')
@@ -562,6 +570,108 @@ def backup_database(store, destination: Path) -> dict:
         stage.unlink(missing_ok=True)
 
 
+_PUBLIC_ARTIFACT=dict(kind=str,identity=str,version=str,digest=('optional',str),summary=str)
+_PUBLIC_DOCUMENT=dict(path=str,branch=('optional',str),commit=('optional',str),version=str,task_id=('optional',str))
+_PUBLIC_DEFINITION=dict(step_id=str,title=str,dependencies=('list',str),completion_check=str,
+                        document=('optional',_PUBLIC_DOCUMENT),definition_version=str,review_required=bool,final_gate=bool)
+_PUBLIC_EVIDENCE=dict(summary=str,artifact=('optional',_PUBLIC_ARTIFACT),workspace_id=('optional',str),
+                      check=str,result=str,limitations=('list',str),blockers=('list',str))
+_PUBLIC_CONTEXT=dict(kind=str,repository_id=('optional',str),workspace_id=('optional',str),repository_exclusive=bool,
+                     external_ids=('list',str),writes=bool,checked_base=('optional',str))
+_PUBLIC_AUTHORIZATION=dict(mode=str,interval=str,since_revision=int,note=str,baseline=('list',str),claimed=('optional',str))
+_PUBLIC_DRAFT=dict(objective=str,acceptance_criteria=('list',str),constraints=('list',str),facts=('list',str),
+                   assumptions=('list',str),next_check=str,authorization=_PUBLIC_AUTHORIZATION,steps=('list',_PUBLIC_DEFINITION),
+                   documents=('list',_PUBLIC_DOCUMENT),workspace_refs=('list',str),workflow=('optional',('map',str)),
+                   horizon=int,stop_reason=('optional',str),block_reason=('optional',str))
+_PUBLIC_REASSESSMENT=dict(summary=str,facts=('list',str),assumptions=('list',str),disposition=str,reason=str,
+                          affected_steps=('list',str),unbounded=bool,proposed_draft=('optional',_PUBLIC_DRAFT))
+_PUBLIC_CHECKPOINT=dict(outcome=str,check=str,evidence=('list',_PUBLIC_EVIDENCE),reassessment=_PUBLIC_REASSESSMENT,
+                        origin_worker=str,relay=('optional',str),artifact=('optional',_PUBLIC_ARTIFACT))
+_PUBLIC_CYCLE=dict(kind=str,plan_id=str,step_id=str,attempt_id=str,definition_version=str,checkpoint_sequence=int,
+                   result_version=str,boundary=int,invalidations=('list',dict(sequence=int,invalidation_id=str,
+                   producer_step_id=str,result_version=str,affected_step_id=str,affected_definition=_PUBLIC_DEFINITION)))
+_PUBLIC_MEMBER=dict(use_id=str,resource_id=str,scope=str,created_at=str)
+_PUBLIC_TRANSITION=dict(role=str,anchor=('optional',str),use_ids=('list',str),state=str,reason=str,actor=str,
+                        epoch=str,generation=str,ownership_version=('optional',int))
+_PUBLIC_TARGET=dict(attempt_id=str,step_id=str,version=int,definition_version=str,definition=_PUBLIC_DEFINITION)
+_PUBLIC_GRAPH_CHANGE=dict(changed_definitions=('map',_PUBLIC_DEFINITION),prior_dependencies=('map',('optional',('list',str))))
+_PUBLIC_REVIEW_TARGET=dict(attempt_id=str,step_id=str,definition_version=str,definition=_PUBLIC_DEFINITION,
+                           artifact=_PUBLIC_ARTIFACT,cycle=_PUBLIC_CYCLE,result_version=str)
+_PUBLIC_EVENT_SCHEMAS={
+    'create_plan':dict(summary=str,authorization_renewed=bool,retired_steps=('list',dict(step_id=str,reason=str)),authorization_note=str,new_plan_intent=str),
+    'revise_plan':dict(summary=str,authorization_renewed=bool,retired_steps=('list',dict(step_id=str,reason=str)),authorization_note=str,**_PUBLIC_GRAPH_CHANGE),
+    'takeover':dict(summary=str,reason=str,previous_ownership_version=int,ownership_version=int),
+    'register_resource':dict(resource_id=str),
+    'reconcile_resources':dict(resource_id=str,retired_resource_ids=('list',str),identity_was_attested=bool,physical_key_was_known=bool,external_key_was_known=bool),
+    'assign_step':dict(**_PUBLIC_TARGET,assignee=str,execution_transitions=('list',_PUBLIC_TRANSITION)),
+    'bind_availability':dict(**_PUBLIC_TARGET,checked_base=str,bindings=('list',dict(prerequisite=str,result_version=str,method=str,checked_base=str,artifact_digest=('optional',str),evidence=_PUBLIC_EVIDENCE))),
+    'start_step':dict(**_PUBLIC_TARGET,observed_activity=str),
+    'report_activity':dict(**_PUBLIC_TARGET,observed_activity=str),
+    'record_checkpoint':dict(**_PUBLIC_TARGET,checkpoint=_PUBLIC_CHECKPOINT,checkpoint_id=str),
+    'recovery_checkpoint':dict(**_PUBLIC_TARGET,before_version=int,context=_PUBLIC_CONTEXT,recovery_only=bool,recovery_event_id=str,checkpoint=_PUBLIC_CHECKPOINT),
+    'resolve_reassessment':dict(checkpoint_id=str,decision=str,affected_steps=('list',str),unbounded=bool,reason=str,summary=str,residual_steps=('list',str),**_PUBLIC_GRAPH_CHANGE),
+    'reopen_attempt':dict(**_PUBLIC_TARGET,before_version=int,checkpoint_sequence=int,ended_cycle=_PUBLIC_CYCLE,reason=str,execution_transitions=('list',_PUBLIC_TRANSITION)),
+    'sweep_stale':dict(observed_at=str,threshold_seconds=int,attempts=('list',dict(**_PUBLIC_TARGET,assignee=str,prior_state=str,before_version=int,context=_PUBLIC_CONTEXT,last_activity=str,hold_id=str))),
+    'record_review':dict(**_PUBLIC_REVIEW_TARGET,review_id=str,reviewer=str,verification_use_id=('optional',str),verdict=str,findings=('list',str),evidence=('list',_PUBLIC_EVIDENCE)),
+    'accept_step':dict(**_PUBLIC_TARGET,artifact=_PUBLIC_ARTIFACT,result_version=str,checkpoint_sequence=int,review_id=str,review_sequence=int,stopped_resource_ids=('list',str),stopped_reason=('optional',str),released_use_ids=('list',str),execution_transitions=('list',_PUBLIC_TRANSITION)),
+    'invalidate_result':dict(**_PUBLIC_REVIEW_TARGET,invalidation_id=str,producer_step_id=str,reason=str,summary=str,evidence=('list',_PUBLIC_EVIDENCE),affected_steps=('list',str),affected_definitions=('map',_PUBLIC_DEFINITION)),
+    'resolve_invalidation':dict(**_PUBLIC_REVIEW_TARGET,invalidation_id=str,affected_step_id=str,disposition=str,reason=str,summary=str,evidence=('list',_PUBLIC_EVIDENCE)),
+    'resolve_attempt':dict(**_PUBLIC_TARGET,before_version=int,resolution=str,reason=str,context=_PUBLIC_CONTEXT,attached_context=_PUBLIC_CONTEXT,next_step_state=str,released_use_ids=('list',str),old_token_fenced=bool,old_attempt_id=str,old_version=int,replacement=dict(attempt_id=str,version=int,definition_version=str),assignment_event_id=str,restored_state=str,observed_at=str),
+    'append_late_evidence':dict(**_PUBLIC_TARGET,origin_worker=str,evidence=('list',_PUBLIC_EVIDENCE),reason=str,stopped_resource_ids=('list',str),releases_performed=bool),
+    'reserve_verification':dict(**_PUBLIC_REVIEW_TARGET,use_id=str,verifier=str,handoff_from=('optional',str),stopped_reason=('optional',str),verification_group=dict(anchor=str,members=('list',_PUBLIC_MEMBER),verifier=str,context=_PUBLIC_CONTEXT,artifact=_PUBLIC_ARTIFACT,cycle=_PUBLIC_CYCLE,definition=_PUBLIC_DEFINITION,source_use_ids=('list',str)),execution_transitions=('list',_PUBLIC_TRANSITION)),
+    'release_resource_use':dict(**_PUBLIC_TARGET,use_id=str,resource_ids=('list',str),stopped=bool,reason=str,use_ids=('list',str),execution_transitions=('list',_PUBLIC_TRANSITION)),
+    'import_plan':dict(writers_stopped=bool,authorization_renewed=bool,authorization_note_missing=bool),
+    'resolve_store_hold':dict(inventory_complete=bool,work_ids=('list',str),backup_cutoff=str,reason=str),
+    'schema_migrated':dict(from_schema=int,to_schema=int),
+    'database_restored':dict(epoch=str,backup_cutoff=str),
+    'restore_attempt':dict(attempt_id=str,step_id=str,from_state=str,from_version=int,to_state=str,to_version=int,hold_id=str),
+    'host_work_declared':dict(absent_work_id=str,actor=str),
+    'orphan_inventory_unresolved':dict(absent_work_id=str,resource_ids=('list',str),reason=str),
+    'orphan_inventory_stopped':dict(absent_work_id=str,resource_ids=('list',str),reason=str),
+}
+_PUBLIC_OMIT=object()
+
+
+def _public_fields(value,schema):
+    """Copy only declared public structures; malformed fields are omitted."""
+    if isinstance(schema,type):
+        return value if type(value) is schema else _PUBLIC_OMIT
+    if isinstance(schema,dict):
+        if not isinstance(value,dict):
+            return _PUBLIC_OMIT
+        result={}
+        for field,child in schema.items():
+            if field in value:
+                projected=_public_fields(value[field],child)
+                if projected is not _PUBLIC_OMIT:result[field]=projected
+        return result
+    shape,child=schema
+    if shape=='optional':
+        return None if value is None else _public_fields(value,child)
+    if shape=='list' and isinstance(value,list):
+        result=[_public_fields(item,child) for item in value]
+        return result if all(item is not _PUBLIC_OMIT for item in result) else _PUBLIC_OMIT
+    if shape=='map' and isinstance(value,dict) and all(isinstance(key,str) for key in value):
+        result={key:_public_fields(item,child) for key,item in value.items()}
+        return result if all(item is not _PUBLIC_OMIT for item in result.values()) else _PUBLIC_OMIT
+    return _PUBLIC_OMIT
+
+
+def _public_event_payload(db,event,raw):
+    schema=_PUBLIC_EVENT_SCHEMAS.get(event['kind'])
+    if schema is None:
+        return _PUBLIC_OMIT
+    value=json.loads(raw)
+    if event['kind']=='record_review' and isinstance(value,dict):
+        # Review events retain links; the immutable public findings/evidence
+        # live in the linked review row, including old submission cycles.
+        row=db.execute('SELECT findings,evidence FROM reviews WHERE review_id=? AND plan_id=? AND attempt_id=?',
+                       (value.get('review_id'),event['plan_id'],value.get('attempt_id'))).fetchone()
+        if row is not None:
+            value={**value,'findings':json.loads(row[0]),'evidence':json.loads(row[1])}
+    return _public_fields(value,schema)
+
+
 def export_database(store, destination: Path) -> None:
     """Export only public projections, excluding grants and private origins."""
     from adaptive_planning import plans
@@ -569,8 +679,12 @@ def export_database(store, destination: Path) -> None:
     def snapshot(db):
         installation = dict(zip(("epoch", "schema_version", "host_id", "store_hold", "restore_cutoff"),
                                 db.execute("SELECT epoch,schema_version,host_id,store_hold,restore_cutoff FROM installation").fetchone()))
-        events = [dict(zip(("sequence", "plan_id", "plan_revision", "kind", "actor", "published_at"), row))
-                  for row in db.execute("SELECT sequence,plan_id,plan_revision,kind,actor,published_at FROM events ORDER BY sequence")]
+        events=[]
+        for row in db.execute("SELECT sequence,plan_id,plan_revision,kind,actor,origin_worker,relay,published_at,payload FROM events ORDER BY sequence"):
+            event=dict(zip(('sequence','plan_id','plan_revision','kind','actor','origin_worker','relay','published_at'),row[:-1]))
+            public=_public_event_payload(db,event,row[-1])
+            if public is not _PUBLIC_OMIT:event['payload']=public
+            events.append(event)
         public_plans=plans.to_jsonable(plans.list_plans(db, True))
         # The ordinary renderer's legacy history accepts arbitrary summary values.
         # Export instead reconstructs its explicit public history fields, admitting
@@ -624,6 +738,8 @@ def _declare_inventory_work(db,work,restore_id,epoch,ts):
         cohort=resources.orphan_cohort(db,work.work_id)
         if cohort['actor']!=work.actor or cohort['record']['producer']!='inventory':
             raise DomainError('invalid','Repeated work contradicts its original actor or producer')
+        if work.state in ('running','unknown') and any(row[6]=='released' for row in cohort['rows']):
+            raise DomainError('invalid','Released members cannot be observed as running or unknown under the same work; declare a new work identity')
         historical={resources.resolve_resource_id(db,row[1]) for row in cohort['rows']}
         if not historical<=set(ids):
             raise DomainError('held','Repeated work cannot omit its original physical identities')
@@ -767,6 +883,11 @@ def resolve_store_hold(db,command):
             if resources.resolve_resource_id(db,row[1]) in chosen:
                 db.execute("UPDATE resource_uses SET status='released' WHERE use_id=?",(row[0],))
         plans._insert_event(db,None,None,'orphan_inventory_stopped',command.actor,ts,dict(absent_work_id=resolution.absent_work_id,resource_ids=sorted(chosen),reason=resolution.reason))
+    if not payload['inventory_complete']:
+        expected=json.dumps(dict(restore_id=restore_id,backup_cutoff=cutoff),sort_keys=True)
+        if db.execute("UPDATE store_hold_reasons SET resolved=0 WHERE reason_id=? AND epoch=? AND kind='restore-inventory' AND details=?",('restore-inventory:'+restore_id,epoch,expected)).rowcount!=1:
+            raise DomainError('invalid','Inventory reason contradicts its retained restore producer')
+        db.execute('UPDATE installation SET store_hold=1')
     if payload['inventory_complete'] and known:
         for reason in ['restore-inventory:'+restore_id,*origin['inherited_inventory']]:
             linked=reason.removeprefix('restore-inventory:')

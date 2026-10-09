@@ -35,6 +35,389 @@ def entry_set(directory):
 
 
 class TestService(unittest.TestCase):
+    def test_export_preserves_public_checkpoint_review_observation_and_old_history(self):
+        from dataclasses import replace
+        from adaptive_planning import plans
+        from adaptive_planning.types import Review
+        with make_service() as f:
+            owner=f.create(steps=(step('a',review_required=True),))
+            attempt=f.start(owner,f.assign(owner))
+            value=checkpoint()
+            value=replace(value,evidence=(replace(value.evidence[0],summary='Intentionally public secret-scanner result',limitations=('Public limitation: offline evidence',),blockers=()),),reassessment=replace(value.reassessment,summary='Public reassessment facts retained',facts=('Public observed fact',)))
+            f.submit(owner,attempt,value)
+            review=Review('public-reviewer',value.artifact,'passed',('Public finding retained verbatim',),value.evidence,None)
+            reviewed=f.service.execute(f.command('record_review',dict(step_id='a',review=review),receipt=owner))
+            accepted=f.accept(owner,attempt,value)
+            f.service.execute(f.command('invalidate_result',dict(step_id='a',result_version=accepted.committed['result_version'],reason='Public historical invalidation',evidence=value.evidence),receipt=owner))
+            before=f.store.read(lambda db:db.execute("SELECT sequence,kind,payload,origin_worker,relay FROM events WHERE plan_id=? ORDER BY sequence",(owner.current_metadata.plan_id,)).fetchall())
+            for index in range(101):
+                view=f.service.read_plan(owner.current_metadata.plan_id)
+                f.service.execute(f.command('revise_plan',dict(draft=view.draft,reason='Public subsequent revision '+str(index),authorization_change=None,retire_steps=()),receipt=owner))
+            destination=f.directory/'r2-public-history.json';admin.export_database(f.store,destination)
+            exported=json.loads(destination.read_text());events={item['sequence']:item for item in exported['events']}
+            history=exported['plans'][0]['legacy_snapshot']['history']
+            self.assertEqual(len(history),100)
+            self.assertGreater(min(item['revision'] for item in history),max(events[sequence]['plan_revision'] for sequence,_,_,_,_ in before))
+            for sequence,kind,raw,worker,relay in before:
+                with self.subTest(kind=kind):
+                    self.assertIn('payload',events[sequence])
+                    public=events[sequence]['payload'];original=json.loads(raw)
+                    self.assertEqual(events[sequence]['origin_worker'],worker);self.assertEqual(events[sequence]['relay'],relay)
+                    for field in ('summary','authorization_note','new_plan_intent','observed_activity','attempt_id','step_id','version','definition_version','definition','artifact','checkpoint','checkpoint_id','result_version','invalidation_id','reason','evidence','affected_steps','affected_definitions'):
+                        if field in original:self.assertEqual(public[field],original[field],field)
+                    if kind=='record_review':
+                        self.assertEqual(public['review_id'],reviewed.committed['review_id'])
+                        self.assertEqual(public['findings'],list(review.findings));self.assertEqual(public['evidence'],plans.to_jsonable(review.evidence))
+            self.assertIn('Intentionally public secret-scanner result',destination.read_text())
+
+    def test_export_preserves_known_global_lifecycle_fields_excluding_private_producers(self):
+        from adaptive_planning.types import HostWork,ResourceResolution
+        with TemporaryDirectory() as name:
+            directory=Path(name);f,owner=self.restored_empty(directory)
+            claim=workspace('/synthetic/r2-export-orphan',2201);rid=f.register(claim,owner)
+            work=HostWork('r2-public-orphan','public-worker','running',(rid,),(),checkpoint().evidence)
+            self.inventory(f,owner,(work,))
+            self.inventory(f,owner,(),(ResourceResolution(None,work.work_id,(),'stopped','Public orphan stopped reason'),))
+            expected=f.store.read(lambda db:db.execute("SELECT sequence,kind,payload FROM events WHERE plan_id IS NULL ORDER BY sequence").fetchall())
+            destination=directory/'r2-public-global.json';admin.export_database(f.store,destination)
+            events={item['sequence']:item for item in json.loads(destination.read_text())['events']}
+            for sequence,kind,raw in expected:
+                with self.subTest(kind=kind):
+                    self.assertIn('payload',events[sequence]);public=events[sequence]['payload'];original=json.loads(raw)
+                    fields={'database_restored':('epoch','backup_cutoff'),'host_work_declared':('absent_work_id','actor'),'orphan_inventory_stopped':('absent_work_id','resource_ids','reason')}[kind]
+                    self.assertEqual(public,{field:original[field] for field in fields})
+                    for private in ('restore_id','producer_id','origin_digest','record_digest','source_metadata','request_key'):
+                        self.assertNotIn(private,public)
+        with TemporaryDirectory() as name:
+            directory=Path(name);shutil.copyfile(Path(__file__).parent/'fixtures/service_v1.sqlite',directory/'planning.sqlite')
+            admin.migrate_installation(Config(directory),directory/'backups')
+            with make_service(directory) as f:
+                destination=directory/'r2-public-migration.json';admin.export_database(f.store,destination)
+                event=next(item for item in json.loads(destination.read_text())['events'] if item['kind']=='schema_migrated')
+                self.assertIn('payload',event);self.assertEqual(event['payload'],dict(from_schema=1,to_schema=2))
+
+    def test_export_projects_known_nested_fields_without_private_extra_objects(self):
+        from adaptive_planning import plans
+        with make_service() as f:
+            owner=f.create();attempt=f.start(owner,f.assign(owner));value=checkpoint();f.submit(owner,attempt,value)
+            secret='synthetic-private-r2-nested-secret'
+            def plant(db):
+                sequence,raw=db.execute("SELECT sequence,payload FROM events WHERE kind='record_checkpoint'").fetchone()
+                payload=json.loads(raw);payload['private_grants']={'token':secret}
+                payload['checkpoint']['private_origin']={'record':secret}
+                payload['checkpoint']['artifact']['source_binding']={'digest':secret}
+                payload['checkpoint']['evidence'][0]['private_source']={'request':secret}
+                payload['checkpoint']['reassessment']['private_request']={'key':secret}
+                db.execute('UPDATE events SET payload=? WHERE sequence=?',(json.dumps(payload,sort_keys=True),sequence))
+                db.execute("INSERT INTO events(kind,actor,published_at,payload) VALUES('future_private_event','synthetic','synthetic',?)",(json.dumps({'summary':secret,'checkpoint':payload['checkpoint']}),))
+            f.store.write(plant)
+            destination=f.directory/'r2-public-nested.json';admin.export_database(f.store,destination)
+            events=json.loads(destination.read_text())['events'];event=next(item for item in events if item['kind']=='record_checkpoint')
+            self.assertIn('payload',event)
+            self.assertEqual(event['payload']['checkpoint'],plans.to_jsonable(value))
+            self.assertNotIn(secret,destination.read_text())
+            self.assertNotIn('payload',next(item for item in events if item['kind']=='future_private_event'))
+
+    def test_export_other_known_coordination_events_preserve_explicit_public_structures(self):
+        from adaptive_planning import plans
+        with make_service() as f:
+            owner=f.create();definition=plans.to_jsonable(step('a'));artifact=plans.to_jsonable(checkpoint().artifact)
+            evidence=plans.to_jsonable(checkpoint().evidence);execution=plans.to_jsonable(context(None,writes=False))
+            cycle=dict(kind='submission',plan_id=owner.current_metadata.plan_id,step_id='a',attempt_id='public-attempt',definition_version='v1',checkpoint_sequence=7)
+            public={
+                'takeover':dict(summary='Public ownership',reason='Public takeover',previous_ownership_version=1,ownership_version=2),
+                'register_resource':dict(resource_id='public-resource'),
+                'reconcile_resources':dict(resource_id='public-survivor',retired_resource_ids=['public-retired'],identity_was_attested=True,physical_key_was_known=True,external_key_was_known=False),
+                'bind_availability':dict(attempt_id='public-attempt',step_id='a',version=2,definition_version='v1',checked_base='public-base',bindings=[dict(prerequisite='b',result_version='public-result',method='observation',checked_base='public-base',artifact_digest=None,evidence=evidence[0])]),
+                'report_activity':dict(attempt_id='public-attempt',step_id='a',version=2,definition_version='v1',observed_activity='Public observation'),
+                'resolve_reassessment':dict(checkpoint_id='7',decision='hold',affected_steps=['a'],unbounded=False,reason='Public residual reason',summary='Public residual reason',residual_steps=['a'],changed_definitions={'a':definition},prior_dependencies={'a':[]}),
+                'reopen_attempt':dict(attempt_id='public-attempt',step_id='a',version=3,before_version=2,definition_version='v1',definition=definition,checkpoint_sequence=7,ended_cycle=cycle,reason='Public reopen'),
+                'sweep_stale':dict(observed_at='2026-10-06T12:00:00+00:00',threshold_seconds=300,attempts=[dict(attempt_id='public-attempt',step_id='a',assignee='public-worker',prior_state='active',before_version=2,version=3,definition_version='v1',definition=definition,context=execution,last_activity='2026-10-06T12:00:00+00:00',hold_id='public-hold')]),
+                'recovery_checkpoint':dict(attempt_id='public-attempt',step_id='a',version=4,before_version=3,definition_version='v1',definition=definition,context=execution,recovery_only=True,recovery_event_id='8',checkpoint=plans.to_jsonable(checkpoint())),
+                'resolve_attempt':dict(attempt_id='public-attempt',step_id='a',version=4,before_version=3,definition_version='v1',definition=definition,context=execution,resolution='replace',reason='Public correction',next_step_state='pending',released_use_ids=['public-use'],old_token_fenced=True,old_attempt_id='public-attempt',old_version=4,replacement=dict(attempt_id='public-next',version=1,definition_version='v1'),assignment_event_id='9'),
+                'append_late_evidence':dict(attempt_id='public-attempt',step_id='a',version=4,definition_version='v1',definition=definition,origin_worker='public-worker',evidence=evidence,reason='Public late observation',stopped_resource_ids=['public-resource']),
+                'resolve_invalidation':dict(invalidation_id='public-invalidation',affected_step_id='a',disposition='revalidated',step_id='a',attempt_id='public-attempt',result_version='public-result',definition_version='v1',definition=definition,artifact=artifact,reason='Public revalidation',summary='Public revalidation',evidence=evidence),
+                'reserve_verification':dict(attempt_id='public-attempt',step_id='a',definition_version='v1',definition=definition,artifact=artifact,cycle=cycle,use_id='public-anchor',verifier='public-reviewer',handoff_from=None,stopped_reason=None,verification_group=dict(anchor='public-anchor',members=[dict(use_id='public-use',resource_id='public-resource',scope='workspace',created_at='synthetic')],verifier='public-reviewer',context=execution,artifact=artifact,cycle=cycle,definition=definition,source_use_ids=[])),
+                'release_resource_use':dict(use_id='public-anchor',resource_ids=['public-resource'],stopped=True,reason='Public stop',use_ids=['public-use'],attempt_id='public-attempt',step_id='a',definition_version='v1',definition=definition),
+                'resolve_store_hold':dict(inventory_complete=False,work_ids=['public-work'],backup_cutoff='public-cutoff',reason='Public inventory'),
+                'orphan_inventory_unresolved':dict(absent_work_id='public-work',resource_ids=['public-resource'],reason='Public unresolved'),
+                'restore_attempt':dict(attempt_id='public-attempt',step_id='a',from_state='active',from_version=2,to_state='stale',to_version=3,hold_id='public-hold'),
+                'import_plan':dict(writers_stopped=False,authorization_renewed=False,authorization_note_missing=True),
+            }
+            secret='synthetic-private-r2-other-source-secret'
+            def seed(db):
+                # Fixture-only public event structures; no simulated feature.
+                for kind,payload in public.items():
+                    payload={**payload,'private_grants':{'token':secret},'source_id':secret,'restore_id':secret,'request_key':secret,'source_metadata':{'epoch':secret}}
+                    db.execute('INSERT INTO events(plan_id,kind,actor,published_at,payload) VALUES(?,?,?,?,?)',(None,kind,'synthetic','synthetic',json.dumps(payload)))
+            f.store.write(seed)
+            destination=f.directory/'r2-public-other.json';admin.export_database(f.store,destination)
+            events={item['kind']:item for item in json.loads(destination.read_text())['events']}
+            for kind,payload in public.items():
+                with self.subTest(kind=kind):
+                    self.assertIn('payload',events[kind]);self.assertEqual(events[kind]['payload'],payload)
+            self.assertNotIn(secret,destination.read_text())
+
+    def restored_source_without_nonterminal(self,directory,terminal):
+        """Real backup/restore chain; no synthetic restore implementation."""
+        with make_service(directory) as f:
+            if terminal:
+                owner=f.create(steps=(step('a'),))
+                attempt=f.start(owner,f.assign(owner));value=checkpoint()
+                f.submit(owner,attempt,value);f.accept(owner,attempt,value)
+            first=directory/'r2-first.sqlite'
+            admin.backup_database(f.store,first)
+        one=admin.restore_database(Config(directory),first,preserve_current=directory/'r2-preserved-first.sqlite')
+        with make_service(directory) as f:
+            second=directory/'r2-second.sqlite';admin.backup_database(f.store,second)
+        two=admin.restore_database(Config(directory),second,preserve_current=directory/'r2-preserved-second.sqlite')
+        with make_service(directory) as f:
+            self.assertEqual(f.store.read(lambda db:db.execute("SELECT COUNT(*) FROM attempts WHERE state IN ('assigned','active','submitted','stale')").fetchone()[0]),0)
+            source=directory/'r2-source.sqlite';admin.backup_database(f.store,source)
+        return source,one['restore_id'],two['restore_id']
+
+    def test_empty_and_terminal_repeated_restore_refuses_unproved_prior_origin_and_ancestry(self):
+        for terminal in (False,True):
+            for mutation in ('payload','seal','host','epoch-link','missing','ambiguous','cycle','unbounded','ancestor'):
+                with self.subTest(terminal=terminal,mutation=mutation),TemporaryDirectory() as name:
+                    directory=Path(name)
+                    source,ancestor,current=self.restored_source_without_nonterminal(directory,terminal)
+                    # Disposable raw fixture corruption only; production restore
+                    # remains the operation under test, with real sealed origins.
+                    with closing(sqlite3.connect(source)) as db,db:
+                        raw=db.execute('SELECT payload FROM restore_origins WHERE restore_id=?',(current,)).fetchone()[0]
+                        origin=json.loads(raw)
+                        def reseal():
+                            encoded=json.dumps(origin,sort_keys=True)
+                            db.execute('UPDATE restore_origins SET payload=? WHERE restore_id=?',(encoded,current))
+                            for sequence,raw_event in db.execute("SELECT sequence,payload FROM events WHERE kind='database_restored'").fetchall():
+                                event=json.loads(raw_event)
+                                if event['restore_id']==current:
+                                    event['origin_digest']=hashlib.sha256(encoded.encode()).hexdigest()
+                                    db.execute('UPDATE events SET payload=? WHERE sequence=?',(json.dumps(event,sort_keys=True),sequence))
+                        if mutation=='payload':
+                            origin['source_digest']='0'*64
+                            db.execute('UPDATE restore_origins SET payload=? WHERE restore_id=?',(json.dumps(origin,sort_keys=True),current))
+                        elif mutation=='seal':
+                            db.execute("UPDATE events SET payload=json_set(payload,'$.origin_digest',?) WHERE kind='database_restored' AND json_extract(payload,'$.restore_id')=?",('0'*64,current))
+                        elif mutation in ('host','epoch-link'):
+                            field='host_id' if mutation=='host' else 'epoch'
+                            origin['source_metadata'][field]='foreign-link'
+                            column='host_id' if mutation=='host' else 'prior_epoch'
+                            db.execute('UPDATE restore_origins SET '+column+'=? WHERE restore_id=?',('foreign-link',current));reseal()
+                        elif mutation=='missing':
+                            db.execute('DELETE FROM restore_origins WHERE restore_id=?',(current,))
+                        elif mutation=='ambiguous':
+                            # new_epoch is already UNIQUE; duplicate the retained
+                            # producer instead of violating fixture schema setup.
+                            event=json.loads(db.execute("SELECT payload FROM events WHERE kind='database_restored' AND json_extract(payload,'$.restore_id')=?",(current,)).fetchone()[0])
+                            db.execute("INSERT INTO events(kind,actor,published_at,payload) VALUES('database_restored','local-administrator','synthetic',?)",(json.dumps(event,sort_keys=True),))
+                        elif mutation in ('cycle','unbounded'):
+                            origin['lineage_restore_ids']=[current] if mutation=='cycle' else ['r2-ancestor-'+str(i) for i in range(129)]
+                            origin['inherited_inventory']=['restore-inventory:'+identity for identity in origin['lineage_restore_ids']];reseal()
+                        else:
+                            old=json.loads(db.execute('SELECT payload FROM restore_origins WHERE restore_id=?',(ancestor,)).fetchone()[0]);old['source_digest']='0'*64
+                            db.execute('UPDATE restore_origins SET payload=? WHERE restore_id=?',(json.dumps(old,sort_keys=True),ancestor))
+                    before=entry_set(directory)
+                    with self.assertRaises(DomainError) as error:
+                        admin.restore_database(Config(directory),source,preserve_current=directory/'r2-refused-preserved.sqlite')
+                    self.assertEqual(error.exception.code,'invalid')
+                    self.assertEqual(entry_set(directory),before)
+
+    def test_valid_empty_and_terminal_repeated_restore_carries_the_exact_sealed_chain(self):
+        from adaptive_planning import recovery
+        for terminal in (False,True):
+            with self.subTest(terminal=terminal),TemporaryDirectory() as name:
+                directory=Path(name);source,ancestor,current=self.restored_source_without_nonterminal(directory,terminal)
+                with closing(sqlite3.connect(source)) as db:
+                    attempts_before=db.execute('SELECT * FROM attempts ORDER BY attempt_id').fetchall()
+                    results_before=db.execute('SELECT * FROM result_versions ORDER BY plan_id,step_id').fetchall()
+                result=admin.restore_database(Config(directory),source,preserve_current=directory/'r2-valid-preserved.sqlite')
+                with make_service(directory) as f:
+                    origin=f.store.read(lambda db:recovery.restore_origin(db,result['restore_id']))
+                    self.assertEqual(origin['lineage_restore_ids'],[current,ancestor])
+                    self.assertEqual(origin['inherited_inventory'],['restore-inventory:'+current,'restore-inventory:'+ancestor])
+                    self.assertEqual(f.store.read(lambda db:db.execute('SELECT * FROM attempts ORDER BY attempt_id').fetchall()),attempts_before)
+                    self.assertEqual(f.store.read(lambda db:db.execute('SELECT * FROM result_versions ORDER BY plan_id,step_id').fetchall()),results_before)
+                    self.assertTrue(f.service.read_service_info().store_hold)
+
+    def test_sealed_depth_fixture_accepts_128_ancestors_and_refuses_the_next_untouched(self):
+        from adaptive_planning import recovery
+        with TemporaryDirectory() as name:
+            directory=Path(name)
+            with make_service(directory) as f:
+                source=directory/'r2-depth-native.sqlite';admin.backup_database(f.store,source)
+            original=admin.restore_database(Config(directory),source,preserve_current=directory/'r2-depth-native-preserved.sqlite')
+            with make_service(directory) as f:
+                source=directory/'r2-depth-fixture.sqlite';admin.backup_database(f.store,source)
+            # Fixture-only depth setup: the original leaf comes from the real
+            # empty restore above. These 127 ancestors are structurally sealed
+            # rows, NOT claimed to have been emitted by 127 real restorations.
+            # Actual large-depth producer evidence remains in the earlier log.
+            with closing(sqlite3.connect(source)) as db,db:
+                row=db.execute('SELECT * FROM restore_origins WHERE restore_id=?',(original['restore_id'],)).fetchone()
+                leaf=json.loads(row[-1]);identities=['r2-fixture-depth-'+str(i) for i in range(127)]+[original['restore_id']]
+                for index,identity in enumerate(identities[:-1]):
+                    new_epoch='r2-fixture-epoch-'+str(index)
+                    prior_epoch='r2-fixture-epoch-'+str(index+1) if index<126 else row[2]
+                    metadata={**leaf['source_metadata'],'epoch':prior_epoch}
+                    lineage=identities[index+1:]
+                    origin={**leaf,'restore_id':identity,'source_metadata':metadata,'lineage_restore_ids':lineage,'inherited_inventory':['restore-inventory:'+value for value in lineage]}
+                    encoded=json.dumps(origin,sort_keys=True)
+                    db.execute('INSERT INTO restore_origins VALUES(?,?,?,?,?,?,?)',(identity,prior_epoch,new_epoch,row[3],row[4],row[5],encoded))
+                    event=dict(restore_id=identity,epoch=new_epoch,backup_cutoff=row[5],origin_digest=hashlib.sha256(encoded.encode()).hexdigest())
+                    db.execute("INSERT INTO events(kind,actor,published_at,payload) VALUES('database_restored','local-administrator','synthetic',?)",(json.dumps(event,sort_keys=True),))
+                db.execute("UPDATE installation SET epoch='r2-fixture-epoch-0'")
+                self.assertEqual(len(recovery.restore_origin(db,identities[0])['lineage_restore_ids']),127)
+            result=admin.restore_database(Config(directory),source,preserve_current=directory/'r2-depth-boundary-preserved.sqlite')
+            with make_service(directory) as f:
+                origin=f.store.read(lambda db:recovery.restore_origin(db,result['restore_id']))
+                self.assertEqual(len(origin['lineage_restore_ids']),128)
+                source=directory/'r2-depth-overflow.sqlite';admin.backup_database(f.store,source)
+            before=entry_set(directory)
+            with self.assertRaises(DomainError) as error:
+                admin.restore_database(Config(directory),source,preserve_current=directory/'r2-depth-refused-preserved.sqlite')
+            self.assertEqual(error.exception.code,'invalid')
+            self.assertEqual(entry_set(directory),before)
+
+    def test_incomplete_inventory_after_completion_reestablishes_hold_and_all_execution_guards(self):
+        from dataclasses import replace
+        from adaptive_planning.types import HostWork
+        for guard in ('assign','start','reopen','accept','verification'):
+            with self.subTest(guard=guard),TemporaryDirectory() as name:
+                f,owner=self.restored_empty(Path(name))
+                self.inventory(f,owner)
+                self.assertFalse(f.service.read_service_info().store_hold)
+                free=f.register(workspace('/synthetic/r2-free-guard',2002),owner)
+                attempt=None;value=checkpoint()
+                if guard!='assign':
+                    attempt=f.assign(owner)
+                if guard in ('reopen','accept','verification'):
+                    attempt=f.start(owner,attempt);f.submit(owner,attempt,value)
+                if guard=='verification':
+                    accepted=f.accept(owner,attempt,value)
+                    f.service.execute(f.command('invalidate_result',dict(step_id='a',result_version=accepted.committed['result_version'],reason='public verifier guard',evidence=value.evidence),receipt=owner))
+                restore=f.store.read(lambda db:db.execute('SELECT restore_id FROM restore_origins WHERE new_epoch=?',(f.epoch,)).fetchone()[0])
+                reason='restore-inventory:'+restore
+                independent=f.store.read(lambda db:db.execute('SELECT * FROM store_hold_reasons WHERE reason_id!=? ORDER BY reason_id',(reason,)).fetchall())
+                sequence=f.service.read_plan(owner.current_metadata.plan_id).coordination.store_sequence
+                work=HostWork('r2-incomplete-work','worker-a','running',(),(workspace('/synthetic/r2-incomplete',2001),),value.evidence)
+                self.inventory(f,owner,(work,),complete=False)
+                with self.subTest(assertion='effective-hold'):
+                    self.assertTrue(f.service.read_service_info().store_hold)
+                with self.subTest(assertion='exact-reason'):
+                    self.assertEqual(f.store.read(lambda db:db.execute('SELECT resolved FROM store_hold_reasons WHERE reason_id=? AND epoch=?',(reason,f.epoch)).fetchone()),(0,))
+                self.assertGreater(f.service.read_plan(owner.current_metadata.plan_id).coordination.store_sequence,sequence)
+                self.assertEqual(f.store.read(lambda db:db.execute('SELECT * FROM store_hold_reasons WHERE reason_id!=? ORDER BY reason_id',(reason,)).fetchall()),independent)
+                before=f.store.read(lambda db:tuple(db.iterdump()))
+                with self.subTest(assertion='guard-refusal'):
+                    with self.assertRaises(DomainError) as error:
+                        if guard=='assign':
+                            f.service.execute(f.command('assign_step',dict(step_id='a',assignee='worker-a',context=context(free)),receipt=owner))
+                        elif guard=='start':
+                            f.start(owner,attempt)
+                        elif guard=='reopen':
+                            f.service.execute(f.command('reopen_attempt',dict(reason='explicit correction'),receipt=owner,attempt=attempt))
+                        elif guard=='accept':
+                            f.accept(owner,attempt,value)
+                        else:
+                            f.service.execute(f.command('reserve_verification',dict(step_id='a',verifier='reviewer',context=context(free),handoff_from=None,stopped_reason=None),receipt=owner))
+                    self.assertEqual(error.exception.code,'held')
+                    self.assertEqual(f.store.read(lambda db:tuple(db.iterdump())),before)
+                if guard=='assign':
+                    f.store.write(lambda db:db.execute("INSERT INTO store_hold_reasons VALUES('r2-independent','older-epoch','material','{}',0,'synthetic')"))
+                self.inventory(f,owner,(work,))
+                self.assertEqual(f.store.read(lambda db:db.execute('SELECT resolved FROM store_hold_reasons WHERE reason_id=?',(reason,)).fetchone()),(1,))
+                self.assertEqual(f.service.read_service_info().store_hold,guard=='assign')
+                if guard=='assign':
+                    self.assertEqual(f.store.read(lambda db:db.execute("SELECT epoch,resolved FROM store_hold_reasons WHERE reason_id='r2-independent'").fetchone()),('older-epoch',0))
+
+    def test_incomplete_inventory_refuses_a_contradictory_current_restore_reason_untouched(self):
+        from adaptive_planning.types import HostWork
+        for mutation in ('details','epoch','kind','absent'):
+            with self.subTest(mutation=mutation),TemporaryDirectory() as name:
+                f,owner=self.restored_empty(Path(name));self.inventory(f,owner)
+                identity=f.store.read(lambda db:db.execute('SELECT reason_id FROM store_hold_reasons').fetchone()[0])
+                def corrupt(db):
+                    if mutation=='absent':
+                        db.execute('DELETE FROM store_hold_reasons WHERE reason_id=?',(identity,))
+                    else:
+                        db.execute('UPDATE store_hold_reasons SET '+mutation+'=? WHERE reason_id=?',('contradictory',identity))
+                f.store.write(corrupt)
+                before=f.store.read(lambda db:tuple(db.iterdump()))
+                work=HostWork('r2-bad-reason','worker-a','running',(),(workspace('/synthetic/r2-bad-reason',2003),),checkpoint().evidence)
+                with self.assertRaises(DomainError) as error:
+                    self.inventory(f,owner,(work,),complete=False)
+                self.assertEqual(error.exception.code,'invalid')
+                self.assertEqual(f.store.read(lambda db:tuple(db.iterdump())),before)
+
+    def test_running_or_unknown_redeclaration_of_released_work_requires_new_identity(self):
+        from dataclasses import replace
+        from adaptive_planning.types import HostWork,ResourceResolution
+        for stopped in ('full','subset'):
+            for state in ('running','unknown'):
+                with self.subTest(stopped=stopped,state=state),TemporaryDirectory() as name:
+                    f,owner=self.restored_empty(Path(name))
+                    work=HostWork('r2-same-work','worker-a','running',(),(workspace('/synthetic/r2-stop-one',2004),workspace('/synthetic/r2-stop-two',2005)),checkpoint().evidence)
+                    initial=f.command('resolve_store_hold',dict(backup_cutoff=f.service.read_service_info().restore_cutoff,inventory_complete=True,absent_work_inventory=(work,),resource_resolutions=(),reason='original running observation'),receipt=owner)
+                    f.service.execute(initial)
+                    rows=f.store.read(lambda db:db.execute('SELECT rowid,* FROM resource_uses ORDER BY rowid').fetchall())
+                    self.inventory(f,owner,(work,))
+                    self.assertEqual(f.store.read(lambda db:db.execute('SELECT rowid,* FROM resource_uses ORDER BY rowid').fetchall()),rows)
+                    ids=f.service.read_plan(owner.current_metadata.plan_id).coordination.reservations[0].resource_ids
+                    resolution=ResourceResolution(None,work.work_id,() if stopped=='full' else (ids[0],),'stopped','actual explicit stopped members')
+                    self.inventory(f,owner,resolutions=(resolution,),complete=stopped=='full')
+                    before=f.store.read(lambda db:tuple(db.iterdump()))
+                    replay=f.service.execute(initial)
+                    self.assertTrue(replay.replayed)
+                    self.assertEqual(f.store.read(lambda db:tuple(db.iterdump())),before)
+                    with self.assertRaises(DomainError) as error:
+                        self.inventory(f,owner,(replace(work,state=state),))
+                    self.assertEqual(error.exception.code,'invalid')
+                    self.assertIn('new work identity',error.exception.message)
+                    self.assertEqual(f.store.read(lambda db:tuple(db.iterdump())),before)
+
+    def test_actual_restore_preserves_open_invalidation_and_gates_writable_verification_until_inventory(self):
+        from adaptive_planning.types import HostWork,Review
+        with TemporaryDirectory() as name:
+            directory=Path(name);value=checkpoint();review=Review('reviewer',value.artifact,'passed',(),value.evidence,None)
+            with make_service(directory) as f:
+                p=f.create(steps=(step('a',review_required=True),))
+                active=f.start(p,f.assign(p));f.submit(p,active,value)
+                f.service.execute(f.command('record_review',dict(step_id='a',review=review),receipt=p))
+                accepted=f.accept(p,active,value)
+                invalidated=f.service.execute(f.command('invalidate_result',dict(step_id='a',result_version=accepted.committed['result_version'],reason='retained open invalidation',evidence=value.evidence),receipt=p))
+                original=f.service.read_plan(p.current_metadata.plan_id)
+                admin.backup_database(f.store,directory/'accepted.sqlite')
+                late=f.create(creation_id='post-backup-review-writer')
+                claim=workspace('/synthetic/r2-absent-verifier',2006);rid=f.register(claim,late)
+                worker=f.service.execute(f.command('assign_step',dict(step_id='a',assignee='worker-a',context=context(rid)),receipt=late));f.start(late,worker)
+            admin.restore_database(Config(directory),directory/'accepted.sqlite',preserve_current=directory/'preserved-review.sqlite')
+            with make_service(directory) as f:
+                owner=self.takeover(f,p.current_metadata.plan_id)
+                state=f.service.read_plan(p.current_metadata.plan_id)
+                self.assertEqual(state.coordination.result_versions,original.coordination.result_versions)
+                self.assertTrue(any(h.kind=='invalidation' and h.source_id==invalidated.committed['invalidation_id'] for h in state.coordination.holds))
+                orphan=f.register(claim,owner);free=f.register(workspace('/synthetic/r2-free-verifier',2007),owner)
+                payload=dict(step_id='a',verifier='reviewer',context=context(orphan),handoff_from=None,stopped_reason=None)
+                before=f.store.read(lambda db:tuple(db.iterdump()))
+                with self.assertRaises(DomainError) as error:
+                    f.service.execute(f.command('reserve_verification',payload,receipt=owner))
+                self.assertEqual(error.exception.code,'held');self.assertEqual(f.store.read(lambda db:tuple(db.iterdump())),before)
+                f.service.execute(f.command('record_review',dict(step_id='a',review=review),receipt=owner))
+                self.assertTrue(f.service.read_service_info().store_hold)
+                work=HostWork('r2-absent-review-worker','worker-a','running',(),(claim,),value.evidence)
+                self.inventory(f,owner,(work,))
+                before=f.store.read(lambda db:tuple(db.iterdump()))
+                with self.assertRaises(DomainError) as error:
+                    f.service.execute(f.command('reserve_verification',payload,receipt=owner))
+                self.assertEqual(error.exception.code,'resource_conflict');self.assertEqual(f.store.read(lambda db:tuple(db.iterdump())),before)
+                reserved=f.service.execute(f.command('reserve_verification',dict(payload,context=context(free)),receipt=owner))
+                self.assertTrue(reserved.committed['use_id'])
+                after=f.service.read_plan(p.current_metadata.plan_id)
+                self.assertEqual(after.coordination.result_versions,original.coordination.result_versions)
+                self.assertTrue(any(h.kind=='invalidation' and h.source_id==invalidated.committed['invalidation_id'] for h in after.coordination.holds))
+
     def test_reserved_destination_case_aliases_refuse_through_physical_parent_alias(self):
         reserved=('planning.sqlite','planning.sqlite-wal','planning.sqlite-shm','planning.sqlite-journal',
                   'service-token','.planning-operation.lock','.planning-maintenance.json')

@@ -205,6 +205,14 @@ restore lineage. Nonterminal ownership becomes stale/unresolved, including an
 explicit transition and source-owned hold for already-stale native attempts.
 Accepted history remains terminal. Old worker commands/replays are fenced.
 
+Repeated restore validates the unique current sealed origin and its entire
+epoch/host-linked ancestry on the same admitted source snapshot, even when all
+attempts are terminal or absent. The supported lineage contains at most 128
+ancestors. A malformed, cyclic, missing, contradictory, or deeper lineage is
+refused before publishing `preserve_current` or replacing the authority; source
+and current installation entries remain unchanged. Valid deeper histories are
+conservatively unsupported and require an explicitly designed archival route.
+
 Publication records the exact operation, original/preserved/staged image
 identities and prepared/normalized/published phases in the private durable
 `.planning-maintenance.json`. SQLite checkpoint/journal normalization precedes
