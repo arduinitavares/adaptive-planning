@@ -121,10 +121,12 @@ def _destination(authority: Path, destination: Path) -> Path:
     reserved = {authority, authority.parent / TOKEN_FILENAME,
                 authority.parent / GATE_FILENAME, authority.parent / MANIFEST_FILENAME}
     reserved.update(Path(str(authority) + suffix) for suffix in ("-wal", "-shm", "-journal"))
-    if destination in reserved or destination.exists() or destination.is_symlink():
-        raise DomainError("invalid", "Administrator destination is reserved or already exists")
     if not destination.parent.is_dir():
         raise DomainError("invalid", "Administrator destination parent does not exist")
+    same_directory = destination.parent.samefile(authority.parent)
+    reserved_name = destination.name.casefold() in {path.name.casefold() for path in reserved}
+    if (same_directory and reserved_name) or destination.exists() or destination.is_symlink():
+        raise DomainError("invalid", "Administrator destination is reserved or already exists")
     return destination
 
 
@@ -166,11 +168,15 @@ def _clone_image(authority: Path):
         directory = Path(name)
         os.chmod(directory,0o700)
         clone = directory / "image.sqlite"
-        for suffix in ("", "-wal", "-journal"):
+        for suffix in ("", "-wal", "-shm", "-journal"):
             source = Path(str(authority) + suffix)
+            if source.is_symlink():
+                raise DomainError("invalid", "Installation image or sidecar cannot be a symlink")
             if source.exists():
-                if source.is_symlink() or not source.is_file():
+                if not source.is_file():
                     raise DomainError("invalid", "Installation sidecar is not regular")
+                if suffix == '-shm':
+                    continue
                 target = Path(str(clone) + suffix)
                 shutil.copyfile(source,target)
                 os.chmod(target,0o600)

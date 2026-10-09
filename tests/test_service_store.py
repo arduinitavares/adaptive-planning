@@ -19,8 +19,82 @@ from adaptive_planning.schema import initialize_schema
 from adaptive_planning.store import Store
 
 
+def entry_set(directory):
+    """Snapshot bytes/modes/inodes/links without opening a symbolic-link target."""
+    result={'.':(directory.lstat().st_mode,directory.lstat().st_dev,directory.lstat().st_ino,None)}
+    for entry in directory.iterdir():
+        details=entry.lstat()
+        content=os.readlink(entry) if entry.is_symlink() else entry.read_bytes() if entry.is_file() else None
+        result[entry.name]=(details.st_mode,details.st_dev,details.st_ino,content)
+    return result
+
+
 class TestService(unittest.TestCase):
     """Test suite for atomic SQLite authority, schema, and Store operations."""
+
+    def test_existing_authority_refuses_dangling_sidecars_without_source_changes(self):
+        for suffix in ('-wal','-shm','-journal'):
+            with self.subTest(suffix=suffix),TemporaryDirectory() as name:
+                root=Path(name);directory=root/'installation';path=directory/'planning.sqlite';clock=FakeClock()
+                with Store(path,clock):
+                    pass
+                credential=directory/'service-token';credential.write_bytes(b'synthetic credential preserved byte for byte')
+                os.chmod(credential,0o640);os.chmod(path,0o640);os.chmod(directory,0o750)
+                target=root/'never-created-target'
+                Path(str(path)+suffix).symlink_to(target)
+                before=(entry_set(root),entry_set(directory))
+                failure=None
+                try:
+                    with Store(path,clock):
+                        pass
+                except Exception as error:
+                    failure=error
+                self.assertEqual((entry_set(root),entry_set(directory)),before)
+                self.assertFalse(target.exists())
+                self.assertFalse(target.is_symlink())
+                self.assertIsInstance(failure,DomainError)
+                self.assertEqual(failure.code,'invalid')
+
+    def test_missing_main_with_dangling_sidecars_refuses_before_bootstrap_or_recreation(self):
+        for gate_exists in (False,True):
+            for suffix in ('-wal','-shm','-journal'):
+                with self.subTest(gate_exists=gate_exists,suffix=suffix),TemporaryDirectory() as name:
+                    root=Path(name);directory=root/'installation';path=directory/'planning.sqlite';clock=FakeClock()
+                    if gate_exists:
+                        with Store(path,clock):
+                            pass
+                        path.unlink()
+                    else:
+                        directory.mkdir()
+                    credential=directory/'service-token';credential.write_bytes(b'synthetic credential preserved byte for byte')
+                    os.chmod(credential,0o640);os.chmod(directory,0o750)
+                    target=root/'never-created-target'
+                    Path(str(path)+suffix).symlink_to(target)
+                    before=(entry_set(root),entry_set(directory))
+                    failure=None
+                    try:
+                        with Store(path,clock):
+                            pass
+                    except Exception as error:
+                        failure=error
+                    self.assertEqual((entry_set(root),entry_set(directory)),before)
+                    self.assertFalse(target.exists())
+                    self.assertFalse(target.is_symlink())
+                    self.assertIsInstance(failure,DomainError)
+                    self.assertEqual(failure.code,'invalid')
+
+    def test_dangling_main_link_refuses_without_following_target(self):
+        with TemporaryDirectory() as name:
+            root=Path(name);directory=root/'installation';directory.mkdir();path=directory/'planning.sqlite'
+            target=root/'never-created-target';path.symlink_to(target)
+            before=(entry_set(root),entry_set(directory))
+            with self.assertRaises(DomainError) as error:
+                with Store(path,FakeClock()):
+                    pass
+            self.assertEqual(error.exception.code,'invalid')
+            self.assertEqual((entry_set(root),entry_set(directory)),before)
+            self.assertFalse(target.exists())
+            self.assertFalse(target.is_symlink())
 
     def test_restart_preserves_epoch_and_events(self) -> None:
         """Closing and reopening DB preserves epoch, host_id, events, watermark, and monotonic sequence."""

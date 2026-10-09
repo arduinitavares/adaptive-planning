@@ -23,7 +23,93 @@ from tests.service_fixtures import FakeClock, checkpoint, context, make_service,
 def file_set(directory):
     return {p.name:(p.read_bytes(),p.stat().st_mode,p.stat().st_ino) for p in directory.iterdir() if p.is_file()}
 
+
+def entry_set(directory):
+    """Record source entries without following symbolic links or their targets."""
+    result={'.':(directory.lstat().st_mode,directory.lstat().st_dev,directory.lstat().st_ino,None)}
+    for entry in directory.iterdir():
+        details=entry.lstat()
+        content=os.readlink(entry) if entry.is_symlink() else entry.read_bytes() if entry.is_file() else None
+        result[entry.name]=(details.st_mode,details.st_dev,details.st_ino,content)
+    return result
+
+
 class TestService(unittest.TestCase):
+    def test_reserved_destination_case_aliases_refuse_through_physical_parent_alias(self):
+        reserved=('planning.sqlite','planning.sqlite-wal','planning.sqlite-shm','planning.sqlite-journal',
+                  'service-token','.planning-operation.lock','.planning-maintenance.json')
+        for function in (admin.backup_database,admin.export_database):
+            for filename in reserved:
+                with self.subTest(operation=function.__name__,reserved=filename),TemporaryDirectory() as name:
+                    root=Path(name)
+                    with make_service(root/'authority') as f:
+                        alias=root/'different-parent-spelling'
+                        alias.symlink_to(f.directory,target_is_directory=True)
+                        destination=alias/filename.upper()
+                        before=entry_set(f.directory)
+                        with self.assertRaises(DomainError) as error:
+                            function(f.store,destination)
+                        self.assertEqual(error.exception.code,'invalid')
+                        self.assertEqual(entry_set(f.directory),before)
+
+    def test_reserved_case_basename_in_a_different_directory_is_a_valid_destination(self):
+        for function in (admin.backup_database,admin.export_database):
+            with self.subTest(operation=function.__name__),TemporaryDirectory() as name:
+                root=Path(name)
+                destination_directory=root/'separate-backups';destination_directory.mkdir()
+                destination=destination_directory/'PLANNING.SQLITE-WAL'
+                with make_service(root/'authority') as f:
+                    function(f.store,destination)
+                self.assertTrue(destination.is_file())
+                if function is admin.backup_database:
+                    with closing(sqlite3.connect(destination)) as db:
+                        self.assertEqual(db.execute('SELECT authority_kind FROM installation').fetchone(),('backup',))
+                else:
+                    self.assertEqual(json.loads(destination.read_text())['installation']['schema_version'],2)
+
+    def test_public_restore_refuses_dangling_source_sidecars_untouched(self):
+        for suffix in ('-wal','-shm','-journal'):
+            with self.subTest(suffix=suffix),TemporaryDirectory() as name:
+                root=Path(name);directory=root/'installation';source=root/'source.sqlite'
+                with make_service(directory) as f:
+                    admin.backup_database(f.store,source)
+                target=root/'never-created-target'
+                Path(str(source)+suffix).symlink_to(target)
+                os.chmod(source,0o640)
+                before=(entry_set(root),entry_set(directory))
+                with self.assertRaises(DomainError) as error:
+                    admin.restore_database(Config(directory),source,preserve_current=directory/'preserved.sqlite')
+                self.assertEqual(error.exception.code,'invalid')
+                self.assertEqual((entry_set(root),entry_set(directory)),before)
+                self.assertFalse(target.exists())
+                self.assertFalse(target.is_symlink())
+
+    def test_real_cold_backup_refuses_dangling_main_and_all_sidecars_untouched(self):
+        from adaptive_planning.store import maintenance_ownership
+        # Root R1 ruling permits this actual existing cold backup route under
+        # real maintenance ownership; public Store/restore are covered separately.
+        for suffix in ('','-wal','-shm','-journal'):
+            with self.subTest(suffix=suffix),TemporaryDirectory() as name:
+                root=Path(name);directory=root/'installation'
+                with make_service(directory) as f:
+                    source=f.store.path
+                target=root/'never-created-target'
+                if not suffix:
+                    source.unlink()
+                Path(str(source)+suffix).symlink_to(target)
+                before=(entry_set(root),entry_set(directory))
+                failure=None
+                with maintenance_ownership(directory):
+                    try:
+                        admin._cold_backup(source,root/'cold-copy.sqlite')
+                    except Exception as error:
+                        failure=error
+                self.assertEqual((entry_set(root),entry_set(directory)),before)
+                self.assertFalse(target.exists())
+                self.assertFalse(target.is_symlink())
+                self.assertIsInstance(failure,DomainError)
+                self.assertEqual(failure.code,'invalid')
+
     def test_restore_materializes_the_same_admitted_committed_wal_snapshot_and_cutoff(self):
         with TemporaryDirectory() as name:
             directory=Path(name)

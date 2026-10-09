@@ -143,14 +143,16 @@ def admitted_image(path: Path, *, versions: tuple[int, ...] = (SCHEMA_VERSION,),
         clone = directory / "image.sqlite"
         try:
             os.chmod(directory, 0o700)
-            if not path.is_file() or path.is_symlink() or path.stat().st_size == 0:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
                 raise DomainError("invalid", "Installation image is not a nonempty regular file")
             files = []
             for suffix in ('', '-journal', '-shm', '-wal'):
                 source = Path(str(path) + suffix)
+                if source.is_symlink():
+                    raise DomainError("invalid", "Installation image or sidecar cannot be a symlink")
                 if not source.exists():
                     continue
-                if source.is_symlink() or not source.is_file():
+                if not source.is_file():
                     raise DomainError("invalid", "Installation sidecar is not regular")
                 if suffix != '-shm':
                     target = Path(str(clone) + suffix)
@@ -254,9 +256,12 @@ class Store:
     def _admit_source(self) -> None:
         if (self.path.parent / ".planning-maintenance.json").exists():
             raise DomainError("maintenance_pending", "Explicit maintenance recovery is required")
+        if self.path.is_symlink():
+            raise DomainError("invalid", "Installation main image cannot be a symlink")
         if self.path.exists():
             inspect_image(self.path, host_id=self._requested_host_id)
-        elif any(Path(str(self.path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")):
+        elif any(Path(str(self.path) + suffix).is_symlink() or Path(str(self.path) + suffix).exists()
+                 for suffix in ("-wal", "-shm", "-journal")):
             raise DomainError("invalid", "Installation main image is missing")
 
     def _check_open(self) -> None:
