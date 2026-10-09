@@ -128,19 +128,59 @@ def stored_receipt(connection: sqlite3.Connection, command: Command, receipt: Mu
     return replace(receipt, private=None)
 
 
+def _incoming_source_root(registry: resources._Registry, payload: Mapping, host_id: str) -> ResourceId:
+    """Canonical identity of an incoming source reference using read-only registry evidence only.
+
+    Exact replay never registers a claim, inserts an alias or guesses a host: a physical claim must already
+    identify exactly one registered source, with no weaker path-only fallback.
+    """
+    source_id, claim = payload.get("source_directory_id"), payload.get("source_directory_claim")
+    if (source_id is not None) == (claim is not None):
+        raise DomainError("invalid", "Import requires exactly one of source_directory_id or source_directory_claim")
+    if claim is None:
+        return _source_root(registry, source_id, host_id)
+    if claim.kind != "workspace" or claim.host_id != host_id or claim.device is None or claim.inode is None:
+        raise DomainError("invalid", "The replayed source claim is not a physical current-host workspace claim")
+    checked, attestation = resources._claim(registry, claim)
+    aliases, keys, unknown = registry.matches(checked, attestation)
+    if unknown:
+        raise DomainError("held", "Unknown historical identity requires reconciliation")
+    candidates = aliases | keys
+    if len(candidates) != 1:
+        raise DomainError("invalid", "The replayed source claim does not identify exactly one registered source")
+    root = next(iter(candidates))
+    registry.compatible(root, checked, attestation)
+    if registry.attestations[root].physical is None and attestation.physical is not None:
+        raise DomainError("resource_conflict", "Attaching a physical identity requires explicit reconciliation")
+    return _source_root(registry, root, host_id)
+
+
 def import_replay(connection: sqlite3.Connection, command: Command, replayed: MutationReceipt) -> MutationReceipt:
     """Disclose only the linked original grant, and only while it is still current."""
     if command.kind != "import_plan":
         return replayed
-    # Bind the actual stored request row, never the untrusted decoded receipt, to the validated origin.
+    payload = command.payload
+    registry = resources._Registry(connection)
+    host_id = registry.host
+    if payload.get("host_id") != host_id:
+        raise DomainError("invalid", "The replayed import receipt contradicts its request row and import origin")
+    # The incoming source, not the stored request plan, selects the origin; the request row must agree with it.
+    root = _incoming_source_root(registry, payload, host_id)
+    mapped = [row for row in connection.execute(
+        "SELECT import_id, source_directory_id, plan_id FROM imports WHERE host_id = ? AND original_task_id = ?",
+        (host_id, payload.get("original_task_id"))).fetchall() if registry.resolve(row[1]) == root]
     request = connection.execute("SELECT plan_id FROM requests WHERE epoch = ? AND key = ?",
                                  (command.epoch, command.key)).fetchone()
     if request is None:
         raise DomainError("invalid", "The replayed request row is missing")
     plan_id = request[0]
+    if len(mapped) != 1 or mapped[0][2] != plan_id:
+        raise DomainError("invalid", "The replayed import receipt contradicts its request row and import origin")
     origin = recovery.origin_link(connection, plan_id)
+    if (origin["import_id"] != mapped[0][0] or registry.resolve(origin["source_directory_id"]) != root
+            or registry.resolve(origin["committed_source_directory_id"]) != root):
+        raise DomainError("invalid", "The replayed import receipt contradicts its request row and import origin")
     committed, committed_metadata, private = _original_receipt(connection, plan_id, origin)
-    payload = command.payload
     snapshot = payload.get("original_snapshot")
     if (replayed.committed != committed or replayed.committed_metadata != committed_metadata
             or replayed.current_metadata.plan_id != plan_id or payload.get("host_id") != origin["host_id"]

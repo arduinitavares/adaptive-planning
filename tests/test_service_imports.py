@@ -1369,6 +1369,150 @@ class TestImportFixRound1(unittest.TestCase):
             "import_plan", self.payload(path="/synthetic/r2-fb", inode=2310), key="r2-fb-again")).private.orchestrator_token,
             second.private.orchestrator_token)
 
+    # ====================================== R3 items 5/B1/6(a): incoming source binding on exact replay
+    def test_exact_replay_binds_incoming_source_to_the_validated_origin(self):
+        source = active_legacy_snapshot()
+        first = self.do_import(self.payload(source, path="/synthetic/r3-a", inode=3001), key="r3-a")
+        second = self.do_import(self.payload(source, path="/synthetic/r3-b", inode=3011), key="r3-b")
+        plan_a, plan_b = first.current_metadata.plan_id, second.current_metadata.plan_id
+        self.assertNotEqual(plan_a, plan_b)
+        bodies = {
+            "claim": self.payload(source, path="/synthetic/r3-a", inode=3001),
+            "existing-id": self.payload(source, directory_id=first.committed["source_directory_id"]),
+        }
+        for name, body in bodies.items():
+            for mode in ("plan-and-response", "plan-only"):
+                with self.subTest(name, mode=mode):
+                    key = f"r3-{name}-{mode}"
+                    command = self.f.command("import_plan", body, key=key)
+                    dedup = self.f.service.execute(command)
+                    self.assertEqual(dedup.private.orchestrator_token, first.private.orchestrator_token)
+                    digest = self.rows("SELECT command_digest FROM requests WHERE key=?", key)
+                    swapped = plans.encode_response(replace(second, private=None))
+                    if mode == "plan-only":
+                        self.f.store.write(lambda db: db.execute(
+                            "UPDATE requests SET plan_id=? WHERE key=?", (plan_b, key)))
+                    else:
+                        self.f.store.write(lambda db: db.execute(
+                            "UPDATE requests SET plan_id=?, response_payload=? WHERE key=?", (plan_b, swapped, key)))
+                    error = self.refused(command)
+                    self.assertEqual(error.code, "invalid")
+                    self.assertEqual(self.rows("SELECT command_digest FROM requests WHERE key=?", key), digest)
+                    self.assertEqual(self.rows("SELECT plan_id FROM requests WHERE key=?", key), ((plan_b,),))
+                    self.f.store.write(lambda db: db.execute(
+                        "UPDATE requests SET plan_id=?, response_payload=? WHERE key=?",
+                        (plan_a, plans.encode_response(replace(dedup, private=None)), key)))
+                    self.assertEqual(self.f.service.execute(command).private.orchestrator_token,
+                                     first.private.orchestrator_token)
+
+    def test_exact_replay_source_proof_is_read_only_and_keeps_alias_reconciliation(self):
+        survivor, retired = self.reconciled_pair("r3-alias", 3100)
+        source = active_legacy_snapshot()
+        command = self.f.command("import_plan", self.payload(source, directory_id=retired), key="r3-alias-first")
+        first = self.f.service.execute(command)
+        token = first.private.orchestrator_token
+        before = self.state()
+        again = self.f.service.execute(command)
+        self.assertTrue(again.replayed)
+        self.assertEqual(again.private.orchestrator_token, token)
+        self.assertEqual(self.state(), before)
+        canonical = self.f.command("import_plan", self.payload(source, directory_id=survivor), key="r3-alias-survivor")
+        dedup = self.f.service.execute(canonical)
+        self.assertEqual(dedup.private.orchestrator_token, token)
+        before = self.state()
+        self.assertEqual(self.f.service.execute(canonical).private.orchestrator_token, token)
+        self.assertEqual(self.state(), before)
+        claim = self.f.command("import_plan", self.payload(source, path="/synthetic/r3-claim-src", inode=3150), key="r3-claim-first")
+        fresh = self.f.service.execute(claim)
+        self.assertNotEqual(fresh.current_metadata.plan_id, first.current_metadata.plan_id)
+        before = self.state()
+        self.assertEqual(self.f.service.execute(claim).private.orchestrator_token, fresh.private.orchestrator_token)
+        self.assertEqual(self.state(), before)
+        reopened = make_service(self.f.directory, self.f.clock)
+        self.assertEqual(reopened.service.execute(claim).private.orchestrator_token, fresh.private.orchestrator_token)
+        self.assertEqual(self.state(), before)
+
+    # ====================================== R3 items 6(b)/11: retained imported history across success
+    LIFECYCLE_KEYS = frozenset({"cancellation_reason", "cancelled_at", "cancelled_from"})
+
+    def retained(self, plan_id, attempt_id):
+        """Everything that must survive an imported terminal or replacement, with only status/version excluded."""
+        def read(db):
+            row = db.execute("SELECT step_id, assignee, definition_version, started_at, stopped_at, payload "
+                             "FROM attempts WHERE plan_id=? AND attempt_id=?", (plan_id, attempt_id)).fetchone()
+            members, namespace = resources.execution_uses(db, plan_id, attempt_id)
+            uses = tuple(db.execute("SELECT use_id, resource_id, scope, created_at FROM resource_uses "
+                                    "WHERE plan_id=? AND attempt_id=? ORDER BY use_id", (plan_id, attempt_id)))
+            origin = tuple(db.execute("SELECT payload FROM events WHERE plan_id=? AND kind='import_plan'", (plan_id,)))
+            mapped = tuple(db.execute("SELECT import_id, host_id, source_directory_id, original_task_id, content_digest "
+                                      "FROM imports WHERE plan_id=?", (plan_id,)))
+            return row[:5], json.loads(row[5]), members, {k: tuple(v[:6]) + tuple(v[7:]) for k, v in namespace.items()}, \
+                uses, origin, mapped
+        head, payload, members, namespace, uses, origin, mapped = self.f.store.read(read)
+        view = self.f.service.read_plan(plan_id)
+        return {"head": head, "payload": payload, "members": members, "namespace": namespace, "uses": uses,
+                "origin": origin, "mapped": mapped, "authorization": view.draft.authorization,
+                "legacy_scope": view.legacy_snapshot["scope"],
+                "definitions": {s.step_id: s for s in view.draft.steps}}
+
+    def assert_history_retained(self, before, after):
+        extra = set(after["payload"]) - set(before["payload"])
+        self.assertLessEqual(extra, self.LIFECYCLE_KEYS)
+        self.assertEqual({k: after["payload"][k] for k in before["payload"]}, before["payload"])
+        for key in ("head", "members", "namespace", "uses", "origin", "mapped", "authorization", "legacy_scope"):
+            self.assertEqual(after[key], before[key], key)
+        self.assertEqual(after["definitions"]["step-1"], before["definitions"]["step-1"])
+
+    def test_successful_imported_terminal_resolutions_retain_the_original_history(self):
+        for name, resolution, next_state in (("release", "release", "blocked"), ("reject", "reject", "blocked"),
+                                              ("retire", "release", "retired")):
+            with self.subTest(name):
+                self.reset()
+                receipt, attempt = self.import_known(
+                    f"/synthetic/r3-term-{name}", 3200,
+                    source=independent_legacy_snapshot() if name == "retire" else None)
+                plan_id = receipt.current_metadata.plan_id
+                before = self.retained(plan_id, attempt.attempt_id)
+                self.assertTrue(self.is_imported(plan_id, attempt.attempt_id))
+                self.f.service.execute(self.resolve(receipt, attempt, resolution, next_state))
+                after = self.retained(plan_id, attempt.attempt_id)
+                self.assert_history_retained(before, after)
+                self.assertEqual(self.rows("SELECT state, version FROM attempts WHERE attempt_id=?", attempt.attempt_id),
+                                 (("rejected" if resolution == "reject" else "released", 2),))
+                self.assertTrue(self.is_imported(plan_id, attempt.attempt_id))
+                self.assertEqual(self.rows("SELECT count(*) FROM capabilities WHERE role='attempt'"), ((0,),))
+                self.assertEqual(self.rows("SELECT DISTINCT status FROM resource_uses WHERE attempt_id=?", attempt.attempt_id),
+                                 (("unresolved",),))
+
+    def test_successful_full_cohort_replacement_retains_history_and_replays_exactly(self):
+        receipt, attempt = self.import_cohort("hist", 3300)
+        plan_id = receipt.current_metadata.plan_id
+        ids = {scope: rid for rid, scope in self.rows("SELECT resource_id, scope FROM resource_uses WHERE plan_id=?", plan_id)}
+        replacement = ExecutionContext("repository", ids["repository"], None, True, (), True, None)
+        before = self.retained(plan_id, attempt.attempt_id)
+        command = self.resolve(receipt, attempt, "replace", "pending", assignee="new-worker",
+                               replacement=replacement, stopped=tuple(ids.values()), key="r3-hist-replace")
+        replaced = self.f.service.execute(command)
+        after = self.retained(plan_id, attempt.attempt_id)
+        self.assert_history_retained(before, after)
+        self.assertEqual(self.rows("SELECT state, version FROM attempts WHERE attempt_id=?", attempt.attempt_id),
+                         (("released", 2),))
+        self.assertEqual(self.rows("SELECT DISTINCT status FROM resource_uses WHERE attempt_id=?", attempt.attempt_id),
+                         (("released",),))
+        successor = self.rows("SELECT attempt_id FROM attempts WHERE plan_id=? AND step_id='step-1' AND attempt_id<>?",
+                              plan_id, attempt.attempt_id)
+        self.assertEqual(len(successor), 1)
+        self.assertTrue(self.is_imported(plan_id, attempt.attempt_id))
+        self.assertFalse(self.is_imported(plan_id, successor[0][0]))
+        self.assertEqual(self.rows("SELECT count(*) FROM capabilities WHERE role='attempt'"), ((1,),))
+        settled = self.state()
+        self.assertEqual(self.f.service.execute(command).private.attempt_token, replaced.private.attempt_token)
+        self.assertEqual(self.state(), settled)
+        reopened = make_service(self.f.directory, self.f.clock)
+        self.assertEqual(reopened.service.execute(command).private.attempt_token, replaced.private.attempt_token)
+        self.assertEqual(self.state(), settled)
+        self.assert_history_retained(before, self.retained(plan_id, attempt.attempt_id))
+
 
 if __name__ == "__main__":
     unittest.main()
