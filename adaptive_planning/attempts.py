@@ -778,6 +778,7 @@ def cancel_attempt(connection: sqlite3.Connection, plan_id: PlanId, attempt_id: 
         if recovery.is_imported_attempt(connection, plan_id, attempt_id):
             if data.get("context") is None:
                 raise DomainError("held", "Imported attempts with unknown context cannot be cancelled until context is attached")
+            recovery.clear_imported_stale(connection, data)
         else:
             raise DomainError("invalid", "The claimed attempt has no bound worker capability")
     data.update(cancellation_reason=reason.strip(), cancelled_from=row[3], cancelled_at=plans._timestamp())

@@ -97,6 +97,7 @@ class PlanningService:
                 require_orchestrator(db, command)
             replayed = plans.replay_request(db, command)
             if replayed is not None:
+                replayed = imports.import_replay(db, command, replayed)
                 return recovery.replacement_replay(db, command, replayed)
             receipt = HANDLERS[command.kind](db, command)
         except DomainError as error:
@@ -110,7 +111,8 @@ class PlanningService:
             "INSERT INTO requests (request_id, epoch, key, command_digest, plan_id, response_payload, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (str(uuid.uuid4()), epoch, command.key, plans.command_digest(command),
-             receipt.committed_metadata.plan_id, plans.encode_response(receipt), self._clock().isoformat()))
+             receipt.committed_metadata.plan_id,
+             plans.encode_response(imports.stored_receipt(db, command, receipt)), self._clock().isoformat()))
         return receipt
 
     # ------------------------------------------------------------------ reads

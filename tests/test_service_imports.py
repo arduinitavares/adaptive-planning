@@ -1,19 +1,22 @@
 """Tests for Task 22: Explicit legacy authority handoff and recovery import."""
 from __future__ import annotations
 
+import asyncio
 import copy
 from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
 import unittest
 import uuid
 
+from adaptive_planning import plans, resources
 from adaptive_planning.core import prepare_publication
 from adaptive_planning.types import (
     Command, DocumentRef, DomainError, ExecutionContext, ExecutionContextClaims,
-    JSONValue, ResourceClaim, ResourceId,
+    JSONValue, ResourceClaim, ResourceId, RetirementRequest,
 )
 from tests.service_fixtures import (
     context, draft, legacy_proposal, make_service, step, workspace,
@@ -394,6 +397,588 @@ class TestServiceImports(unittest.TestCase):
         with self.assertRaises(DomainError) as error:
             self.f.service.execute(cmd)
         self.assertEqual(error.exception.code, "held")
+
+
+def known_claim(path: str, inode: int, writes: bool = True) -> ExecutionContextClaims:
+    kind = "non-repository" if writes else "read-only"
+    return ExecutionContextClaims(kind, None, workspace(path, inode), False, (), writes, None)
+
+
+def independent_legacy_snapshot() -> dict[str, JSONValue]:
+    """Active legacy snapshot whose second step no longer depends on the in-progress first step."""
+    p = copy.deepcopy(legacy_proposal())
+    p["status"] = "running"
+    p["steps"][0]["status"] = "in-progress"
+    p["steps"][1]["dependsOn"] = []
+    return prepare_publication(
+        p, None, timestamp="2026-10-06T00:00:00Z", generation="00000000-0000-4000-8000-000000000001",
+        expected_revision=0, expected_generation=None, authorization_note="synthetic legacy authorization",
+        max_file_bytes=10 * 1024 * 1024, max_history=100)
+
+
+class TestImportFixRound1(unittest.TestCase):
+    """Fix round 1: composite import risks that the first nine cases did not establish."""
+
+    TABLES = ("plans", "resources", "capabilities", "imports", "requests", "events", "holds",
+              "resource_uses", "attempts", "store_hold_reasons", "steps")
+
+    def setUp(self):
+        self.reset()
+
+    def reset(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = directory
+        self.f = make_service(Path(directory.name))
+        self.p = self.f.create(steps=(step("setup"),))
+
+    # ----------------------------------------------------------------- helpers
+    def payload(self, source=None, *, claim=None, directory_id=None, known=None, provenance=None,
+                path="/synthetic/r1-source", inode=1000, writers="legacy publisher stopped"):
+        source = source if source is not None else active_legacy_snapshot()
+        info = self.f.service.read_service_info()
+        return {
+            "host_id": info.host_id,
+            "source_directory_id": directory_id,
+            "source_directory_claim": None if directory_id is not None else (claim or workspace(path, inode)),
+            "original_task_id": source["taskId"],
+            "original_snapshot": source,
+            "provenance": provenance or DocumentRef("legacy.json", None, None, "v1", None),
+            "writers_stopped": writers,
+            "known_contexts": known or {},
+        }
+
+    def do_import(self, payload, key=None):
+        return self.f.service.execute(self.f.command("import_plan", payload, key=key))
+
+    def rows(self, sql, *params):
+        return self.f.store.read(lambda db: tuple(db.execute(sql, params)))
+
+    def counts(self):
+        return self.f.store.read(lambda db: {
+            table: db.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in self.TABLES})
+
+    def attempt(self, receipt):
+        return self.f.service.read_plan(receipt.current_metadata.plan_id).coordination.attempts[0]
+
+    def holds(self, plan_id):
+        return [item.value for item in self.f.service.read_coordination(plan_id).items if item.kind == "hold"]
+
+    def import_known(self, path, inode, writes=True, **kwargs):
+        receipt = self.do_import(self.payload(
+            path=path, inode=inode, known={"step-1": known_claim(path + "-live", inode + 1, writes)}, **kwargs))
+        return receipt, self.attempt(receipt)
+
+    def resolve(self, receipt, attempt, resolution, next_state, *, stopped=(), attached=None,
+                replacement=None, assignee=None, key=None):
+        body = {"resolution": resolution, "reason": "r1 regression", "next_step_state": next_state,
+                "stopped_resource_ids": tuple(stopped), "replacement_assignee": assignee,
+                "replacement_context": replacement, "attached_context": attached}
+        return replace(self.f.command("resolve_attempt", body, receipt=receipt, key=key),
+                       attempt_id=attempt.attempt_id, attempt_version=attempt.version,
+                       definition_version=attempt.definition_version)
+
+    def reconciled_pair(self, name="r1-alias", inode=1100):
+        left = replace(workspace(f"/synthetic/{name}-left", inode), device=None, inode=None)
+        right = replace(left, canonical_path=f"/synthetic/{name}-right")
+        a, b = self.f.register(left, self.p), self.f.register(right, self.p)
+        self.f.service.execute(self.f.command("reconcile_resources", {
+            "resource_ids": (a, b), "canonical_claim": workspace(f"/synthetic/{name}-canonical", inode),
+            "reason": "host-attested physical equivalence"}, receipt=self.p))
+        return min(a, b), max(a, b)
+
+    def origin(self):
+        events = self.rows("SELECT payload FROM events WHERE kind='import_plan'")
+        self.assertEqual(len(events), 1)
+        return json.loads(events[0][0])
+
+    # -------------------------------------------------- P1 canonical source identity
+    def test_redirected_existing_source_commits_canonical_id_and_keeps_raw_provenance(self):
+        survivor, retired = self.reconciled_pair()
+        source = active_legacy_snapshot()
+        first = self.do_import(self.payload(source, directory_id=retired), key="r1-redirect")
+        self.assertEqual(first.committed["source_directory_id"], survivor)
+        self.assertEqual(self.rows("SELECT source_directory_id FROM imports"), ((retired,),))
+        host = self.f.service.read_service_info().host_id
+        expected = "legacy:" + hashlib.sha256(plans.canonical_bytes(
+            [host, retired, source["taskId"], source.get("generation"), source["scope"]["sinceRevision"]])).hexdigest()
+        plan = self.f.service.read_plan(first.current_metadata.plan_id)
+        self.assertEqual(plan.draft.authorization.interval, expected)
+        self.assertEqual(self.origin()["source_directory_id"], retired)
+        for ident, key in ((survivor, "r1-by-survivor"), (retired, "r1-by-retired")):
+            retry = self.do_import(self.payload(source, directory_id=ident), key=key)
+            self.assertEqual(retry.current_metadata.plan_id, first.current_metadata.plan_id)
+            self.assertEqual(retry.committed, first.committed)
+        self.assertEqual(self.rows("SELECT count(*) FROM imports"), ((1,),))
+
+    def test_source_rejections_leave_no_residue(self):
+        repo = self.f.register(replace(workspace("/synthetic/r1-repo", 1110), kind="repository"), self.p)
+        source = active_legacy_snapshot()
+        cases = {
+            "repository-kind": self.payload(source, directory_id=repo),
+            "unknown-id": self.payload(source, directory_id="no-such-resource"),
+            "irrelevant-known-key-with-new-claim": self.payload(
+                source, path="/synthetic/r1-new-claim", inode=1112,
+                known={"step-2": known_claim("/synthetic/r1-irrelevant", 1111)}),
+            "foreign-host-claim": self.payload(source, claim=replace(workspace("/synthetic/r1-foreign", 1113), host_id="other-host")),
+            "known-claim-conflicting-parent": self.payload(source, path="/synthetic/r1-parent", inode=1114, known={
+                "step-1": ExecutionContextClaims("repository", replace(workspace("/synthetic/r1-p-repo", 1115), kind="repository"),
+                                                  workspace("/synthetic/r1-p-ws", 1116, repository_id="not-the-parent"),
+                                                  False, (), True, None)}),
+        }
+        for name, payload in cases.items():
+            with self.subTest(name):
+                before = self.counts()
+                with self.assertRaises(DomainError):
+                    self.do_import(payload)
+                self.assertEqual(self.counts(), before)
+
+    def test_multiple_collapsed_mappings_are_ambiguous_even_for_one_plan(self):
+        survivor, retired = self.reconciled_pair("r1-collapse", 1120)
+        source = active_legacy_snapshot()
+        self.do_import(self.payload(source, directory_id=retired), key="r1-collapse-first")
+
+        def clone(db):
+            row = db.execute("SELECT host_id, original_task_id, plan_id, content_digest, created_at FROM imports").fetchone()
+            db.execute("INSERT INTO imports (import_id, host_id, source_directory_id, original_task_id, plan_id, "
+                       "content_digest, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       ("clone-import", row[0], survivor, row[1], row[2], row[3], row[4]))
+        self.f.store.write(clone)
+        before = self.counts()
+        with self.assertRaises(DomainError) as error:
+            self.do_import(self.payload(source, directory_id=survivor), key="r1-collapse-second")
+        self.assertEqual(error.exception.code, "handoff_conflict")
+        self.assertEqual(self.counts(), before)
+
+    # ------------------------------------------- P3/P6 obligations, holds, namespace
+    def test_each_imported_obligation_has_source_owned_stale_hold(self):
+        for known in (True, False):
+            with self.subTest(known=known):
+                self.reset()
+                if known:
+                    receipt, attempt = self.import_known("/synthetic/r1-hold-known", 1200)
+                else:
+                    receipt = self.do_import(self.payload(path="/synthetic/r1-hold-unknown", inode=1210))
+                    attempt = self.attempt(receipt)
+                kinds = sorted(hold.kind for hold in self.holds(receipt.current_metadata.plan_id))
+                self.assertEqual(kinds, ["stale"] if known else ["identity", "stale"])
+                stale = next(hold for hold in self.holds(receipt.current_metadata.plan_id) if hold.kind == "stale")
+                self.assertEqual(stale.step_id, "step-1")
+                self.assertEqual(self.f.service.read_service_info().store_hold, not known)
+                self.assertEqual(attempt.last_activity, "")
+                self.assertEqual(self.rows("SELECT started_at FROM attempts"), ((None,),))
+
+    def test_known_context_namespace_is_strict_and_unknown_is_not_invented(self):
+        receipt, attempt = self.import_known("/synthetic/r1-ns-known", 1220)
+        plan_id = receipt.current_metadata.plan_id
+        generation = receipt.current_metadata.generation
+        reopened = make_service(self.f.directory, self.f.clock)
+        for fixture in (self.f, reopened):
+            namespace, owned = fixture.store.read(lambda db: resources.execution_uses(db, plan_id, attempt.attempt_id))
+            self.assertIsNone(namespace["implementation"]["writer"])
+            self.assertEqual(namespace["groups"], {})
+            self.assertEqual(len(namespace["implementation"]["members"]), 1)
+            self.assertEqual(namespace["source"]["origin_epoch"], self.f.epoch)
+            self.assertEqual(namespace["source"]["origin_generation"], generation)
+        readonly, ro_attempt = self.import_known("/synthetic/r1-ns-readonly", 1230, writes=False)
+        namespace, _ = self.f.store.read(lambda db: resources.execution_uses(
+            db, readonly.current_metadata.plan_id, ro_attempt.attempt_id))
+        self.assertEqual(namespace["implementation"]["members"], [])
+        unknown = self.do_import(self.payload(path="/synthetic/r1-ns-unknown", inode=1240))
+        unknown_attempt = self.attempt(unknown)
+        with self.assertRaises(DomainError):
+            self.f.store.read(lambda db: resources.execution_uses(db, unknown.current_metadata.plan_id, unknown_attempt.attempt_id))
+        self.assertEqual(self.rows("SELECT json_extract(payload,'$.execution_uses') FROM attempts WHERE attempt_id=?",
+                                   unknown_attempt.attempt_id), ((None,),))
+        self.assertEqual(self.rows("SELECT count(*) FROM resource_uses WHERE attempt_id=?", unknown_attempt.attempt_id), ((0,),))
+
+    def test_import_time_cross_plan_conflict_rolls_back_every_record(self):
+        rid = self.f.register(workspace("/synthetic/r1-conflict-live", 1250), self.p)
+        self.f.service.execute(self.f.command("assign_step", {
+            "step_id": "setup", "assignee": "worker-b", "context": context(rid)}, receipt=self.p))
+        before = self.counts()
+        with self.assertRaises(DomainError) as error:
+            self.do_import(self.payload(path="/synthetic/r1-conflict-source", inode=1251,
+                                        known={"step-1": known_claim("/synthetic/r1-conflict-live", 1250)}))
+        self.assertEqual(error.exception.code, "resource_conflict")
+        self.assertEqual(self.counts(), before)
+
+    # --------------------------------------------------- P4 positive imported proof
+    def test_tampered_imported_origin_never_gains_tokenless_authority(self):
+        def duplicate_origin(db):
+            db.execute("INSERT INTO events (plan_id, plan_revision, kind, actor, published_at, payload) "
+                       "SELECT plan_id, plan_revision, kind, actor, published_at, payload FROM events WHERE kind='import_plan'")
+        tampers = {
+            "assignee-suffix": lambda db: db.execute("UPDATE attempts SET assignee = assignee || '-x'"),
+            "foreign-import-id": lambda db: db.execute(
+                "UPDATE attempts SET payload = json_set(payload, '$.import_source.import_id', 'foreign')"),
+            "origin-event-deleted": lambda db: db.execute("DELETE FROM events WHERE kind='import_plan'"),
+            "origin-event-duplicated": duplicate_origin,
+            "source-step-not-in-progress": lambda db: db.execute(
+                "UPDATE events SET payload = json_set(payload, '$.original_snapshot.steps[0].status', 'pending') WHERE kind='import_plan'"),
+            "constructor-attempt-swapped": lambda db: db.execute(
+                "UPDATE events SET payload = json_set(payload, '$.constructor_attempts.\"step-1\"', 'other') WHERE kind='import_plan'"),
+            "origin-epoch-relabelled": lambda db: db.execute(
+                "UPDATE attempts SET payload = json_set(payload, '$.epoch', 'other-epoch')"),
+            "native-capability-bound": lambda db: db.execute(
+                "UPDATE attempts SET assignee = 'worker-native'"),
+        }
+        for name, tamper in tampers.items():
+            with self.subTest(name):
+                self.reset()
+                receipt, attempt = self.import_known("/synthetic/r1-tamper", 1300)
+                self.f.store.write(tamper)
+                with self.assertRaises(DomainError):
+                    self.f.service.execute(self.resolve(receipt, attempt, "release", "blocked"))
+                self.assertEqual(self.rows("SELECT state, version FROM attempts"), (("stale", 1),))
+                self.assertEqual(self.rows("SELECT count(*) FROM capabilities WHERE role='attempt'"), ((0,),))
+
+    def test_origin_event_carries_version_context_and_constructor_lineage(self):
+        known, known_attempt = self.import_known("/synthetic/r1-origin-known", 1310)
+        origin = self.origin()
+        self.assertEqual(origin["v"], 1)
+        self.assertEqual(origin["constructor_attempts"], {"step-1": known_attempt.attempt_id})
+        self.assertEqual(origin["initial_contexts"]["step-1"]["writes"], True)
+        self.assertEqual(origin["plan_generation"], known.current_metadata.generation)
+        self.assertEqual(origin["provenance"]["path"], "legacy.json")
+        self.assertFalse(origin["authorization_note_missing"])
+        self.reset()
+        unknown = self.do_import(self.payload(path="/synthetic/r1-origin-unknown", inode=1320))
+        self.assertIsNone(self.origin()["initial_contexts"]["step-1"])
+        self.assertEqual(self.origin()["constructor_attempts"], {"step-1": self.attempt(unknown).attempt_id})
+
+    def test_definition_version_hashes_the_complete_original_step(self):
+        source = active_legacy_snapshot()
+        receipt = self.do_import(self.payload(source))
+        host = self.f.service.read_service_info().host_id
+        raw_dir = self.rows("SELECT source_directory_id FROM imports")[0][0]
+        stored = dict(self.rows("SELECT step_id, definition_version FROM steps WHERE plan_id=?", receipt.current_metadata.plan_id))
+        for original in source["steps"]:
+            expected = "legacy:" + hashlib.sha256(plans.canonical_bytes(
+                [host, raw_dir, source["taskId"], source.get("generation"), source["revision"], original])).hexdigest()
+            self.assertEqual(stored[original["id"]], expected)
+
+    def test_missing_authorization_note_is_explicit_and_not_fabricated(self):
+        # The validator permits a plan-only revision-1 opening that retains only a recoveryNote.
+        proposal = copy.deepcopy(legacy_proposal())
+        proposal["executionMode"] = "plan-only"
+        source = prepare_publication(
+            proposal, None, timestamp="2026-10-06T00:00:00Z", generation="00000000-0000-4000-8000-000000000001",
+            expected_revision=0, expected_generation=None, authorization_note="synthetic legacy authorization",
+            max_file_bytes=10 * 1024 * 1024, max_history=100)
+        source = copy.deepcopy(source)
+        entry = source["history"][0]
+        entry.pop("authorizationNote")
+        entry["recoveryNote"] = "recovery-only opening note"
+        receipt = self.do_import(self.payload(source))
+        origin = self.origin()
+        self.assertTrue(origin["authorization_note_missing"])
+        self.assertEqual(origin["original_snapshot"], json.loads(json.dumps(source)))
+        self.assertEqual(origin["original_snapshot"]["history"][0]["recoveryNote"], "recovery-only opening note")
+        plan = self.f.service.read_plan(receipt.current_metadata.plan_id)
+        self.assertEqual(plan.draft.authorization.note, "")
+        self.assertEqual(plan.draft.authorization.since_revision, 1)
+        self.assertEqual(receipt.committed_metadata.revision, 1)
+
+    # -------------------------------------------- P5 receipt linkage, private persistence
+    def test_corrupt_origin_receipt_fails_closed_without_residue(self):
+        def duplicate_origin(db):
+            db.execute("INSERT INTO events (plan_id, plan_revision, kind, actor, published_at, payload) "
+                       "SELECT plan_id, plan_revision, kind, actor, published_at, payload FROM events WHERE kind='import_plan'")
+        cases = {
+            "origin-payload-not-json": ("UPDATE events SET payload='not-json' WHERE kind='import_plan'", ()),
+            "origin-payload-array": ("UPDATE events SET payload='[]' WHERE kind='import_plan'", ()),
+            "origin-import-id-changed": ("UPDATE events SET payload=json_set(payload,'$.import_id','other') WHERE kind='import_plan'", ()),
+            "origin-digest-changed": ("UPDATE events SET payload=json_set(payload,'$.content_digest','0') WHERE kind='import_plan'", ()),
+            "origin-version-changed": ("UPDATE events SET payload=json_set(payload,'$.v',2) WHERE kind='import_plan'", ()),
+            "request-payload-malformed": ("UPDATE requests SET response_payload='{}' WHERE key='r1-origin'", ()),
+            "request-digest-changed": ("UPDATE requests SET command_digest=? WHERE key='r1-origin'", ("0" * 64,)),
+        }
+        for name, (sql, params) in {**cases, "origin-event-duplicated": (None, None)}.items():
+            with self.subTest(name):
+                self.reset()
+                self.do_import(self.payload(), key="r1-origin")
+                if sql is None:
+                    self.f.store.write(duplicate_origin)
+                else:
+                    self.f.store.write(lambda db: db.execute(sql, params))
+                before = self.counts()
+                with self.assertRaises(DomainError):
+                    self.do_import(self.payload(), key=f"r1-retry-{name}")
+                self.assertEqual(self.counts(), before)
+
+    def test_only_original_request_row_keeps_private_grant(self):
+        first = self.do_import(self.payload(), key="r1-private-one")
+        token = first.private.orchestrator_token
+        second = self.do_import(self.payload(), key="r1-private-two")
+        self.assertEqual(second.private.orchestrator_token, token)
+        holders = self.rows("SELECT key FROM requests WHERE response_payload LIKE ?", "%" + token + "%")
+        self.assertEqual(holders, (("r1-private-one",),))
+        again = self.do_import(self.payload(), key="r1-private-two")
+        self.assertTrue(again.replayed)
+        self.assertEqual(again.private.orchestrator_token, token)
+        self.assertEqual(again.committed, first.committed)
+        self.f.service.execute(self.f.command("takeover", {
+            "expected_ownership_version": first.current_metadata.ownership_version, "reason": "r1 takeover"}, receipt=first))
+        for key in ("r1-private-one", "r1-private-two"):
+            fenced = self.do_import(self.payload(), key=key)
+            self.assertIsNone(fenced.private)
+            self.assertEqual(fenced.committed_metadata.revision, first.committed_metadata.revision)
+
+    def test_new_key_retry_ignores_changed_auxiliary_instructions(self):
+        first = self.do_import(self.payload(), key="r1-aux-one")
+        before = self.counts()
+        changed = self.payload(
+            directory_id=first.committed["source_directory_id"],
+            provenance=DocumentRef("other.json", "branch", "commit", "v9", "task"),
+            writers="a different handoff statement",
+            known={"step-1": known_claim("/synthetic/r1-aux-live", 1400)})
+        retry = self.do_import(changed, key="r1-aux-two")
+        after = self.counts()
+        self.assertEqual({k: v for k, v in after.items() if k != "requests"},
+                         {k: v for k, v in before.items() if k != "requests"})
+        self.assertEqual(after["requests"], before["requests"] + 1)
+        self.assertEqual(retry.committed, first.committed)
+        self.assertEqual(retry.private.orchestrator_token, first.private.orchestrator_token)
+        self.assertEqual(self.origin()["provenance"]["path"], "legacy.json")
+        self.assertEqual(self.origin()["writers_stopped"], "legacy publisher stopped")
+
+    def test_concurrent_duplicate_bootstrap_commits_one_import(self):
+        other = make_service(self.f.directory, self.f.clock)
+        source = active_legacy_snapshot()
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def run(name, fixture, key):
+            try:
+                command = fixture.command("import_plan", self.payload(source), key=key)
+                barrier.wait(timeout=20)
+                results[name] = fixture.service.execute(command)
+            except BaseException as error:  # reported by the assertions below
+                results[name] = error
+        threads = [threading.Thread(target=run, args=("a", self.f, "r1-race-a")),
+                   threading.Thread(target=run, args=("b", other, "r1-race-b"))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        for outcome in results.values():
+            self.assertNotIsInstance(outcome, BaseException, repr(outcome))
+        self.assertEqual(results["a"].current_metadata.plan_id, results["b"].current_metadata.plan_id)
+        self.assertEqual(results["a"].private.orchestrator_token, results["b"].private.orchestrator_token)
+        self.assertEqual(self.rows("SELECT count(*) FROM imports"), ((1,),))
+        self.assertEqual(self.rows("SELECT count(*) FROM events WHERE kind='import_plan'"), ((1,),))
+        imported = results["a"].current_metadata.plan_id
+        self.assertEqual(self.rows("SELECT count(*) FROM capabilities WHERE plan_id=? AND role='orchestrator'", imported), ((1,),))
+
+    # ------------------------------------------------------- P7 attachment lifecycle
+    def test_attach_replay_counts_one_decision_and_never_overwrites(self):
+        receipt = self.do_import(self.payload())
+        attempt = self.attempt(receipt)
+        command = self.resolve(receipt, attempt, "attach-context", "blocked",
+                               attached=known_claim("/synthetic/r1-attach-live", 1500), key="r1-attach")
+        first = self.f.service.execute(command)
+        again = self.f.service.execute(command)
+        self.assertTrue(again.replayed)
+        self.assertEqual(again.committed, first.committed)
+        self.assertEqual(first.committed_metadata.revision, receipt.committed_metadata.revision + 1)
+        self.assertEqual(self.rows("SELECT state, version, started_at FROM attempts"), (("stale", 2, None),))
+        self.assertEqual(self.attempt(receipt).last_activity, "")
+        self.assertEqual(self.rows("SELECT count(*) FROM capabilities WHERE role='attempt'"), ((0,),))
+        with self.assertRaises(DomainError):
+            self.f.service.execute(self.resolve(receipt, self.attempt(receipt), "attach-context", "blocked",
+                                                attached=known_claim("/synthetic/r1-attach-other", 1501)))
+        self.f.service.execute(self.f.command("takeover", {
+            "expected_ownership_version": receipt.current_metadata.ownership_version, "reason": "r1 takeover"}, receipt=receipt))
+        with self.assertRaises(DomainError) as error:
+            self.f.service.execute(command)
+        self.assertEqual(error.exception.code, "fenced")
+
+    def test_attach_conflict_rolls_back_atomically(self):
+        rid = self.f.register(workspace("/synthetic/r1-attach-busy", 1510), self.p)
+        self.f.service.execute(self.f.command("assign_step", {
+            "step_id": "setup", "assignee": "worker-b", "context": context(rid)}, receipt=self.p))
+        receipt = self.do_import(self.payload())
+        attempt = self.attempt(receipt)
+        before = self.counts()
+        with self.assertRaises(DomainError) as error:
+            self.f.service.execute(self.resolve(receipt, attempt, "attach-context", "blocked",
+                                                attached=known_claim("/synthetic/r1-attach-busy", 1510)))
+        self.assertEqual(error.exception.code, "resource_conflict")
+        self.assertEqual(self.counts(), before)
+        self.assertTrue(self.f.service.read_service_info().store_hold)
+
+    def test_attachment_clears_only_its_own_identity_reason(self):
+        first = self.do_import(self.payload(path="/synthetic/r1-sel-a", inode=1520), key="r1-sel-a")
+        second = self.do_import(self.payload(path="/synthetic/r1-sel-b", inode=1530), key="r1-sel-b")
+        self.assertEqual(self.rows("SELECT count(*) FROM store_hold_reasons WHERE resolved=0"), ((2,),))
+        self.f.service.execute(self.resolve(first, self.attempt(first), "attach-context", "blocked",
+                                            attached=known_claim("/synthetic/r1-sel-a-live", 1521)))
+        self.assertEqual(self.rows("SELECT count(*) FROM store_hold_reasons WHERE resolved=0"), ((1,),))
+        self.assertTrue(self.f.service.read_service_info().store_hold)
+        self.assertEqual(sorted(h.kind for h in self.holds(first.current_metadata.plan_id)), ["stale"])
+        self.assertEqual(sorted(h.kind for h in self.holds(second.current_metadata.plan_id)), ["identity", "stale"])
+        self.f.service.execute(self.resolve(second, self.attempt(second), "attach-context", "blocked",
+                                            attached=known_claim("/synthetic/r1-sel-b-live", 1531)))
+        self.assertFalse(self.f.service.read_service_info().store_hold)
+
+    # ------------------------------------------- P10 real imported terminal integration
+    def test_known_imported_terminal_resolutions_stay_tokenless_and_blocking(self):
+        for name, resolution, next_state in (("release", "release", "blocked"), ("reject", "reject", "blocked"),
+                                             ("retire", "release", "retired")):
+            with self.subTest(name):
+                self.reset()
+                receipt, attempt = self.import_known(
+                    f"/synthetic/r1-term-{name}", 1600,
+                    source=independent_legacy_snapshot() if name == "retire" else None)
+                plan_id = receipt.current_metadata.plan_id
+                self.assertEqual([h.kind for h in self.holds(plan_id)], ["stale"])
+                self.f.service.execute(self.resolve(receipt, attempt, resolution, next_state))
+                self.assertEqual(self.rows("SELECT state, version FROM attempts"),
+                                 (("rejected" if resolution == "reject" else "released", 2),))
+                self.assertEqual(self.rows("SELECT count(*) FROM capabilities WHERE role='attempt'"), ((0,),))
+                self.assertEqual(self.rows("SELECT DISTINCT status FROM resource_uses WHERE plan_id=?", plan_id), (("unresolved",),))
+                self.assertEqual(self.rows("SELECT state FROM steps WHERE plan_id=? AND step_id='step-1'", plan_id), ((next_state,),))
+                self.assertEqual(self.holds(plan_id), [])
+                live = self.f.register(workspace(f"/synthetic/r1-term-{name}-live", 1601), self.p)
+                with self.assertRaises(DomainError) as error:
+                    self.f.service.execute(self.f.command("assign_step", {
+                        "step_id": "setup", "assignee": "worker-c", "context": context(live)}, receipt=self.p))
+                self.assertEqual(error.exception.code, "resource_conflict")
+
+    def test_physical_release_requires_complete_stopped_proof(self):
+        receipt, attempt = self.import_known("/synthetic/r1-stop", 1700)
+        wid = self.rows("SELECT resource_id FROM resource_uses")[0][0]
+        before = self.counts()
+        with self.assertRaises(DomainError):
+            self.f.service.execute(self.resolve(receipt, attempt, "release", "blocked", stopped=("no-such-resource",)))
+        self.assertEqual(self.counts(), before)
+        self.f.service.execute(self.resolve(receipt, attempt, "release", "blocked", stopped=(wid,)))
+        self.assertEqual(self.rows("SELECT DISTINCT status FROM resource_uses"), (("released",),))
+
+    def test_replacement_conflict_rolls_back_and_stopped_proof_enables_it(self):
+        receipt, attempt = self.import_known("/synthetic/r1-rep", 1800)
+        wid = self.rows("SELECT resource_id FROM resource_uses")[0][0]
+        before = self.counts()
+        with self.assertRaises(DomainError) as error:
+            self.f.service.execute(self.resolve(receipt, attempt, "replace", "pending", assignee="new-worker",
+                                                replacement=context(wid)))
+        self.assertEqual(error.exception.code, "resource_conflict")
+        self.assertEqual(self.counts(), before)
+        replaced = self.f.service.execute(self.resolve(receipt, attempt, "replace", "pending", assignee="new-worker",
+                                                       replacement=context(wid), stopped=(wid,), key="r1-rep-key"))
+        self.assertIsNotNone(replaced.private.attempt_token)
+        self.assertEqual(self.rows("SELECT count(*) FROM capabilities WHERE role='attempt'"), ((1,),))
+        self.assertEqual(self.rows("SELECT state FROM attempts WHERE attempt_id=?", attempt.attempt_id), (("released",),))
+        retry = self.do_import(self.payload(path="/synthetic/r1-rep", inode=1800), key="r1-rep-retry")
+        self.assertEqual(retry.private.orchestrator_token, receipt.private.orchestrator_token)
+
+    # ------------------------------------------------- historical completion is strict
+    def test_completed_legacy_step_does_not_fabricate_accepted_output(self):
+        proposal = copy.deepcopy(legacy_proposal())
+        proposal["steps"][0]["status"] = "complete"
+        proposal["steps"][0]["evidence"] = ["historical completion note"]
+        proposal["nextStepId"] = "step-2"
+        source = prepare_publication(
+            proposal, None, timestamp="2026-10-06T00:00:00Z", generation="00000000-0000-4000-8000-000000000001",
+            expected_revision=0, expected_generation=None, authorization_note="synthetic legacy authorization",
+            max_file_bytes=10 * 1024 * 1024, max_history=100)
+        receipt = self.do_import(self.payload(source))
+        plan_id = receipt.current_metadata.plan_id
+        self.assertEqual(self.rows("SELECT count(*) FROM attempts WHERE plan_id=?", plan_id), ((0,),))
+        self.assertEqual(self.rows("SELECT count(*) FROM result_versions WHERE plan_id=?", plan_id), ((0,),))
+        try:
+            attempt = self.f.assign(receipt, step_id="step-2")
+        except DomainError:
+            self.assertEqual(self.rows("SELECT count(*) FROM attempts WHERE plan_id=?", plan_id), ((0,),))
+            return
+        with self.assertRaises(DomainError):
+            self.f.start(receipt, attempt)
+        self.assertEqual(self.rows("SELECT state FROM attempts WHERE plan_id=?", plan_id), (("assigned",),))
+
+    # ------------------------------------------------------------ P2 typed MCP route
+    def test_typed_mcp_import_route_and_wire_contract(self):
+        from adaptive_planning.transport import ImportPlanInput, build_mcp
+        server = build_mcp(self.f.service)
+        raw = plans.to_jsonable(self.f.command("import_plan", self.payload(
+            known={"step-1": known_claim("/synthetic/r1-mcp-live", 1900)}), key="r1-mcp"))
+
+        async def call(arguments):
+            try:
+                result = await server.call_tool("import_plan", {"command": arguments})
+            except Exception:
+                return None
+            return None if result.is_error else result
+
+        before = self.counts()
+        mutations = {
+            "missing provenance": lambda p: p.pop("provenance"),
+            "null provenance": lambda p: p.__setitem__("provenance", None),
+            "missing source id": lambda p: p.pop("source_directory_id"),
+            "missing source claim": lambda p: p.pop("source_directory_claim"),
+            "missing known contexts": lambda p: p.pop("known_contexts"),
+            "unknown nested field": lambda p: p["known_contexts"]["step-1"].__setitem__("surprise", 1),
+            "malformed nested claim": lambda p: p["known_contexts"]["step-1"]["workspace_claim"].pop("host_id"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name):
+                arguments = copy.deepcopy(raw)
+                mutate(arguments["payload"])
+                self.assertIsNone(asyncio.run(call(arguments)))
+                self.assertEqual(self.counts(), before)
+        model = ImportPlanInput.model_validate(copy.deepcopy(raw))
+        self.assertNotIsInstance(model.payload.provenance, dict)
+        self.assertNotIn("/synthetic/r1-mcp-live", repr(model))
+        result = asyncio.run(call(raw))
+        self.assertIsNotNone(result)
+        self.assertTrue(result.structured_content["private"]["orchestrator_token"])
+        self.assertEqual(self.counts()["imports"], before["imports"] + 1)
+        nullable = copy.deepcopy(raw)
+        nullable["key"] = "r1-mcp-nullable"
+        nullable["payload"]["provenance"].update(branch=None, commit=None, task_id=None)
+        self.assertIsNotNone(asyncio.run(call(nullable)))
+
+    # ------------------------------------ P10 revise_plan(retire_steps) integration
+    def retire_command(self, receipt):
+        current = self.f.service.read_plan(receipt.current_metadata.plan_id).draft
+        return self.f.command("revise_plan", {
+            "draft": current, "reason": "r1 retire imported step", "authorization_change": None,
+            "retire_steps": (RetirementRequest("step-1", "r1 retire imported step"),)}, receipt=receipt)
+
+    def test_revise_plan_retires_known_imported_step_tokenless_and_clears_stale_hold(self):
+        receipt, attempt = self.import_known("/synthetic/r1-revise-known", 1800,
+                                             source=independent_legacy_snapshot())
+        plan_id = receipt.current_metadata.plan_id
+        self.assertEqual([h.kind for h in self.holds(plan_id)], ["stale"])
+        self.f.service.execute(self.retire_command(receipt))
+        self.assertEqual(self.rows("SELECT state, version FROM attempts"), (("released", 2),))
+        self.assertEqual(self.rows("SELECT count(*) FROM capabilities WHERE role='attempt'"), ((0,),))
+        self.assertEqual(self.rows("SELECT DISTINCT status FROM resource_uses WHERE plan_id=?", plan_id), (("unresolved",),))
+        self.assertEqual(self.rows("SELECT state FROM steps WHERE plan_id=? AND step_id='step-1'", plan_id), (("retired",),))
+        self.assertEqual(self.holds(plan_id), [])
+        live = self.f.register(workspace("/synthetic/r1-revise-known-live", 1801), self.p)
+        with self.assertRaises(DomainError) as error:
+            self.f.service.execute(self.f.command("assign_step", {
+                "step_id": "setup", "assignee": "worker-c", "context": context(live)}, receipt=self.p))
+        self.assertEqual(error.exception.code, "resource_conflict")
+
+    def test_revise_plan_cannot_retire_unknown_context_imported_step(self):
+        receipt = self.do_import(self.payload(source=independent_legacy_snapshot()))
+        before = self.counts()
+        with self.assertRaises(DomainError) as error:
+            self.f.service.execute(self.retire_command(receipt))
+        self.assertEqual(error.exception.code, "held")
+        self.assertEqual(self.counts(), before)
+        self.assertEqual(self.rows("SELECT state, version FROM attempts"), (("stale", 1),))
+        self.assertTrue(self.f.service.read_service_info().store_hold)
+
+    def test_retiring_imported_step_with_live_dependent_is_rejected_without_residue(self):
+        receipt, _ = self.import_known("/synthetic/r1-revise-dependent", 1810)
+        before = self.counts()
+        with self.assertRaises(DomainError):
+            self.f.service.execute(self.retire_command(receipt))
+        self.assertEqual(self.counts(), before)
+        self.assertEqual(self.rows("SELECT state, version FROM attempts"), (("stale", 1),))
 
 
 if __name__ == "__main__":

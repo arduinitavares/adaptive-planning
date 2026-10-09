@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime
+import hashlib
 import json
 import re
 import sqlite3
@@ -184,42 +185,135 @@ def swept_target(connection, plan, command):
     return row, data, step, marker
 
 
-def is_imported_attempt(connection: sqlite3.Connection, plan_id: PlanId, attempt_id: AttemptId) -> bool:
-    row = connection.execute(
-        "SELECT step_id, assignee, state, version, definition_version, payload FROM attempts WHERE plan_id=? AND attempt_id=?",
-        (plan_id, attempt_id),
-    ).fetchone()
+def legacy_definition_version(host_id, source_directory_id, task_id, generation, revision, step) -> str:
+    """Deterministic frozen-definition version over the complete original step and its source key."""
+    return "legacy:" + hashlib.sha256(plans.canonical_bytes(
+        [host_id, source_directory_id, task_id, generation, revision, step])).hexdigest()
+
+
+_ORIGIN_FIELDS = {"v", "import_id", "plan_id", "plan_generation", "request_epoch", "request_key", "command_digest",
+                  "host_id", "source_directory_id", "committed_source_directory_id", "original_task_id",
+                  "content_digest", "original_snapshot", "provenance", "writers_stopped", "authorization_renewed",
+                  "authorization_note_missing", "initial_contexts", "constructor_attempts"}
+
+
+def origin_link(connection: sqlite3.Connection, plan_id: PlanId) -> dict:
+    """The one validated immutable v1 origin of an imported plan; anything ambiguous or corrupt fails closed."""
+    links = connection.execute(
+        "SELECT import_id, host_id, source_directory_id, original_task_id, content_digest FROM imports WHERE plan_id=?",
+        (plan_id,)).fetchall()
+    events = connection.execute(
+        "SELECT sequence, payload FROM events WHERE plan_id=? AND kind='import_plan'", (plan_id,)).fetchall()
+    if len(links) != 1 or len(events) != 1:
+        raise DomainError("invalid", "The imported plan has no unique origin link")
+    origin = resources._json_object(events[0][1], "import origin event")
+    link = links[0]
+    if (set(origin) != _ORIGIN_FIELDS or origin["v"] != 1 or origin["plan_id"] != plan_id
+            or (origin["import_id"], origin["host_id"], origin["source_directory_id"],
+                origin["original_task_id"], origin["content_digest"]) != tuple(link)
+            or not isinstance(origin["request_epoch"], str) or not isinstance(origin["request_key"], str)
+            or not isinstance(origin["command_digest"], str) or not isinstance(origin["plan_generation"], str)
+            or not isinstance(origin["original_snapshot"], dict) or not isinstance(origin["initial_contexts"], dict)
+            or not isinstance(origin["constructor_attempts"], dict)):
+        raise DomainError("invalid", "The import origin event contradicts its immutable import map")
+    return origin
+
+
+def clear_imported_stale(connection: sqlite3.Connection, data: dict) -> None:
+    """Logical terminal ownership ended: clear only this obligation's own stale plan hold."""
+    source = data.get("import_source")
+    hold_id = source.get("stale_hold_id") if isinstance(source, dict) else None
+    if isinstance(hold_id, str):
+        checkpoints._clear_holds(connection, [hold_id])
+
+
+def _imported_proof(connection, plan_id, attempt_id):
+    """Positive proof that this attempt is the exact constructor product of its unique v1 import origin."""
+    row = attempts._attempt_row(connection, plan_id, attempt_id)
     if row is None:
-        return False
-    step_id, assignee, state, version, def_ver, raw = row
-    if not assignee.startswith(f"legacy-unresolved:{step_id}"):
-        return False
+        raise DomainError("not_found", "The attempt does not exist in this plan")
+    step_id, assignee, state, version, definition_version, started_at, raw = row[1:]
+    data = resources._json_object(raw, "imported attempt")
+    origin = origin_link(connection, plan_id)
+    source = data.get("import_source")
+    if (assignee != f"legacy-unresolved:{step_id}" or state not in ("stale", "released", "rejected")
+            or started_at is not None or data.get("started_at") is not None
+            or data.get("recovery_required") is not True or data.get("prior_state") != "active"
+            or "stale_source" in data or not isinstance(source, dict)
+            or set(source) != {"source", "import_id", "step_id", "stale_hold_id"}
+            or source["import_id"] != origin["import_id"] or source["source"] != f"import:{origin['import_id']}"
+            or source["step_id"] != step_id or not isinstance(source["stale_hold_id"], str)):
+        raise DomainError("invalid", "The attempt is not an unresolved imported obligation")
+    if (origin["constructor_attempts"].get(step_id) != attempt_id
+            or data.get("epoch") != origin["request_epoch"] or data.get("generation") != origin["plan_generation"]):
+        raise DomainError("invalid", "The attempt is not the immutable constructor product of its origin")
+    snapshot = origin["original_snapshot"]
+    original = next((item for item in snapshot.get("steps", []) if isinstance(item, dict) and item.get("id") == step_id), None)
+    if original is None or original.get("status") != "in-progress":
+        raise DomainError("invalid", "The origin source step was not in progress")
+    plan = plans._load_plan(connection, plan_id)
+    node = next((item for item in plan.steps if item.step_id == step_id), None)
+    expected = legacy_definition_version(origin["host_id"], origin["source_directory_id"], origin["original_task_id"],
+                                         snapshot.get("generation"), snapshot.get("revision", 0), original)
+    if (node is None or data.get("definition") != node.definition or definition_version != expected
+            or node.definition.get("definition_version") != expected):
+        raise DomainError("invalid", "The attempt definition contradicts its mapped origin step")
+    if connection.execute("SELECT count(*) FROM capabilities WHERE plan_id=? AND json_valid(payload) AND "
+                          "json_extract(payload, '$.attempt_id')=?", (plan_id, attempt_id)).fetchone()[0] != 0:
+        raise DomainError("invalid", "An imported obligation never carries a worker capability")
+    initial = origin["initial_contexts"].get(step_id)
+    attached = []
+    for (event_raw,) in connection.execute("SELECT payload FROM events WHERE plan_id=? AND kind='resolve_attempt'", (plan_id,)):
+        event = resources._json_object(event_raw, "attachment event")
+        if event.get("attempt_id") == attempt_id and event.get("resolution") == "attach-context":
+            attached.append(event)
+    context = data.get("context")
+    if initial is not None:
+        if context != initial or attached:
+            raise DomainError("invalid", "The attempt context contradicts its origin lineage")
+    elif context is not None and (len(attached) != 1 or attached[0].get("attached_context") != context
+                                  or attached[0].get("before_version") != 1):
+        raise DomainError("invalid", "The attached context lacks one valid immutable lineage")
+    elif context is None and attached:
+        raise DomainError("invalid", "An attachment exists without an attached context")
+    if context is not None:
+        namespace, _ = resources.execution_uses(connection, plan_id, attempt_id)
+        if namespace["implementation"]["writer"] is not None or namespace["groups"]:
+            raise DomainError("invalid", "An imported cohort has unknown writer liveness and no verification roles")
+    return row, data, origin
+
+
+def is_imported_attempt(connection: sqlite3.Connection, plan_id: PlanId, attempt_id: AttemptId) -> bool:
+    """True only with full positive imported-origin proof on this connection; anything else fails closed."""
     try:
-        data = json.loads(raw)
-    except Exception:
-        return False
-    if not isinstance(data, dict):
-        return False
-    if data.get("recovery_required") is not True:
-        return False
-    import_source = data.get("import_source")
-    if not isinstance(import_source, dict):
-        return False
-    import_id = import_source.get("import_id")
-    if not import_id:
-        return False
-    imp_count = connection.execute(
-        "SELECT count(*) FROM imports WHERE import_id=? AND plan_id=?", (import_id, plan_id)
-    ).fetchone()[0]
-    if imp_count != 1:
-        return False
-    cap_count = connection.execute(
-        "SELECT count(*) FROM capabilities WHERE plan_id=? AND json_extract(payload, '$.attempt_id')=?",
-        (plan_id, attempt_id),
-    ).fetchone()[0]
-    if cap_count != 0:
+        _imported_proof(connection, plan_id, attempt_id)
+    except (DomainError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
         return False
     return True
+
+
+def _reserve_known_context(connection, plan_id, attempt_id, execution, ts):
+    """Register one known context's strict original cohort; every failure rolls back with the caller."""
+    row = attempts._attempt_row(connection, plan_id, attempt_id)
+    data = attempts._object(row[7], "imported attempt")
+    if execution.writes:
+        resource_ids = resources.resolve_context(connection, execution)
+        if resources.conflicting_uses(connection, resource_ids, execution.repository_exclusive):
+            raise DomainError("resource_conflict", "Writable execution overlaps another unresolved resource use")
+        for resource_id in resource_ids:
+            scope = connection.execute("SELECT kind FROM resources WHERE resource_id=?", (resource_id,)).fetchone()[0]
+            connection.execute(
+                "INSERT INTO resource_uses(use_id, resource_id, plan_id, attempt_id, scope, status, created_at) "
+                "VALUES(?, ?, ?, ?, ?, 'unresolved', ?)",
+                (str(uuid.uuid4()), resource_id, plan_id, attempt_id, scope, ts))
+    data["context"] = plans.to_jsonable(execution)
+    data.pop(resources._USE_NAMESPACE, None)
+    connection.execute("UPDATE attempts SET payload=? WHERE plan_id=? AND attempt_id=?",
+                       (json.dumps(data, sort_keys=True, ensure_ascii=False), plan_id, attempt_id))
+    # Decode the owned rows through the strict resource path, persist its namespace, then re-read the result.
+    namespace, _ = resources.execution_uses(connection, plan_id, attempt_id)
+    resources.save_execution_uses(connection, plan_id, attempt_id, namespace)
+    resources.execution_uses(connection, plan_id, attempt_id)
 
 
 def create_unresolved_attempt(
@@ -229,77 +323,43 @@ def create_unresolved_attempt(
     context: ExecutionContext | None,
     *,
     source: str,
+    attempt_id: AttemptId | None = None,
 ) -> AttemptId:
     plan = plans._load_plan(connection, plan_id)
     step = next((s for s in plan.steps if s.step_id == step_id), None)
     if step is None:
         raise DomainError("not_found", f"Step {step_id!r} not found in plan {plan_id!r}")
     epoch = plans._installation_epoch(connection)
-    attempt_id = str(uuid.uuid4())
+    attempt_id = attempt_id or str(uuid.uuid4())
     ts = plans._timestamp(plan.updated_at)
     assignee = f"legacy-unresolved:{step_id}"
-
-    import_id = source.split(":", 1)[1] if source.startswith("import:") else source
+    import_id = source[len("import:"):] if source.startswith("import:") else source
+    stale_hold_id = str(uuid.uuid4())
     payload = {
         "epoch": epoch,
         "generation": plan.generation,
         "definition": step.definition,
-        "context": plans.to_jsonable(context) if context is not None else None,
+        "context": None,
         "started_at": None,
         "last_activity": None,
         "recovery_required": True,
         "prior_state": "active",
-        "import_source": {
-            "source": source,
-            "import_id": import_id,
-            "step_id": step_id,
-        },
+        "import_source": {"source": source, "import_id": import_id, "step_id": step_id, "stale_hold_id": stale_hold_id},
     }
-
     connection.execute(
         "INSERT INTO attempts(plan_id, attempt_id, step_id, assignee, state, version, definition_version, started_at, stopped_at, payload) "
         "VALUES(?, ?, ?, ?, 'stale', 1, ?, NULL, NULL, ?)",
         (plan_id, attempt_id, step_id, assignee, step.definition["definition_version"],
          json.dumps(payload, sort_keys=True, ensure_ascii=False)),
     )
+    # Source-owned stale plan hold for every imported in-progress obligation, known context or not.
+    stale_reason = {"kind": "stale", "step_id": step_id, "source_id": f"{source}:{attempt_id}:stale",
+                    "reason": "Imported legacy in-progress obligation requires an explicit ownership decision"}
+    connection.execute("INSERT INTO holds(hold_id, plan_id, reason, active, created_at) VALUES (?, ?, ?, 1, ?)",
+                       (stale_hold_id, plan_id, json.dumps(stale_reason, sort_keys=True), ts))
 
     if context is not None:
-        if context.writes:
-            resource_ids = resources.resolve_context(connection, context)
-            conflicts = resources.conflicting_uses(connection, resource_ids, context.repository_exclusive)
-            if conflicts:
-                raise DomainError("resource_conflict", "Writable execution overlaps another unresolved resource use")
-            members = []
-            for resource_id in resource_ids:
-                scope = connection.execute("SELECT kind FROM resources WHERE resource_id=?", (resource_id,)).fetchone()[0]
-                use_id = str(uuid.uuid4())
-                connection.execute(
-                    "INSERT INTO resource_uses(use_id, resource_id, plan_id, attempt_id, scope, status, created_at) "
-                    "VALUES(?, ?, ?, ?, ?, 'unresolved', ?)",
-                    (use_id, resource_id, plan_id, attempt_id, scope, ts),
-                )
-                members.append({"use_id": use_id, "resource_id": resource_id, "scope": scope, "created_at": ts})
-            source_dict = {
-                "plan_id": plan_id,
-                "attempt_id": attempt_id,
-                "step_id": step_id,
-                "assignee": assignee,
-                "definition_version": step.definition["definition_version"],
-                "definition": step.definition,
-                "origin_epoch": epoch,
-                "origin_generation": plan.generation,
-            }
-            namespace = {
-                "v": 1,
-                "source": source_dict,
-                "implementation": {"members": members, "writer": None},
-                "groups": {},
-            }
-            payload[resources._USE_NAMESPACE] = namespace
-            connection.execute(
-                "UPDATE attempts SET payload = ? WHERE plan_id = ? AND attempt_id = ?",
-                (json.dumps(payload, sort_keys=True, ensure_ascii=False), plan_id, attempt_id),
-            )
+        _reserve_known_context(connection, plan_id, attempt_id, context, ts)
     else:
         hold_id = str(uuid.uuid4())
         details = json.dumps({"plan_id": plan_id, "attempt_id": attempt_id, "step_id": step_id, "source": source}, sort_keys=True)
@@ -341,59 +401,22 @@ def _attach_context(connection: sqlite3.Connection, plan, command: Command) -> M
     if data.get("context") is not None:
         raise DomainError("invalid", "Context is already attached to this attempt")
 
+    # The baseline is taken before registration, reservation or hold changes so the cross-revision
+    # validator compares against the genuinely previous state.
+    previous = plans.project_plan(connection, plan.plan_id)
     execution = resolve_context_claims(connection, payload["attached_context"])
-    now = plans._now()
     ts = plans._timestamp(plan.updated_at)
-    epoch = plans._installation_epoch(connection)
-    members = []
-    if execution.writes:
-        resource_ids = resources.resolve_context(connection, execution)
-        conflicts = resources.conflicting_uses(connection, resource_ids, execution.repository_exclusive)
-        if conflicts:
-            raise DomainError("resource_conflict", "Writable execution overlaps another unresolved resource use")
-        for resource_id in resource_ids:
-            scope = connection.execute("SELECT kind FROM resources WHERE resource_id=?", (resource_id,)).fetchone()[0]
-            use_id = str(uuid.uuid4())
-            connection.execute(
-                "INSERT INTO resource_uses(use_id, resource_id, plan_id, attempt_id, scope, status, created_at) "
-                "VALUES(?, ?, ?, ?, ?, 'unresolved', ?)",
-                (use_id, resource_id, plan.plan_id, row[0], scope, ts),
-            )
-            members.append({"use_id": use_id, "resource_id": resource_id, "scope": scope, "created_at": ts})
-        source_dict = {
-            "plan_id": plan.plan_id,
-            "attempt_id": row[0],
-            "step_id": row[1],
-            "assignee": row[2],
-            "definition_version": row[5],
-            "definition": data["definition"],
-            "origin_epoch": epoch,
-            "origin_generation": plan.generation,
-        }
-        namespace = {
-            "v": 1,
-            "source": source_dict,
-            "implementation": {"members": members, "writer": None},
-            "groups": {},
-        }
-        data[resources._USE_NAMESPACE] = namespace
-
+    _reserve_known_context(connection, plan.plan_id, row[0], execution, ts)
     version = row[4] + 1
-    data["context"] = plans.to_jsonable(execution)
-    connection.execute(
-        "UPDATE attempts SET version=?, payload=? WHERE plan_id=? AND attempt_id=?",
-        (version, json.dumps(data, sort_keys=True, ensure_ascii=False), plan.plan_id, row[0]),
-    )
+    connection.execute("UPDATE attempts SET version=? WHERE plan_id=? AND attempt_id=?", (version, plan.plan_id, row[0]))
 
     hold_id = data.get("identity_hold_id")
     if hold_id:
         connection.execute(
             "UPDATE store_hold_reasons SET resolved = 1 WHERE epoch = ? AND reason_id = ?",
-            (epoch, hold_id),
-        )
+            (plans._installation_epoch(connection), hold_id))
         checkpoints._clear_holds(connection, [hold_id])
 
-    previous = plans.project_plan(connection, plan.plan_id)
     revision = plan.revision + 1
     committed = {
         "attempt_id": row[0],
@@ -407,7 +430,6 @@ def _attach_context(connection: sqlite3.Connection, plan, command: Command) -> M
         "before_version": row[4],
         "reason": payload["reason"],
         "attached_context": plans.to_jsonable(execution),
-        "context": plans.to_jsonable(execution),
         "next_step_state": payload["next_step_state"],
     }
     checkpoints._event_limits(event)
@@ -523,7 +545,9 @@ def _resolve_logical(connection, plan, command):
         connection.execute("UPDATE steps SET state=? WHERE plan_id=? AND step_id=?",
                            (payload["next_step_state"], plan.plan_id, step.step_id))
         previous = plans._commit_projection(connection, plan.plan_id, previous)
-    if marker and "hold_id" in marker:
+    if imported:
+        clear_imported_stale(connection, data)
+    elif marker and "hold_id" in marker:
         checkpoints._clear_holds(connection, [marker["hold_id"]])
     previous = plans._commit_projection(connection, plan.plan_id, previous)
     assignment, assignment_event = None, None

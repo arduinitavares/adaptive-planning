@@ -205,17 +205,6 @@ class _ResourceClaimInput(_InputModel):
     external_identity: str | None = Field(repr=False)
 
 
-class _ImportPayload(_InputModel):
-    host_id: str
-    source_directory_id: str | None = None
-    source_directory_claim: _ResourceClaimInput | None = None
-    original_task_id: str
-    original_snapshot: dict[str, Any]
-    provenance: dict[str, Any] | None = None
-    writers_stopped: str
-    known_contexts: dict[str, Any] = Field(default_factory=dict)
-
-
 class _RegisterResourcePayload(_InputModel):
     claim: _ResourceClaimInput
 
@@ -234,6 +223,35 @@ class _ExecutionContextInput(_InputModel):
     external_ids: list[str]
     writes: bool
     checked_base: str | None
+
+
+class _ExecutionContextClaimsInput(_InputModel):
+    kind: Literal["repository", "non-repository", "external-only", "read-only"]
+    repository_claim: _ResourceClaimInput | None
+    workspace_claim: _ResourceClaimInput | None
+    repository_exclusive: bool
+    external_claims: list[_ResourceClaimInput]
+    writes: bool
+    checked_base: str | None
+
+
+class _DocumentRefInput(_InputModel):
+    path: str
+    branch: str | None
+    commit: str | None
+    version: str
+    task_id: str | None
+
+
+class _ImportPayload(_InputModel):
+    host_id: str
+    source_directory_id: str | None
+    source_directory_claim: _ResourceClaimInput | None
+    original_task_id: str
+    original_snapshot: dict[str, Any]
+    provenance: _DocumentRefInput
+    writers_stopped: str
+    known_contexts: dict[str, _ExecutionContextInput | _ExecutionContextClaimsInput]
 
 
 class _AssignStepPayload(_InputModel):
@@ -527,7 +545,8 @@ _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_field
                            *_CreatePayload.model_fields, *_ImportPayload.model_fields, *_RevisePayload.model_fields, *_TakeoverPayload.model_fields,
                            *_ResourceClaimInput.model_fields, *_RegisterResourcePayload.model_fields,
                            *_ReconcileResourcesPayload.model_fields,
-                           *_ExecutionContextInput.model_fields, *_AssignStepPayload.model_fields,
+                           *_ExecutionContextInput.model_fields, *_ExecutionContextClaimsInput.model_fields,
+                           *_DocumentRefInput.model_fields, *_AssignStepPayload.model_fields,
                            *_ArtifactInput.model_fields, *_EvidenceInput.model_fields, *_AvailabilityInput.model_fields,
                            *_AcceptStepPayload.model_fields,
                            *_BindAvailabilityPayload.model_fields, *_ActivityPayload.model_fields,

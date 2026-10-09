@@ -1,16 +1,15 @@
 """Explicit legacy authority handoff and recovery import."""
 from __future__ import annotations
 
-import copy
 from dataclasses import replace
 import hashlib
 import json
 import sqlite3
 import uuid
 
-from adaptive_planning import attempts, checkpoints, plans, recovery, resources
+from adaptive_planning import plans, recovery, resources
 from adaptive_planning.core import validate_published_snapshot, PlanValidationError
-from adaptive_planning.ownership import current_private, hash_token, issue_orchestrator
+from adaptive_planning.ownership import current_private, issue_orchestrator
 from adaptive_planning.types import (
     Authorization,
     Command,
@@ -19,16 +18,10 @@ from adaptive_planning.types import (
     ExecutionContext,
     ExecutionContextClaims,
     JSONValue,
-    Metadata,
     MutationReceipt,
     PlanDraft,
-    PlanId,
-    ResourceClaim,
     ResourceId,
     StepDefinition,
-    StepId,
-    _to_execution_context,
-    _to_resource_claim,
 )
 from typing import Any, Mapping
 
@@ -89,6 +82,59 @@ def resolve_context_claims(
     )
 
 
+def _source_root(registry: resources._Registry, resource_id: str, host_id: str) -> ResourceId:
+    """Canonical current-host workspace identity for a raw source directory reference."""
+    if resource_id not in registry.rows:
+        raise DomainError("not_found", f"Source directory resource {resource_id!r} not found")
+    root = registry.resolve(resource_id)
+    row = registry.rows[root]
+    if row.host_id != host_id or row.kind != "workspace":
+        raise DomainError("invalid", "Source directory resource must be a workspace kind on current host")
+    if not registry.supported_history(root):
+        raise DomainError("held", "The source directory identity requires reconciliation")
+    return root
+
+
+def _original_receipt(connection: sqlite3.Connection, plan_id: str, origin: dict):
+    """The immutable original bootstrap receipt linked by the validated origin; corruption fails closed."""
+    stored = connection.execute(
+        "SELECT response_payload, plan_id, command_digest FROM requests WHERE epoch = ? AND key = ?",
+        (origin["request_epoch"], origin["request_key"])).fetchone()
+    if stored is None:
+        raise DomainError("invalid", "Stored original request receipt is missing")
+    if stored[1] != plan_id or stored[2] != origin["command_digest"]:
+        raise DomainError("invalid", "Stored original request receipt is not linked to this import origin")
+    try:
+        committed, committed_metadata, private = plans.decode_response(stored[0])
+    except (ValueError, TypeError, KeyError, AttributeError):
+        raise DomainError("invalid", "Stored original request receipt is malformed") from None
+    if (not isinstance(committed, dict) or committed.get("source_directory_id") != origin["committed_source_directory_id"]
+            or committed_metadata.plan_id != plan_id or committed_metadata.epoch != origin["request_epoch"]
+            or private is None or not isinstance(private.orchestrator_token, str) or private.attempt_token is not None):
+        raise DomainError("invalid", "Stored original request receipt contradicts its import origin")
+    return committed, committed_metadata, private
+
+
+def stored_receipt(connection: sqlite3.Connection, command: Command, receipt: MutationReceipt) -> MutationReceipt:
+    """Only the first bootstrap request row may persist the original private grant."""
+    if command.kind != "import_plan" or receipt.private is None:
+        return receipt
+    origin = recovery.origin_link(connection, receipt.committed_metadata.plan_id)
+    if origin["request_epoch"] == command.epoch and origin["request_key"] == command.key:
+        return receipt
+    return replace(receipt, private=None)
+
+
+def import_replay(connection: sqlite3.Connection, command: Command, replayed: MutationReceipt) -> MutationReceipt:
+    """Disclose only the linked original grant, and only while it is still current."""
+    if command.kind != "import_plan":
+        return replayed
+    plan_id = replayed.committed_metadata.plan_id
+    origin = recovery.origin_link(connection, plan_id)
+    _, _, private = _original_receipt(connection, plan_id, origin)
+    return replace(replayed, private=current_private(connection, plan_id, private))
+
+
 def import_plan(connection: sqlite3.Connection, command: Command) -> MutationReceipt:
     """Import an authorized legacy plan with explicit publisher authority handoff."""
     epoch = plans._installation_epoch(connection)
@@ -105,6 +151,10 @@ def import_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
     s_dir_claim = payload["source_directory_claim"]
     if (s_dir_id is not None) == (s_dir_claim is not None):
         raise DomainError("invalid", "Import requires exactly one of source_directory_id or source_directory_claim")
+
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, DocumentRef):
+        raise DomainError("invalid", "Import requires a provenance document reference")
 
     writers_stopped = payload.get("writers_stopped")
     if not isinstance(writers_stopped, str) or not writers_stopped.strip():
@@ -133,7 +183,7 @@ def import_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
         raise DomainError("limit_exceeded", "Snapshot exceeds the 10MB limit")
     content_digest = hashlib.sha256(canonical_snapshot_bytes).hexdigest()
 
-    # Resolve source directory ID
+    # Resolve the raw source reference, then validate its canonical current-host workspace target.
     if s_dir_claim is not None:
         if s_dir_claim.kind != "workspace":
             raise DomainError("invalid", "Source directory claim must be workspace kind")
@@ -141,59 +191,33 @@ def import_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
             raise DomainError("invalid", "Source directory claim host_id does not match installation")
         if s_dir_claim.device is None or s_dir_claim.inode is None:
             raise DomainError("invalid", "New source directory claim requires physical device and inode")
-        resolved_dir_id = resources.register_claim(connection, s_dir_claim)
+        raw_dir_id = resources.register_claim(connection, s_dir_claim)
     else:
-        row = connection.execute("SELECT host_id, kind FROM resources WHERE resource_id = ?", (s_dir_id,)).fetchone()
-        if row is None:
-            raise DomainError("not_found", f"Source directory resource {s_dir_id!r} not found")
-        if row[0] != host_id or row[1] != "workspace":
-            raise DomainError("invalid", "Source directory resource must be a workspace kind on current host")
-        resolved_dir_id = s_dir_id
+        raw_dir_id = s_dir_id
 
-    canonical_dir_id = resources.resolve_resource_id(connection, resolved_dir_id)
+    registry = resources._Registry(connection)
+    canonical_dir_id = _source_root(registry, raw_dir_id, host_id)
 
-    # Check for existing imports matching (host, canonical_dir, original_task_id)
-    existing_rows = connection.execute(
-        "SELECT import_id, source_directory_id, plan_id, content_digest FROM imports WHERE host_id = ? AND original_task_id = ?",
-        (host_id, payload["original_task_id"]),
-    ).fetchall()
-
+    # Canonicalize both the incoming and every stored raw source; collapsed mappings are ambiguous.
     matching_imports = []
-    for r in existing_rows:
-        stored_canonical = resources.resolve_resource_id(connection, r[1])
-        if stored_canonical == canonical_dir_id:
-            matching_imports.append(r)
-
+    for candidate in connection.execute(
+            "SELECT import_id, source_directory_id, plan_id, content_digest FROM imports "
+            "WHERE host_id = ? AND original_task_id = ?", (host_id, payload["original_task_id"])).fetchall():
+        if registry.resolve(candidate[1]) == canonical_dir_id:
+            matching_imports.append(candidate)
     if len(matching_imports) > 1:
-        distinct_plans = {r[2] for r in matching_imports}
-        if len(distinct_plans) > 1:
-            raise DomainError("handoff_conflict", "Ambiguous multiple mappings collapsed to canonical key")
-
+        raise DomainError("handoff_conflict", "Ambiguous multiple mappings collapsed to canonical key")
     if matching_imports:
-        existing = matching_imports[0]
-        existing_plan_id, existing_digest = existing[2], existing[3]
+        existing_plan_id, existing_digest = matching_imports[0][2], matching_imports[0][3]
         if existing_digest != content_digest:
             raise DomainError("handoff_conflict", "Snapshot content has changed after handoff")
-
-        evt = connection.execute(
-            "SELECT sequence, payload FROM events WHERE plan_id = ? AND kind = 'import_plan'",
-            (existing_plan_id,),
-        ).fetchone()
-        if evt is None:
-            raise DomainError("invalid", "Missing origin import_plan event for existing imported plan")
-        origin_payload = json.loads(evt[1])
-        req_epoch = origin_payload.get("request_epoch")
-        req_key = origin_payload.get("request_key")
-        req_row = connection.execute(
-            "SELECT response_payload FROM requests WHERE epoch = ? AND key = ?",
-            (req_epoch, req_key),
-        ).fetchone()
-        if req_row is None:
-            raise DomainError("invalid", "Stored original request receipt is missing")
-        committed, committed_metadata, private = plans.decode_response(req_row[0])
+        origin = recovery.origin_link(connection, existing_plan_id)
+        if origin["import_id"] != matching_imports[0][0]:
+            raise DomainError("invalid", "The import map contradicts its origin event")
+        committed, committed_metadata, private = _original_receipt(connection, existing_plan_id, origin)
         current_meta = plans._metadata(connection, existing_plan_id)
-        current_grant = current_private(connection, existing_plan_id, private)
-        return MutationReceipt(committed, committed_metadata, current_meta, command.key == req_key, current_grant)
+        return MutationReceipt(committed, committed_metadata, current_meta, False,
+                               current_private(connection, existing_plan_id, private))
 
     # Validate known_contexts
     known_contexts = payload.get("known_contexts", {})
@@ -220,13 +244,14 @@ def import_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
     baseline = tuple(scope_info.get("baseline", ()))
     claimed = scope_info.get("claimed")
     interval = "legacy:" + hashlib.sha256(
-        plans.canonical_bytes([host_id, resolved_dir_id, original_snapshot["taskId"], original_snapshot.get("generation"), since_revision])
+        plans.canonical_bytes([host_id, raw_dir_id, original_snapshot["taskId"], original_snapshot.get("generation"), since_revision])
     ).hexdigest()
 
-    note = ""
+    # Only a retained source history note authorizes; otherwise the note stays empty and the origin says so.
+    note, note_found = "", False
     for entry in original_snapshot.get("history", []):
         if entry.get("revision") == since_revision and entry.get("authorizationNote"):
-            note = entry["authorizationNote"]
+            note, note_found = entry["authorizationNote"], True
             break
 
     authorization = Authorization(
@@ -242,9 +267,8 @@ def import_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
     step_defs: list[tuple[StepDefinition, dict[str, JSONValue], int]] = []
     for ordinal, s_dict in enumerate(original_snapshot.get("steps", [])):
         s_id = s_dict["id"]
-        def_ver = "legacy:" + hashlib.sha256(
-            plans.canonical_bytes([host_id, resolved_dir_id, payload["original_task_id"], original_snapshot.get("generation"), source_revision, s_id])
-        ).hexdigest()
+        def_ver = recovery.legacy_definition_version(
+            host_id, raw_dir_id, payload["original_task_id"], original_snapshot.get("generation"), source_revision, s_dict)
         s_def = StepDefinition(
             step_id=s_id,
             title=s_dict.get("title", ""),
@@ -279,7 +303,7 @@ def import_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
         next_check=next_check,
         authorization=authorization,
         steps=tuple(sd for sd, _, _ in step_defs),
-        documents=(payload["provenance"],) if payload.get("provenance") else (),
+        documents=(provenance,),
         workspace_refs=(),
         workflow=None,
         horizon=10,
@@ -311,27 +335,41 @@ def import_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
             (plan_id, s_def.step_id, s_def.title, s_state, s_def.definition_version, plans._step_payload(step_obj)),
         )
 
-    # In-progress unresolved attempts
+    # In-progress unresolved attempts: immutable constructor identities and original context lineage.
+    constructor_attempts: dict[str, str] = {}
+    initial_contexts: dict[str, JSONValue] = {}
     for s_def, s_dict, _ in step_defs:
         if s_dict.get("status") == "in-progress":
             raw_ctx = known_contexts.get(s_def.step_id)
             ctx = resolve_context_claims(connection, raw_ctx) if raw_ctx is not None else None
-            recovery.create_unresolved_attempt(connection, plan_id, s_def.step_id, ctx, source=f"import:{import_id}")
+            attempt_id = str(uuid.uuid4())
+            recovery.create_unresolved_attempt(
+                connection, plan_id, s_def.step_id, ctx, source=f"import:{import_id}", attempt_id=attempt_id)
+            constructor_attempts[s_def.step_id] = attempt_id
+            initial_contexts[s_def.step_id] = None if ctx is None else plans.to_jsonable(ctx)
 
     grant = issue_orchestrator(connection, plan_id, command.actor)
 
     event_payload = {
+        "v": 1,
         "import_id": import_id,
+        "plan_id": plan_id,
+        "plan_generation": generation,
         "request_epoch": command.epoch,
         "request_key": command.key,
+        "command_digest": plans.command_digest(command),
         "host_id": host_id,
-        "source_directory_id": resolved_dir_id,
+        "source_directory_id": raw_dir_id,
+        "committed_source_directory_id": canonical_dir_id,
         "original_task_id": payload["original_task_id"],
         "content_digest": content_digest,
         "original_snapshot": original_snapshot,
-        "provenance": plans.to_jsonable(payload["provenance"]),
+        "provenance": plans.to_jsonable(provenance),
         "writers_stopped": writers_stopped,
         "authorization_renewed": False,
+        "authorization_note_missing": not note_found,
+        "initial_contexts": initial_contexts,
+        "constructor_attempts": constructor_attempts,
     }
     if len(plans.canonical_bytes(event_payload)) > plans.MAX_FILE_BYTES:
         raise DomainError("limit_exceeded", "Import origin event exceeds 10MB limit")
@@ -340,9 +378,9 @@ def import_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
     connection.execute(
         "INSERT INTO imports (import_id, host_id, source_directory_id, original_task_id, plan_id, content_digest, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (import_id, host_id, resolved_dir_id, payload["original_task_id"], plan_id, content_digest, ts),
+        (import_id, host_id, raw_dir_id, payload["original_task_id"], plan_id, content_digest, ts),
     )
 
     view = plans._commit_projection(connection, plan_id, None)
-    committed = {"source_directory_id": resolved_dir_id}
+    committed = {"source_directory_id": canonical_dir_id}
     return MutationReceipt(committed, view.metadata, view.metadata, False, grant)
