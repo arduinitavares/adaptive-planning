@@ -96,20 +96,79 @@ During Mac sleep or temporary Docker downtime:
 
 ### Deployment update and rollback
 
+Record the previous verified image ID before rebuilding the mutable `adaptive-planning:local` tag.
+Use the currently verified service container, rather than assuming the mutable tag
+still identifies it. Set `rollback_image` to an unused, installation-owned local
+tag, such as `adaptive-planning:rollback-update-id` (replace `update-id`), then:
+
+```sh
+verified_container=$(docker compose ps -q adaptive-planning)
+previous_image_id=$(docker inspect --format '{{.Image}}' "$verified_container")
+docker image tag "$previous_image_id" "$rollback_image"
+docker image inspect --format '{{.Id}}' "$rollback_image"
+```
+
+Save the previous image ID and rollback tag in the update record. Confirm that the
+tag's inspected ID equals the recorded container image ID before proceeding.
+Retain that image and tag until the update is accepted; do not prune them.
+
 To update the service deployment image:
-1. Rebuild the image: `docker compose build`.
+1. Rebuild the image: `docker compose build adaptive-planning`. Record its image ID
+   with `docker image inspect --format '{{.Id}}' adaptive-planning:local`.
 2. Stop the current container: `docker compose down`.
-3. Start with the updated image: `docker compose up -d`.
-4. The named volume `adaptive-planning-data` is preserved intact. Verify schema version,
+3. Start that local image: `docker compose up -d --no-build --pull never adaptive-planning`.
+4. Verify that the new container's inspected `.Image` equals the recorded new image ID.
+   The named volume `adaptive-planning-data` is preserved intact. Verify schema version,
    epoch, and plan continuity via `read_service_info` and the dashboard at `http://127.0.0.1:8790/`.
 
-If an updated image fails or introduces regressions, execute rollback:
-1. Stop the failing container: `docker compose down`.
-2. Revert to the previously verified image or commit in `compose.yaml` (or checkout).
-3. Start the previous service: `docker compose up -d`.
-4. If database corruption occurred or rollback requires restoring a backup snapshot, follow
-   the explicit administrative restore procedure using `adaptive_planning.admin restore`
-   with `--preserve-current` and recorded maintenance manifest recovery decisions.
+If an update regresses, stop the failing container with `docker compose down` and
+choose one of the following paths. Keep the installation's original Compose
+project and named volume; never add `-v` to `down`.
+
+Rollback using the retained verified image:
+1. Recheck that `docker image inspect --format '{{.Id}}' "$rollback_image"` equals
+   the saved previous image ID. Stop if the tag is absent or identifies another image.
+2. Create a private `rollback.compose.yaml` override selecting that exact retained tag:
+
+   ```yaml
+   services:
+     adaptive-planning:
+       image: adaptive-planning:rollback-update-id
+   ```
+
+3. Inspect `docker compose -f compose.yaml -f rollback.compose.yaml config`: the
+   selected image must be the retained tag and `/data` must still use
+   `adaptive-planning-data`. The base file's `build` stanza remains, so prevent
+   rebuilding or pulling when starting this image:
+   `docker compose -f compose.yaml -f rollback.compose.yaml up -d --no-build --pull never adaptive-planning`.
+   Keep using these same Compose files while this rollback image is selected.
+
+Rollback from a verified source checkout:
+1. Select the previous verified source commit in the installation checkout, then
+   explicitly rebuild it with `docker compose build adaptive-planning`. A checkout
+   followed only by `up` can reuse the regressed `adaptive-planning:local` image.
+2. Record the rebuilt image ID using
+   `docker image inspect --format '{{.Id}}' adaptive-planning:local`. Rebuilds may
+   differ from the retained image; qualify the rebuilt image against the platform
+   checks below rather than assume byte-identical output.
+3. Use the source checkout's base Compose file, without the retained-image override:
+   `docker compose up -d --no-build --pull never adaptive-planning`.
+
+After either rollback path:
+1. Obtain the container ID with `docker compose ps -q adaptive-planning`, including
+   the same `-f` options when using the override. Check
+   `docker inspect --format '{{.Image}}' "$service_container"` against the selected image ID
+   recorded for that path. Stop and investigate any mismatch before accepting rollback.
+2. Verify that `adaptive-planning-data` is still mounted at `/data`, and reread
+   schema version, epoch, and existing plan continuity through MCP and the dashboard.
+   Changing images does not undo database changes. If corruption or schema compatibility
+   requires a backup restore, use the explicit administrative restore procedure with
+   `adaptive_planning.admin restore`, `--preserve-current`, and recorded maintenance
+   manifest recovery decisions.
+
+Docker documents [tagging an image by ID](https://docs.docker.com/reference/cli/docker/image/tag/),
+[Compose override selection](https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/),
+and the [`up` build and pull controls](https://docs.docker.com/reference/cli/docker/compose/up/).
 
 ## Build inputs and platform verification
 

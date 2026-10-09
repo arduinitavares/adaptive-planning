@@ -78,6 +78,36 @@ class TestService(unittest.TestCase):
                 text,
             )
 
+        # A source checkout alone cannot roll back the mutable Compose image.
+        deployment = Path("docs/operations.md").read_text().split(
+            "### Deployment update and rollback\n", 1
+        )[1].split("\n## Build inputs and platform verification", 1)[0]
+        self.assertIn(
+            "Record the previous verified image ID before rebuilding the mutable `adaptive-planning:local` tag.",
+            deployment,
+        )
+        preservation = deployment.split("To update the service deployment image:", 1)[0]
+        self.assertIn("docker inspect --format '{{.Image}}'", preservation)
+        self.assertIn("docker image tag", preservation)
+        self.assertIn("docker image inspect --format '{{.Id}}'", preservation)
+        self.assertIn("Rollback using the retained verified image:", deployment)
+        self.assertIn("Rollback from a verified source checkout:", deployment)
+        retained, source = deployment.split("Rollback using the retained verified image:", 1)[1].split(
+            "Rollback from a verified source checkout:", 1
+        )
+        self.assertIn("image: adaptive-planning:rollback-", retained)
+        self.assertIn("config", retained)
+        self.assertIn("up -d --no-build --pull never adaptive-planning", retained)
+        self.assertIn("docker compose build adaptive-planning", source)
+        self.assertLess(
+            source.index("docker compose build adaptive-planning"),
+            source.index("up -d --no-build --pull never adaptive-planning"),
+        )
+        verification = source.split("After either rollback path:", 1)[1]
+        self.assertIn("docker inspect --format '{{.Image}}'", verification)
+        self.assertIn("selected image ID", verification)
+        self.assertIn("adaptive-planning-data", verification)
+
         # Synthetic outage walkthrough:
         # Assigned bounded worker finishes verification and retains unpublished evidence,
         # new assignments/dependents wait, same-key retry/reread/reconcile, no new server/canonical plan.
