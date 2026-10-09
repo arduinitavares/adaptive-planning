@@ -7,6 +7,7 @@ The service MCP endpoint is `http://127.0.0.1:8790/mcp`; the dashboard is
 This setup material retains Task 10 preparation. Task 20 source tests do not
 refresh installed versions, activate configuration or verify current CLI/VS Code
 environment handling; each actual surface still needs its own runtime evidence.
+Copilot entries remain stopped due to user-confirmed exhausted credits.
 
 ```json
 {
@@ -81,6 +82,59 @@ tools, plan ID, committed revision and dashboard observation. Record unavailable
 call capability or allowance as a gap. An official SDK equivalent is separate
 from installed Copilot acceptance.
 
+## Instruction contract, domain grants, and session lifecycle
+
+Copilot operates under the generic framework-neutral instruction contract:
+`publish/resume -> assign/start -> act/verify -> checkpoint/reassess -> resolve/review/accept -> eligible next work`.
+Workflow document references and phase metadata are optional; no specific Superpowers sequence is required.
+
+### Domain grants and session persistence
+
+Persist domain grants (orchestrator tokens, attempt tokens) only in explicitly
+private client/session working records outside service public views. Do not assume
+automatic client-session persistence across Copilot sessions or restarts. If a
+new session starts without a retained valid orchestrator grant, perform an explicit
+`takeover` with current generation and expected ownership version. Takeover re-establishes
+coordination authority but is not scope renewal; execution boundaries remain strictly
+governed by user instructions.
+
+### Resume and stale recovery sequence
+
+Ordinary resume reads events, unfinished ownership, holds, and reviews, and
+obtains an authorized owner `sweep_stale` before dispatch or recovery. A direct
+worker asks the owner to sweep. If its attempt is overdue, reread the latest version
+after the sweep, then the owner confirms ownership or an unfenced current worker
+publishes a recovery checkpoint.
+
+### Worktree isolation and resource declarations
+
+Isolate each assigned worker within its own worktree or directory and declare
+physical resource claims (repository, workspace, external) to avoid concurrent
+write conflicts. Workers must report observable activity at least every five
+minutes; attempts exceeding fifteen minutes of inactivity reach the default stale
+threshold. Owner sweep and explicit recovery are required. The service coordinates
+declared resources and capability fences; workers and operators enforce actual
+filesystem isolation and stops.
+
+### Missing-MCP worker relay and safe pause
+
+When a dispatched worker lacks direct MCP tools, an authorized relay submits
+`start_step`, `report_activity`, and `record_checkpoint` using both orchestrator
+and attempt grants. The relay faithfully preserves the worker's identity in
+`origin_worker` and the relay's identity in `relay`, and never invents checks or
+heartbeat signals. For review, `record_review` records the independent reviewer
+in `Review.reviewer` and the submitting actor as orchestrator; the `Review` DTO
+has no relay field. Safe pause relays record state truthfully without fabricating
+progress.
+
+### Outage policy
+
+If the MCP service or dashboard becomes unavailable during execution:
+- An assigned bounded worker finishes verification locally and retains unpublished evidence in its private working record.
+- New assignments and dependents wait.
+- Do not spawn a fallback server or create a new canonical plan. Report the last published revision as **LAST KNOWN**, offline/stale while the service is unavailable.
+- On recovery, reread service identity, events, ownership, and coordination before publishing retained evidence. Retain the original immutable command body and request key and retry that exact saved command without rebuilding metadata or payload. Reconcile epoch, generation, ownership, attempt version, and holds; fenced or stale commands need explicit owner recovery. Reread after publication or replay before dispatching work.
+
 ## Worker checkpoints and the remaining client gate
 
 The installation bearer authorizes MCP transport access, while the private owner
@@ -105,7 +159,9 @@ exact artifact and final checked base. Invalidation holds the producer and each
 affected consumer for explicit named remediation, with a post-invalidation
 review when required. Tools, reads and readiness do not renew scope or grant
 execution; `plan-only` still refuses assignment. The [worker gate](../operations.md#three-client-worker-checkpoint-gate)
-records the tested 24-tool catalog, five disabled future kinds and proof fields.
+records the current 29-tool source catalog (six reads and 23 mutations), with no
+disabled future kinds, and proof fields. The catalog has synthetic SDK evidence;
+genuine installed Copilot discovery and acceptance remain unverified.
 
 The Task 20 source checkpoint uses three synthetic official SDK clients per
 protocol, auto `2026-07-28` and legacy `2025-11-25`. `copilot-worker` is an actor

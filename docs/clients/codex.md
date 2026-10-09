@@ -59,6 +59,58 @@ does not provide a negotiated `protocolVersion` field. The public
 calls, but schema availability alone does not prove installed runtime dispatch,
 gating or inference-free behavior. Verify that route before using it for the gate.
 
+## Instruction contract, domain grants, and session lifecycle
+
+Codex operates under the generic framework-neutral instruction contract:
+`publish/resume -> assign/start -> act/verify -> checkpoint/reassess -> resolve/review/accept -> eligible next work`.
+Workflow document references and phase metadata are optional; no specific Superpowers sequence is required.
+
+### Domain grants and session persistence
+
+Persist domain grants (orchestrator tokens, attempt tokens) only in explicitly
+private client/session working records outside service public views. Do not
+assume automatic client-session persistence across Codex restarts or new sessions.
+If a new session begins without a retained valid orchestrator grant, perform an
+explicit `takeover` with the current generation and expected ownership version.
+Takeover establishes new coordination authority but is not scope renewal; execution
+boundaries remain strictly bounded by user instructions.
+
+### Resume and stale recovery sequence
+
+Ordinary session resume must read events, unfinished ownership, holds, and reviews,
+and obtain an authorized owner `sweep_stale` before dispatch or recovery. A direct
+worker asks the owner to sweep. If its attempt is overdue, reread the latest version
+after the sweep, then the owner confirms ownership or an unfenced current worker
+publishes a recovery checkpoint.
+
+### Worktree isolation and resource obligations
+
+Enforce strict worktree isolation for each worker and declare physical resource claims
+(repository, workspace, external) to avoid uncoordinated concurrent mutations. Workers
+must maintain observable activity at least every five minutes; attempts reaching
+fifteen minutes of inactivity reach the default stale threshold. Owner sweep and
+explicit recovery are required. The service coordinates declared resources and
+capability fences; workers and operators enforce actual filesystem isolation and stops.
+
+### Missing-MCP worker relay and safe pause
+
+When a dispatched worker lacks direct MCP tools, an authorized relay submits
+`start_step`, `report_activity`, and `record_checkpoint` using both orchestrator
+and attempt grants. The relay faithfully preserves the worker's identity in
+`origin_worker` and the relay's identity in `relay`, and never invents checks or
+heartbeat signals. For review, `record_review` records the original independent
+reviewer in `Review.reviewer` and the submitting actor as orchestrator; the `Review`
+DTO has no relay field. If work must pause, the relay records a safe pause without
+fabricating progress.
+
+### Outage policy
+
+If the MCP service or dashboard becomes unavailable during execution:
+- An assigned bounded worker finishes verification locally and retains unpublished evidence in its private working record.
+- New assignments and dependents wait.
+- Do not spawn a fallback server or create a new canonical plan. Report the last published revision as **LAST KNOWN**, offline/stale while the service is unavailable.
+- On recovery, reread service identity, events, ownership, and coordination before publishing retained evidence. Retain the original immutable command body and request key and retry that exact saved command without rebuilding metadata or payload. Reconcile epoch, generation, ownership, attempt version, and holds; fenced or stale commands need explicit owner recovery. Reread after publication or replay before dispatching work.
+
 ## Worker checkpoints and the remaining client gate
 
 The installation bearer authenticates MCP requests. A plan's private owner grant
@@ -85,7 +137,9 @@ consumers until their named remediation; required revalidation uses a current
 post-invalidation review. Resource identity reconciliation, visible tools and
 readiness do not grant execution or renew authorization. `plan-only` still
 refuses assignment. The [worker gate](../operations.md#three-client-worker-checkpoint-gate)
-lists the tested 24 tools and five disabled future operations.
+lists the current 29-tool source catalog (six reads and 23 mutations), with no
+disabled future kinds. That catalog has synthetic SDK evidence; genuine installed
+Codex discovery and worker acceptance remain unverified.
 
 Task 20 exercises three synthetic official SDK clients per negotiated protocol:
 auto `2026-07-28` and legacy `2025-11-25`. `codex-worker` is an actor label, not

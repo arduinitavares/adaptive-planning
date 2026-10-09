@@ -49,6 +49,57 @@ planning-only revision with a distinct fact, and expose that event through the
 same dashboard. Record the negotiated MCP protocol rather than assuming a
 version. An SDK session does not establish Antigravity acceptance.
 
+## Instruction contract, domain grants, and session lifecycle
+
+Antigravity executes under the generic framework-neutral instruction contract:
+`publish/resume -> assign/start -> act/verify -> checkpoint/reassess -> resolve/review/accept -> eligible next work`.
+Workflow document references and phase metadata are optional; no specific Superpowers sequence is required.
+
+### Domain grants and session persistence
+
+Persist domain grants (orchestrator tokens, attempt tokens) only in explicitly
+private client/session working records outside service public views. Do not assume
+automatic client-session persistence across Antigravity sessions or restarts.
+If a new session begins without a retained valid orchestrator grant, perform an
+explicit `takeover` specifying current generation and expected ownership version.
+Takeover re-establishes coordination authority but is not scope renewal; execution
+boundaries remain strictly governed by user instructions.
+
+### Resume and stale recovery sequence
+
+Ordinary resume reads events, unfinished ownership, holds, and reviews, and
+obtains an authorized owner `sweep_stale` before dispatch or recovery. A direct
+worker asks the owner to sweep. If its attempt is overdue, reread the latest version
+after the sweep, then the owner confirms ownership or an unfenced current worker
+publishes a recovery checkpoint.
+
+### Worktree isolation and resource declarations
+
+Isolate each assigned worker within its own worktree or directory and declare physical
+resource claims (repository, workspace, external) to avoid write conflicts. Workers
+must provide observable activity at least every five minutes; attempts exceeding
+fifteen minutes of inactivity reach the default stale threshold. Owner sweep and
+explicit recovery are required. The service coordinates declared resources and
+capability fences; workers and operators enforce actual filesystem isolation and stops.
+
+### Missing-MCP worker relay and safe pause
+
+When a dispatched worker lacks direct MCP tools, an authorized relay submits
+`start_step`, `report_activity`, and `record_checkpoint` using both orchestrator
+and attempt grants. The relay preserves the worker's identity in `origin_worker`
+and the relay's identity in `relay`, and never invents checks or heartbeat signals.
+For review, `record_review` records the independent reviewer in `Review.reviewer`
+and the submitting actor as orchestrator; the `Review` DTO has no relay field.
+Safe pause relays truthfully record state without fabricating completion.
+
+### Outage policy
+
+If the MCP service or dashboard becomes unavailable during execution:
+- An assigned bounded worker finishes verification locally and retains unpublished evidence in its private working record.
+- New assignments and dependents wait.
+- Do not spawn a fallback server or create a new canonical plan. Report the last published revision as **LAST KNOWN**, offline/stale while the service is unavailable.
+- On recovery, reread service identity, events, ownership, and coordination before publishing retained evidence. Retain the original immutable command body and request key and retry that exact saved command without rebuilding metadata or payload. Reconcile epoch, generation, ownership, attempt version, and holds; fenced or stale commands need explicit owner recovery. Reread after publication or replay before dispatching work.
+
 ## Worker checkpoints and the remaining client gate
 
 Keep the installation bearer separate from the private owner and attempt grants.
@@ -73,7 +124,10 @@ final checked base before start. Invalidation preserves accepted identities and
 holds each affected step until named remediation, including a post-invalidation
 review where required. Scope is not renewed by discovery, readiness or holds;
 `plan-only` still refuses execution. See the [worker gate](../operations.md#three-client-worker-checkpoint-gate)
-for the 24 tested tools, disabled future kinds and complete recording requirements.
+for the current 29-tool source catalog (six reads and 23 mutations), with no
+disabled future kinds, and complete recording requirements. The catalog has
+synthetic SDK evidence; genuine installed Antigravity discovery and acceptance
+remain unverified.
 
 The Task 20 source test uses three synthetic official SDK clients in each of auto
 `2026-07-28` and legacy `2025-11-25`; `agy-worker` does not show AGY or a Google

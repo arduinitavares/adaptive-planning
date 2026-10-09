@@ -70,6 +70,47 @@ shutdown, updates, or persistence checks: it removes the installation data.
 `unless-stopped` restarts the service after an unexpected exit or daemon restart;
 a deliberately stopped or removed service needs an explicit start.
 
+### Mac sleep and Docker availability
+
+On macOS hosts, Mac sleep can suspend Docker and make the endpoint unavailable.
+Retain the named volume `adaptive-planning-data` across wake and restart, then
+verify canonical state continuity once the endpoint is reachable.
+
+During Mac sleep or temporary Docker downtime:
+1. Active MCP requests fail with transport errors (connection refused or timeout).
+2. Assigned bounded workers that are already executing may finish their local verification
+   steps and retain unpublished evidence in their private client working records.
+3. Downstream dependent steps and new assignments must wait.
+4. Clients must not launch fallback servers or create competing local canonical plans.
+   Report the last published revision as **LAST KNOWN**, offline/stale until canonical
+   reads succeed again.
+5. Upon host wake, wait for Docker and the service to become available. An unexpectedly
+   exited service may restart under `restart: unless-stopped`; a deliberately stopped
+   service requires an explicit operator start.
+6. Once the endpoint is reachable, reread service identity, canonical events, ownership,
+   and paged coordination. Reconcile the epoch, generation, current attempt version, and
+   any holds before publishing retained evidence. Preserve the original immutable command
+   body and request key and retry that exact saved command without rebuilding metadata or
+   payload. A fenced or stale command requires explicit owner recovery; reread after
+   publication or exact replay before dispatching more work.
+
+### Deployment update and rollback
+
+To update the service deployment image:
+1. Rebuild the image: `docker compose build`.
+2. Stop the current container: `docker compose down`.
+3. Start with the updated image: `docker compose up -d`.
+4. The named volume `adaptive-planning-data` is preserved intact. Verify schema version,
+   epoch, and plan continuity via `read_service_info` and the dashboard at `http://127.0.0.1:8790/`.
+
+If an updated image fails or introduces regressions, execute rollback:
+1. Stop the failing container: `docker compose down`.
+2. Revert to the previously verified image or commit in `compose.yaml` (or checkout).
+3. Start the previous service: `docker compose up -d`.
+4. If database corruption occurred or rollback requires restoring a backup snapshot, follow
+   the explicit administrative restore procedure using `adaptive_planning.admin restore`
+   with `--preserve-current` and recorded maintenance manifest recovery decisions.
+
 ## Build inputs and platform verification
 
 The Python base is
@@ -396,18 +437,47 @@ Another regression proves that `plan-only` refuses assignment even when the
 worker tools are visible. Resource paths, identity declarations and stopped-use
 facts in these tests are synthetic; they certify no real host liveness.
 
-The tested catalog at this source checkpoint contains six reads:
+The current accepted Task 24 source catalog contains 29 tools, including six reads:
 `read_service_info`, `list_plans`, `read_plan`, `read_events`, `list_ready` and
-`read_coordination`. Eighteen mutations are enabled: `create_plan`, `revise_plan`,
+`read_coordination`. Twenty-three mutations are enabled: `create_plan`, `revise_plan`,
 `takeover`, `register_resource`, `reconcile_resources`, `assign_step`,
 `bind_availability`, `start_step`, `report_activity`, `record_checkpoint`,
 `resolve_reassessment`, `invalidate_result`, `resolve_invalidation`,
 `record_review`, `accept_step`, `reserve_verification`, `release_resource_use`
-and `reopen_attempt`. Five declared future kinds remain disabled: `import_plan`,
-`sweep_stale`, `resolve_attempt`, `append_late_evidence` and `resolve_store_hold`.
-Their appearance in the capability vocabulary is not tool availability.
+`reopen_attempt`, `import_plan`, `sweep_stale`, `resolve_attempt`,
+`append_late_evidence` and `resolve_store_hold`. No declared future kinds remain
+disabled at this checkpoint. The current interop suite expects all 29 tools and
+an empty disabled-kind set through synthetic SDK clients. This source/SDK evidence
+does not establish genuine installed-client tool discovery or worker acceptance;
+those gates remain open with zero actual client runs.
 
 ### Roles, checkpoints and reconciliation
+
+The service provides one generic framework-neutral instruction contract:
+`publish/resume -> assign/start -> act/verify -> checkpoint/reassess -> resolve/review/accept -> eligible next work`.
+Workflow document references and phase metadata are optional; no specific Superpowers sequence is required.
+
+The authoritative MCP service stores the canonical plan graph, step lifecycle,
+assignments, physical resource uses, audit events, and verifiable evidence references.
+Detailed design/implementation documents and temporary workflow notes remain distinct.
+Persist domain grants (orchestrator tokens, attempt tokens) only in explicitly private
+client/session working records outside service public views. Do not assume automatic
+client-session persistence across sessions or restarts. If no valid grant is retained
+in a new session, perform explicit `takeover` with current generation and expected ownership
+version. Takeover establishes new coordination authority but is not scope renewal.
+
+Ordinary session resume must read events, unfinished ownership, holds, and reviews,
+and obtain an authorized owner `sweep_stale` before dispatch or recovery. A direct
+worker asks the owner to sweep. If its attempt is overdue, reread the latest version
+after the sweep, then the owner confirms ownership or an unfenced current worker
+publishes a recovery checkpoint.
+
+Enforce worktree isolation for each assigned worker and declare physical resource claims
+(repository, workspace, external) to avoid uncoordinated concurrent mutations. Workers
+must maintain observable activity at least every five minutes; attempts reaching fifteen
+minutes of inactivity reach the default stale threshold. Owner sweep and explicit
+recovery are required. The service enforces declared resource coordination and
+capability fences, not filesystem permissions or termination of host processes.
 
 Every MCP request needs the installation bearer. It is separate from the private
 domain grants returned by creation/takeover and assignment. Public reads show
@@ -421,8 +491,11 @@ Direct `start_step`, `report_activity` and `record_checkpoint` use only the
 current attempt grant. Their actor and origin match the assignee, global
 `expected_revision` and `ownership_version` are null, and their own attempt ID,
 version and definition match the actual target. A relay requires both grants,
-current owner CAS and `relay` equal to the exact current owner actor. Takeover
-fences old owners and relays while leaving coherent direct worker grants alive.
+current owner CAS and `relay` equal to the exact current owner actor. Relays
+must faithfully preserve worker identity in `origin_worker` and relay identity
+in `relay`, and never invent checks, heartbeats, or activity signals. If work
+must pause, the relay records a safe pause without fabricating progress.
+Takeover fences old owners and relays while leaving coherent direct worker grants alive.
 Owner commands use current global revision/ownership and exact nonsecret target
 fields where required, without a worker token.
 
@@ -435,6 +508,12 @@ read canonical events and paged coordination to reconcile what committed before
 dispatching anything else. Resource identity reconciliation records identity;
 it neither proves stopped use nor renews scope or the first-step latch.
 
+During an outage or service unavailability:
+- An assigned bounded worker finishes verification and retains unpublished evidence locally in its private working record.
+- New assignments and dependents wait.
+- Do not spawn a fallback server or create a new canonical plan. Report the last published revision as **LAST KNOWN**, offline/stale while the service is unavailable.
+- On recovery, reread service identity, events, ownership, and coordination before publishing retained evidence. Retain the original immutable command body and request key and retry that exact saved command without rebuilding metadata or payload. Reconcile epoch, generation, ownership, attempt version, and holds; fenced or stale commands need explicit owner recovery. Reread after publication or replay before dispatching work.
+
 A finished checkpoint carries outcome/check, full `ArtifactRef`, meaningful
 artifact-bound evidence, origin/relay and reassessment. Its public
 `checkpoint_id` is the actual global checkpoint event sequence represented as
@@ -443,7 +522,9 @@ Material reassessment creates provisional holds that the current owner must
 classify explicitly. Acceptance requires the exact current attempt/version/
 definition, full submitted artifact, passing checkpoint evidence, current
 execution authorization and satisfied holds/prerequisites. A required review uses the
-latest original matching verdict and evidence; a final gate also requires
+latest original matching verdict and evidence recorded by an independent reviewer;
+the `Review` DTO has no relay field, and relayed reviews record the submitting actor
+as orchestrator and original reviewer in `Review.reviewer`. A final gate also requires
 review. Neither role may bypass that review.
 
 The owner supplies `accept_step.payload` with `step_id`, full `artifact`,
