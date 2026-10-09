@@ -108,8 +108,11 @@ def _original_receipt(connection: sqlite3.Connection, plan_id: str, origin: dict
         committed, committed_metadata, private = plans.decode_response(stored[0])
     except (ValueError, TypeError, KeyError, AttributeError):
         raise DomainError("invalid", "Stored original request receipt is malformed") from None
-    if (not isinstance(committed, dict) or committed.get("source_directory_id") != origin["committed_source_directory_id"]
+    if (committed != {"source_directory_id": origin["committed_source_directory_id"]}
             or committed_metadata.plan_id != plan_id or committed_metadata.epoch != origin["request_epoch"]
+            or committed_metadata.generation != origin["plan_generation"]
+            or committed_metadata.revision != origin["original_snapshot"].get("revision", 0)
+            or committed_metadata.ownership_version != 1
             or private is None or not isinstance(private.orchestrator_token, str) or private.attempt_token is not None):
         raise DomainError("invalid", "Stored original request receipt contradicts its import origin")
     return committed, committed_metadata, private
@@ -129,9 +132,21 @@ def import_replay(connection: sqlite3.Connection, command: Command, replayed: Mu
     """Disclose only the linked original grant, and only while it is still current."""
     if command.kind != "import_plan":
         return replayed
-    plan_id = replayed.committed_metadata.plan_id
+    # Bind the actual stored request row, never the untrusted decoded receipt, to the validated origin.
+    request = connection.execute("SELECT plan_id FROM requests WHERE epoch = ? AND key = ?",
+                                 (command.epoch, command.key)).fetchone()
+    if request is None:
+        raise DomainError("invalid", "The replayed request row is missing")
+    plan_id = request[0]
     origin = recovery.origin_link(connection, plan_id)
-    _, _, private = _original_receipt(connection, plan_id, origin)
+    committed, committed_metadata, private = _original_receipt(connection, plan_id, origin)
+    payload = command.payload
+    snapshot = payload.get("original_snapshot")
+    if (replayed.committed != committed or replayed.committed_metadata != committed_metadata
+            or replayed.current_metadata.plan_id != plan_id or payload.get("host_id") != origin["host_id"]
+            or payload.get("original_task_id") != origin["original_task_id"] or not isinstance(snapshot, (dict, Mapping))
+            or hashlib.sha256(plans.canonical_bytes(_unfreeze_json(snapshot))).hexdigest() != origin["content_digest"]):
+        raise DomainError("invalid", "The replayed import receipt contradicts its request row and import origin")
     return replace(replayed, private=current_private(connection, plan_id, private))
 
 
@@ -267,18 +282,8 @@ def import_plan(connection: sqlite3.Connection, command: Command) -> MutationRec
     step_defs: list[tuple[StepDefinition, dict[str, JSONValue], int]] = []
     for ordinal, s_dict in enumerate(original_snapshot.get("steps", [])):
         s_id = s_dict["id"]
-        def_ver = recovery.legacy_definition_version(
+        s_def = recovery.legacy_step_definition(
             host_id, raw_dir_id, payload["original_task_id"], original_snapshot.get("generation"), source_revision, s_dict)
-        s_def = StepDefinition(
-            step_id=s_id,
-            title=s_dict.get("title", ""),
-            dependencies=tuple(s_dict.get("dependsOn", ())),
-            completion_check=s_dict.get("check", ""),
-            document=None,
-            definition_version=def_ver,
-            review_required=False,
-            final_gate=False,
-        )
         step_defs.append((s_def, s_dict, ordinal))
 
     # Next check

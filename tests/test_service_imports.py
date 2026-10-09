@@ -10,16 +10,17 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
 import unittest
+from unittest import mock
 import uuid
 
-from adaptive_planning import plans, resources
+from adaptive_planning import plans, recovery, resources
 from adaptive_planning.core import prepare_publication
 from adaptive_planning.types import (
-    Command, DocumentRef, DomainError, ExecutionContext, ExecutionContextClaims,
+    Availability, Command, DocumentRef, DomainError, ExecutionContext, ExecutionContextClaims,
     JSONValue, ResourceClaim, ResourceId, RetirementRequest,
 )
 from tests.service_fixtures import (
-    context, draft, legacy_proposal, make_service, step, workspace,
+    checkpoint, context, draft, legacy_proposal, make_service, step, workspace,
 )
 
 
@@ -876,6 +877,7 @@ class TestImportFixRound1(unittest.TestCase):
     # ------------------------------------------------- historical completion is strict
     def test_completed_legacy_step_does_not_fabricate_accepted_output(self):
         proposal = copy.deepcopy(legacy_proposal())
+        proposal["executionMode"] = "complete-task"
         proposal["steps"][0]["status"] = "complete"
         proposal["steps"][0]["evidence"] = ["historical completion note"]
         proposal["nextStepId"] = "step-2"
@@ -887,14 +889,14 @@ class TestImportFixRound1(unittest.TestCase):
         plan_id = receipt.current_metadata.plan_id
         self.assertEqual(self.rows("SELECT count(*) FROM attempts WHERE plan_id=?", plan_id), ((0,),))
         self.assertEqual(self.rows("SELECT count(*) FROM result_versions WHERE plan_id=?", plan_id), ((0,),))
-        try:
-            attempt = self.f.assign(receipt, step_id="step-2")
-        except DomainError:
-            self.assertEqual(self.rows("SELECT count(*) FROM attempts WHERE plan_id=?", plan_id), ((0,),))
-            return
-        with self.assertRaises(DomainError):
-            self.f.start(receipt, attempt)
+        attempt = self.f.assign(receipt, step_id="step-2")
+        before = self.state()
+        guard = self.refused(self.f.command("start_step", {
+            "origin_worker": "worker-a", "relay": None, "observed_activity": "started"},
+            receipt=receipt, attempt=attempt), before)
+        self.assertEqual(guard.code, "invalid")
         self.assertEqual(self.rows("SELECT state FROM attempts WHERE plan_id=?", plan_id), (("assigned",),))
+        self.assertEqual(self.rows("SELECT count(*) FROM result_versions WHERE plan_id=?", plan_id), ((0,),))
 
     # ------------------------------------------------------------ P2 typed MCP route
     def test_typed_mcp_import_route_and_wire_contract(self):
@@ -979,6 +981,393 @@ class TestImportFixRound1(unittest.TestCase):
             self.f.service.execute(self.retire_command(receipt))
         self.assertEqual(self.counts(), before)
         self.assertEqual(self.rows("SELECT state, version FROM attempts"), (("stale", 1),))
+
+
+    # ================================================================ R2 helpers
+    STATE_TABLES = ("plans", "steps", "attempts", "resource_uses", "events", "holds", "store_hold_reasons",
+                    "capabilities", "imports", "resources", "requests", "result_versions")
+
+    def state(self):
+        """Per-table digest of every existing row; failures print digests only, never grants."""
+        return self.f.store.read(lambda db: {
+            table: hashlib.sha256(repr(tuple(db.execute(f"SELECT * FROM {table} ORDER BY rowid"))).encode()).hexdigest()
+            for table in self.STATE_TABLES})
+
+    def rewrite_json(self, table, column, where, params, mutate):
+        def run(db):
+            raw = db.execute(f"SELECT {column} FROM {table} WHERE {where}", params).fetchone()[0]
+            value = json.loads(raw)
+            mutate(value)
+            db.execute(f"UPDATE {table} SET {column}=? WHERE {where}", (json.dumps(value, sort_keys=True), *params))
+        self.f.store.write(run)
+
+    def is_imported(self, plan_id, attempt_id):
+        return self.f.store.read(lambda db: recovery.is_imported_attempt(db, plan_id, attempt_id))
+
+    def refused(self, command, before=None):
+        before = self.state() if before is None else before
+        with self.assertRaises(DomainError) as error:
+            self.f.service.execute(command)
+        self.assertEqual(self.state(), before)
+        return error.exception
+
+    def snapshot17(self):
+        source = None
+        generation = "00000000-0000-4000-8000-000000000001"
+        for revision in range(1, 18):
+            proposal = copy.deepcopy(legacy_proposal())
+            proposal["status"] = "running"
+            proposal["steps"][0]["status"] = "in-progress"
+            source = prepare_publication(
+                proposal, source, timestamp="2026-10-06T00:00:00Z", generation=generation,
+                expected_revision=revision - 1, expected_generation=None if revision == 1 else generation,
+                authorization_note="synthetic legacy authorization" if revision in (1, 12) else None,
+                max_file_bytes=10 * 1024 * 1024, max_history=100)
+        return source
+
+    def cohort(self, tag, base):
+        repository = replace(workspace(f"/synthetic/r2-{tag}-repo", base), kind="repository")
+        member = workspace(f"/synthetic/r2-{tag}-ws", base + 1)
+        external = ResourceClaim("synthetic-host", "external", None, None, None, False, None, f"r2-{tag}-ext")
+        return ExecutionContextClaims("repository", repository, member, True, (external,), True, None)
+
+    def import_cohort(self, tag, base):
+        receipt = self.do_import(self.payload(path=f"/synthetic/r2-{tag}-src", inode=base + 9,
+                                              known={"step-1": self.cohort(tag, base)}), key=f"r2-{tag}")
+        return receipt, self.attempt(receipt)
+
+    def live_accept(self, receipt, target, version="producer-v1"):
+        assigned = self.f.assign(receipt, target)
+        active = self.f.start(receipt, assigned)
+        value = checkpoint(artifact_version=version)
+        self.f.submit(receipt, active, value)
+        return self.f.accept(receipt, active, value), value
+
+    # ====================================== R2 item 6: bootstrap lifecycle and bounds
+    def test_import_bootstrap_lost_response_current_grant_only(self):
+        payload = self.payload()
+        command = self.f.command("import_plan", payload, key="r2-lost")
+        first = self.f.service.execute(command)
+        token = first.private.orchestrator_token
+        self.assertEqual(self.rows("SELECT key FROM requests WHERE response_payload LIKE ?", "%" + token + "%"), (("r2-lost",),))
+        error = self.refused(replace(command, epoch="r2-old-epoch"))
+        self.assertEqual(error.code, "stale_epoch")
+        again = self.f.service.execute(command)
+        self.assertTrue(again.replayed)
+        self.assertEqual(again.private.orchestrator_token, token)
+        self.assertEqual(again.current_metadata.plan_id, first.current_metadata.plan_id)
+        fresh_key = self.do_import(payload, key="r2-lost-new")
+        self.assertFalse(fresh_key.replayed)
+        self.assertEqual(fresh_key.private.orchestrator_token, token)
+        reopened = make_service(self.f.directory, self.f.clock)
+        self.assertEqual(reopened.service.execute(command).private.orchestrator_token, token)
+        self.assertEqual(self.rows("SELECT count(*) FROM imports"), ((1,),))
+        self.assertEqual(self.rows("SELECT key FROM requests WHERE response_payload LIKE ?", "%" + token + "%"), (("r2-lost",),))
+        reopened.service.execute(reopened.command("takeover", {
+            "expected_ownership_version": first.current_metadata.ownership_version,
+            "reason": "r2 explicit takeover"}, receipt=first))
+        self.assertIsNone(reopened.service.execute(command).private)
+        self.assertIsNone(reopened.service.execute(reopened.command("import_plan", payload, key="r2-lost-third")).private)
+
+    def test_import_origin_and_page_bounds_fail_closed_with_exact_rollback(self):
+        source = active_legacy_snapshot()
+        size = len(plans.canonical_bytes(source))
+        before = self.state()
+        with mock.patch.object(plans, "MAX_FILE_BYTES", size + 16):
+            with self.assertRaises(DomainError) as error:
+                self.do_import(self.payload(source), key="r2-origin-bound")
+        self.assertEqual(error.exception.code, "limit_exceeded")
+        self.assertEqual(self.state(), before)
+        with mock.patch.object(plans, "MAX_PAGE_BYTES", 64):
+            with self.assertRaises(DomainError) as error:
+                self.do_import(self.payload(source), key="r2-page-bound")
+        self.assertEqual(error.exception.code, "limit_exceeded")
+        self.assertEqual(self.state(), before)
+        self.assertEqual(self.rows("SELECT count(*) FROM imports"), ((0,),))
+        self.assertIsNotNone(self.do_import(self.payload(source), key="r2-bound-restored").private)
+
+    def test_native_attempt_without_live_capability_is_never_imported_authority(self):
+        for name, mutate in (("deleted", lambda db: db.execute("DELETE FROM capabilities WHERE role='attempt'")),
+                             ("revoked", lambda db: db.execute("UPDATE capabilities SET revoked=1 WHERE role='attempt'"))):
+            with self.subTest(name):
+                self.reset()
+                assigned = self.f.assign(self.p, "setup")
+                self.f.start(self.p, assigned)
+                plan_id, attempt_id = self.p.current_metadata.plan_id, assigned.committed["attempt_id"]
+                self.assertEqual(self.rows("SELECT count(*) FROM capabilities WHERE role='attempt'"), ((1,),))
+                self.f.store.write(mutate)
+                self.assertFalse(self.is_imported(plan_id, attempt_id))
+                if name == "deleted":
+                    current = self.f.service.read_plan(plan_id).draft
+                    error = self.refused(self.f.command("revise_plan", {
+                        "draft": current, "reason": "r2 native retire", "authorization_change": None,
+                        "retire_steps": (RetirementRequest("setup", "r2 native retire"),)}, receipt=self.p))
+                    self.assertEqual(error.code, "invalid")
+
+    def test_supported_existing_path_only_source_imports_with_its_own_identity(self):
+        path_only = replace(workspace("/synthetic/r2-pathonly", 1900), device=None, inode=None)
+        rid = self.f.register(path_only, self.p)
+        receipt = self.do_import(self.payload(directory_id=rid), key="r2-pathonly")
+        self.assertEqual(receipt.committed["source_directory_id"], rid)
+        self.assertEqual(self.rows("SELECT source_directory_id FROM imports"), ((rid,),))
+        self.assertEqual(self.origin()["committed_source_directory_id"], rid)
+
+    # ====================================== R2 item 6/11: cohort, authorization, continuation
+    def test_repository_exclusive_original_cohort_partial_and_full_stop(self):
+        receipt, attempt = self.import_cohort("coh", 100)
+        plan_id = receipt.current_metadata.plan_id
+        uses = self.rows("SELECT resource_id, scope FROM resource_uses WHERE plan_id=?", plan_id)
+        ids = {scope: rid for rid, scope in uses}
+        self.assertEqual(sorted(ids), ["external", "repository"])
+        namespace = self.f.store.read(lambda db: resources.execution_uses(db, plan_id, attempt.attempt_id))[0]
+        self.assertIsNone(namespace["implementation"]["writer"])
+        self.assertEqual(namespace["groups"], {})
+        self.assertEqual(len(namespace["implementation"]["members"]), 2)
+        rival = replace(context(None, repository_id=ids["repository"]), repository_exclusive=True)
+        error = self.refused(self.f.command("assign_step", {
+            "step_id": "setup", "assignee": "worker-b", "context": rival}, receipt=self.p))
+        self.assertEqual(error.code, "resource_conflict")
+        replacement = ExecutionContext("repository", ids["repository"], None, True, (), True, None)
+        before = self.state()
+        partial = self.refused(self.resolve(receipt, attempt, "replace", "pending", assignee="new-worker",
+                                            replacement=replacement, stopped=(ids["external"],)), before)
+        self.assertEqual(partial.code, "resource_conflict")
+        outsider = self.f.register(workspace("/synthetic/r2-outsider", 2999), self.p)
+        before = self.state()
+        self.refused(self.resolve(receipt, attempt, "replace", "pending", assignee="new-worker", replacement=replacement,
+                                  stopped=tuple(ids.values()) + (outsider,)), before)
+        self.refused(self.resolve(receipt, attempt, "replace", "pending", assignee="new-worker", replacement=replacement,
+                                  stopped=(outsider,)))
+        replaced = self.f.service.execute(self.resolve(receipt, attempt, "replace", "pending", assignee="new-worker",
+                                                       replacement=replacement, stopped=tuple(ids.values()), key="r2-full-stop"))
+        self.assertIsNotNone(replaced.private.attempt_token)
+        self.assertEqual(self.rows("SELECT DISTINCT status FROM resource_uses WHERE attempt_id=?", attempt.attempt_id),
+                         (("released",),))
+        self.assertEqual(self.rows("SELECT state FROM attempts WHERE attempt_id=?", attempt.attempt_id), (("released",),))
+
+    def test_revision_seventeen_authorization_survives_attachment_and_terminal_change(self):
+        source = self.snapshot17()
+        scope = source["scope"]
+        receipt = self.do_import(self.payload(source, path="/synthetic/r2-r17", inode=2200), key="r2-r17")
+        plan_id = receipt.current_metadata.plan_id
+
+        def authority():
+            view = self.f.service.read_plan(plan_id)
+            auth = view.draft.authorization
+            return (view.metadata.revision, auth, view.legacy_snapshot["scope"])
+        revision, auth, legacy_scope = authority()
+        self.assertEqual(revision, 17)
+        self.assertEqual((auth.mode, auth.since_revision, tuple(auth.baseline), auth.claimed, auth.note),
+                         (scope.get("mode", source["executionMode"]), scope["sinceRevision"],
+                          tuple(scope.get("baseline", ())), scope.get("claimed"), "synthetic legacy authorization"))
+        self.assertTrue(auth.interval.startswith("legacy:"))
+        self.f.service.execute(self.resolve(receipt, self.attempt(receipt), "attach-context", "blocked",
+                                            attached=known_claim("/synthetic/r2-r17-live", 2201)))
+        attached = authority()
+        self.assertEqual((attached[0], attached[1], attached[2]), (18, auth, legacy_scope))
+        self.f.service.execute(self.resolve(receipt, self.attempt(receipt), "release", "blocked"))
+        released = authority()
+        self.assertEqual((released[1], released[2]), (auth, legacy_scope))
+
+    def test_completed_legacy_step_continues_only_through_a_genuine_independent_producer(self):
+        proposal = copy.deepcopy(legacy_proposal())
+        proposal["executionMode"] = "complete-task"
+        proposal["steps"][0]["status"] = "complete"
+        proposal["steps"][0]["evidence"] = ["historical completion note"]
+        proposal["steps"].append({"id": "step-3", "title": "Independent validation", "status": "pending",
+                                  "dependsOn": [], "check": "Validation exits 0", "evidence": []})
+        proposal["steps"].append({"id": "step-4", "title": "Consume validation", "status": "pending",
+                                  "dependsOn": ["step-1"], "check": "Consumer exits 0", "evidence": []})
+        proposal["nextStepId"] = "step-2"
+        source = prepare_publication(
+            proposal, None, timestamp="2026-10-06T00:00:00Z", generation="00000000-0000-4000-8000-000000000001",
+            expected_revision=0, expected_generation=None, authorization_note="synthetic legacy authorization",
+            max_file_bytes=10 * 1024 * 1024, max_history=100)
+        receipt = self.do_import(self.payload(source), key="r2-hist")
+        plan_id = receipt.current_metadata.plan_id
+        self.assertEqual(self.rows("SELECT count(*) FROM result_versions WHERE plan_id=?", plan_id), ((0,),))
+        assigned = self.f.assign(receipt, step_id="step-2")
+        before = self.state()
+        guard = self.refused(self.f.command("start_step", {
+            "origin_worker": "worker-a", "relay": None, "observed_activity": "started"}, receipt=receipt, attempt=assigned), before)
+        self.assertEqual(guard.code, "invalid")
+        self.assertEqual(self.rows("SELECT state FROM attempts WHERE attempt_id=?", assigned.committed["attempt_id"]),
+                         (("assigned",),))
+        fabricated = Availability("step-1", "fabricated-result", "ancestor", "synthetic-consumer-base", None,
+                                  checkpoint().evidence[0])
+        self.refused(self.f.command("bind_availability", {
+            "bindings": (fabricated,), "checked_base": "synthetic-consumer-base"}, receipt=receipt, attempt=assigned))
+        producer, value = self.live_accept(receipt, "step-3")
+        current = self.f.service.read_plan(plan_id).draft
+        revised = replace(current, steps=tuple(
+            replace(s, dependencies=("step-3",), definition_version="v2") if s.step_id == "step-4" else s
+            for s in current.steps))
+        self.f.service.execute(self.f.command("revise_plan", {
+            "draft": revised, "reason": "r2 explicit dependency on the genuine producer",
+            "authorization_change": None, "retire_steps": ()}, receipt=receipt))
+        consumer = self.f.assign(receipt, "step-4")
+        self.f.service.execute(self.f.command("bind_availability", {
+            "bindings": (Availability("step-3", producer.committed["result_version"], "ancestor",
+                                      "synthetic-consumer-base", None, value.evidence[0]),),
+            "checked_base": "synthetic-consumer-base"}, receipt=receipt, attempt=consumer))
+        active = self.f.start(receipt, consumer)
+        done = checkpoint(artifact_version="consumer-v1")
+        self.f.submit(receipt, active, done)
+        self.f.accept(receipt, active, done)
+        view = self.f.service.read_plan(plan_id)
+        step_one = next(s for s in view.legacy_snapshot["steps"] if s["id"] == "step-1")
+        self.assertEqual((step_one["status"], step_one["evidence"]), ("complete", ["historical completion note"]))
+        self.assertEqual(sorted(view.coordination.result_versions), ["step-3", "step-4"])
+
+    # ====================================== R2 item 3 / B2: source-owned hold binding
+    def test_stale_hold_clearing_is_bound_to_the_exact_source_owned_row(self):
+        for name in ("foreign-hold-id", "altered-reason", "duplicated-hold", "missing-hold"):
+            with self.subTest(name):
+                self.reset()
+                first, attempt_a = self.import_known("/synthetic/r2-ha", 2400)
+                second, _ = self.import_known("/synthetic/r2-hb", 2410)
+                plan_a, plan_b = first.current_metadata.plan_id, second.current_metadata.plan_id
+                hold_a = self.rows("SELECT hold_id FROM holds WHERE plan_id=?", plan_a)[0][0]
+                hold_b = self.rows("SELECT hold_id FROM holds WHERE plan_id=?", plan_b)[0][0]
+                if name == "foreign-hold-id":
+                    self.rewrite_json("attempts", "payload", "attempt_id=?", (attempt_a.attempt_id,),
+                                      lambda data: data["import_source"].__setitem__("stale_hold_id", hold_b))
+                elif name == "altered-reason":
+                    self.rewrite_json("holds", "reason", "hold_id=?", (hold_a,),
+                                      lambda data: data.__setitem__("reason", "altered"))
+                elif name == "duplicated-hold":
+                    self.f.store.write(lambda db: db.execute(
+                        "INSERT INTO holds SELECT 'r2-dup-hold', plan_id, reason, active, created_at FROM holds WHERE hold_id=?",
+                        (hold_a,)))
+                else:
+                    self.f.store.write(lambda db: db.execute("DELETE FROM holds WHERE hold_id=?", (hold_a,)))
+                self.assertFalse(self.is_imported(plan_a, attempt_a.attempt_id))
+                self.refused(self.resolve(first, attempt_a, "release", "blocked"))
+                self.assertEqual(self.rows("SELECT active FROM holds WHERE hold_id=?", hold_b), ((1,),))
+
+    def test_identity_clearing_is_bound_to_the_exact_source_owned_reason(self):
+        for name in ("foreign-id", "altered-details", "resolved-while-unknown"):
+            with self.subTest(name):
+                self.reset()
+                first = self.do_import(self.payload(path="/synthetic/r2-ia", inode=2500), key="r2-ia")
+                second = self.do_import(self.payload(path="/synthetic/r2-ib", inode=2510), key="r2-ib")
+                attempt_a, attempt_b = self.attempt(first), self.attempt(second)
+                payload_of = lambda receipt: json.loads(self.rows(
+                    "SELECT payload FROM attempts WHERE plan_id=?", receipt.current_metadata.plan_id)[0][0])
+                reason_a, reason_b = payload_of(first)["identity_hold_id"], payload_of(second)["identity_hold_id"]
+                if name == "foreign-id":
+                    self.rewrite_json("attempts", "payload", "attempt_id=?", (attempt_a.attempt_id,),
+                                      lambda data: data.__setitem__("identity_hold_id", reason_b))
+                elif name == "altered-details":
+                    self.f.store.write(lambda db: db.execute(
+                        "UPDATE store_hold_reasons SET details=? WHERE reason_id=?",
+                        (json.dumps({"plan_id": "other"}), reason_a)))
+                else:
+                    self.f.store.write(lambda db: db.execute(
+                        "UPDATE store_hold_reasons SET resolved=1 WHERE reason_id=?", (reason_a,)))
+                self.refused(self.resolve(first, attempt_a, "attach-context", "blocked",
+                                          attached=known_claim(f"/synthetic/r2-ia-live-{name}", 2501)))
+                self.assertEqual(self.rows("SELECT resolved FROM store_hold_reasons WHERE reason_id=?", reason_b), ((0,),))
+                self.assertEqual(self.rows("SELECT active FROM holds WHERE hold_id=?", reason_b), ((1,),))
+
+    def test_terminal_history_must_stay_coherent_with_its_cleared_stale_hold(self):
+        receipt, attempt = self.import_known("/synthetic/r2-term", 2550)
+        plan_id = receipt.current_metadata.plan_id
+        hold = self.rows("SELECT hold_id FROM holds WHERE plan_id=?", plan_id)[0][0]
+        self.assertTrue(self.is_imported(plan_id, attempt.attempt_id))
+        self.f.service.execute(self.resolve(receipt, attempt, "release", "blocked"))
+        self.assertTrue(self.is_imported(plan_id, attempt.attempt_id))
+        self.f.store.write(lambda db: db.execute("UPDATE holds SET active=1 WHERE hold_id=?", (hold,)))
+        self.assertFalse(self.is_imported(plan_id, attempt.attempt_id))
+
+    # ====================================== R2 item 4: reconstructed immutable proof
+    def test_original_step_definition_is_reconstructed_not_compared_with_mutable_copies(self):
+        receipt, attempt = self.import_known("/synthetic/r2-def", 2600)
+        plan_id = receipt.current_metadata.plan_id
+
+        def retitle(value):
+            if isinstance(value, dict):
+                for key, item in list(value.items()):
+                    if key == "title" and item == "Set up database schema":
+                        value[key] = "tampered title"
+                    else:
+                        retitle(item)
+            elif isinstance(value, list):
+                for item in value:
+                    retitle(item)
+        self.rewrite_json("attempts", "payload", "attempt_id=?", (attempt.attempt_id,), retitle)
+        self.rewrite_json("steps", "payload", "plan_id=? AND step_id='step-1'", (plan_id,), retitle)
+        self.f.store.write(lambda db: db.execute(
+            "UPDATE steps SET title='tampered title' WHERE plan_id=? AND step_id='step-1'", (plan_id,)))
+        self.assertFalse(self.is_imported(plan_id, attempt.attempt_id))
+        self.refused(self.resolve(receipt, attempt, "release", "blocked"))
+
+    def test_attachment_lineage_must_name_this_attempt_step_definition_and_versions(self):
+        for number, (field, forged) in enumerate((("step_id", "other-step"), ("definition_version", "legacy:forged"),
+                                                  ("version", 9), ("attempt_id", "other-attempt"),
+                                                  ("before_version", 4))):
+            with self.subTest(field):
+                self.reset()
+                receipt = self.do_import(self.payload(), key=f"r2-al-{field}")
+                attempt = self.attempt(receipt)
+                plan_id = receipt.current_metadata.plan_id
+                self.f.service.execute(self.resolve(receipt, attempt, "attach-context", "blocked",
+                                                    attached=known_claim(f"/synthetic/r2-al-{field}", 2700 + number)))
+                self.rewrite_json("events", "payload", "kind='resolve_attempt' AND plan_id=?", (plan_id,),
+                                  lambda data: data.__setitem__(field, forged))
+                self.assertFalse(self.is_imported(plan_id, attempt.attempt_id))
+                self.refused(self.resolve(receipt, self.attempt(receipt), "release", "blocked"))
+
+    def test_origin_snapshot_digest_and_constructor_entries_are_recomputed(self):
+        mutations = {
+            "objective": lambda e: e["original_snapshot"].__setitem__("objective", "tampered objective"),
+            "missing-initial-context": lambda e: e["initial_contexts"].pop("step-1"),
+            "extra-constructor": lambda e: e["constructor_attempts"].__setitem__("ghost", "ghost-attempt"),
+            "extra-initial-context": lambda e: e["initial_contexts"].__setitem__("ghost", None),
+        }
+        for number, (name, mutate) in enumerate(mutations.items()):
+            with self.subTest(name):
+                self.reset()
+                first = self.do_import(self.payload(path=f"/synthetic/r2-od-{name}", inode=2800 + number), key=f"r2-od-{name}")
+                attempt = self.attempt(first)
+                self.rewrite_json("events", "payload", "kind='import_plan'", (), mutate)
+                self.refused(self.f.command("import_plan", self.payload(path=f"/synthetic/r2-od-{name}", inode=2800 + number),
+                                            key=f"r2-od-retry-{name}"))
+                self.refused(self.resolve(first, attempt, "attach-context", "blocked",
+                                          attached=known_claim(f"/synthetic/r2-od-live-{name}", 2850 + number)))
+
+    # ====================================== R2 item 5 / B1: original receipt and replay binding
+    def test_original_receipt_contradictions_fail_closed_without_disclosure(self):
+        cases = {
+            "revision": lambda r: replace(r, committed_metadata=replace(r.committed_metadata, revision=999)),
+            "ownership": lambda r: replace(r, committed_metadata=replace(r.committed_metadata, ownership_version=999)),
+            "generation": lambda r: replace(r, committed_metadata=replace(r.committed_metadata, generation="foreign-generation")),
+            "committed-shape": lambda r: replace(r, committed={**r.committed, "extra": "x"}),
+        }
+        for name, forge in cases.items():
+            with self.subTest(name):
+                self.reset()
+                first = self.do_import(self.payload(), key="r2-m-one")
+                forged = plans.encode_response(forge(first))
+                self.f.store.write(lambda db: db.execute(
+                    "UPDATE requests SET response_payload=? WHERE key='r2-m-one'", (forged,)))
+                self.refused(self.f.command("import_plan", self.payload(), key="r2-m-two"))
+                self.refused(self.f.command("import_plan", self.payload(), key="r2-m-one"))
+
+    def test_replayed_receipt_must_agree_with_request_row_and_origin(self):
+        first = self.do_import(self.payload(path="/synthetic/r2-fa", inode=2300), key="r2-fa")
+        second = self.do_import(self.payload(path="/synthetic/r2-fb", inode=2310), key="r2-fb")
+        dedup_command = self.f.command("import_plan", self.payload(path="/synthetic/r2-fa", inode=2300), key="r2-fa-dedup")
+        dedup = self.f.service.execute(dedup_command)
+        self.assertEqual(dedup.private.orchestrator_token, first.private.orchestrator_token)
+        self.assertEqual(self.f.service.execute(dedup_command).private.orchestrator_token, first.private.orchestrator_token)
+        swapped = plans.encode_response(replace(second, private=None))
+        self.f.store.write(lambda db: db.execute(
+            "UPDATE requests SET response_payload=? WHERE key='r2-fa-dedup'", (swapped,)))
+        self.refused(dedup_command)
+        self.assertEqual(self.f.service.execute(self.f.command(
+            "import_plan", self.payload(path="/synthetic/r2-fb", inode=2310), key="r2-fb-again")).private.orchestrator_token,
+            second.private.orchestrator_token)
 
 
 if __name__ == "__main__":

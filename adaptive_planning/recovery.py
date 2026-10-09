@@ -19,6 +19,7 @@ from adaptive_planning.types import (
     MutationReceipt,
     PlanId,
     RetirementRequest,
+    StepDefinition,
     StepId,
     _to_execution_context,
 )
@@ -191,6 +192,17 @@ def legacy_definition_version(host_id, source_directory_id, task_id, generation,
         [host_id, source_directory_id, task_id, generation, revision, step])).hexdigest()
 
 
+def legacy_step_definition(host_id, source_directory_id, task_id, generation, revision, step) -> StepDefinition:
+    """The one frozen definition the importer derives from an original legacy step; proof rebuilds it."""
+    return StepDefinition(
+        step_id=step["id"], title=step.get("title", ""), dependencies=tuple(step.get("dependsOn", ())),
+        completion_check=step.get("check", ""), document=None,
+        definition_version=legacy_definition_version(host_id, source_directory_id, task_id, generation, revision, step),
+        review_required=False, final_gate=False)
+
+
+_STALE_HOLD_REASON = "Imported legacy in-progress obligation requires an explicit ownership decision"
+_IDENTITY_HOLD_REASON = "Missing required execution identity requires explicit attachment"
 _ORIGIN_FIELDS = {"v", "import_id", "plan_id", "plan_generation", "request_epoch", "request_key", "command_digest",
                   "host_id", "source_directory_id", "committed_source_directory_id", "original_task_id",
                   "content_digest", "original_snapshot", "provenance", "writers_stopped", "authorization_renewed",
@@ -216,15 +228,57 @@ def origin_link(connection: sqlite3.Connection, plan_id: PlanId) -> dict:
             or not isinstance(origin["original_snapshot"], dict) or not isinstance(origin["initial_contexts"], dict)
             or not isinstance(origin["constructor_attempts"], dict)):
         raise DomainError("invalid", "The import origin event contradicts its immutable import map")
+    snapshot = origin["original_snapshot"]
+    steps = snapshot.get("steps")
+    revision = snapshot.get("revision", 0)
+    host = connection.execute("SELECT host_id FROM installation WHERE id = 1").fetchone()[0]
+    if (not isinstance(steps, list) or type(revision) is not int or snapshot.get("schemaVersion") != 2
+            or origin["host_id"] != host or snapshot.get("taskId") != origin["original_task_id"]
+            or hashlib.sha256(plans.canonical_bytes(snapshot)).hexdigest() != origin["content_digest"]):
+        raise DomainError("invalid", "The retained origin snapshot contradicts its recorded digest and source tuple")
+    in_progress = {item.get("id") for item in steps if isinstance(item, dict) and item.get("status") == "in-progress"}
+    if (set(origin["initial_contexts"]) != in_progress or set(origin["constructor_attempts"]) != in_progress
+            or not all(isinstance(value, str) for value in origin["constructor_attempts"].values())):
+        raise DomainError("invalid", "The origin constructor entries contradict the source in-progress steps")
     return origin
 
 
-def clear_imported_stale(connection: sqlite3.Connection, data: dict) -> None:
-    """Logical terminal ownership ended: clear only this obligation's own stale plan hold."""
-    source = data.get("import_source")
-    hold_id = source.get("stale_hold_id") if isinstance(source, dict) else None
-    if isinstance(hold_id, str):
-        checkpoints._clear_holds(connection, [hold_id])
+def _hold_json(raw):
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _bound_holds(connection, plan_id, attempt_id, step_id, state, data, origin, initial, context):
+    """Exact source-owned stale hold and (for an initially unknown context) identity reason/hold rows."""
+    source = data["import_source"]
+    stale_source = f"{source['source']}:{attempt_id}:stale"
+    stale_expected = {"kind": "stale", "step_id": step_id, "source_id": stale_source, "reason": _STALE_HOLD_REASON}
+    holds = connection.execute("SELECT hold_id, reason, active FROM holds WHERE plan_id=?", (plan_id,)).fetchall()
+    mine = [row for row in holds if (_hold_json(row[1]) or {}).get("source_id") == stale_source]
+    if (len(mine) != 1 or mine[0][0] != source["stale_hold_id"] or _hold_json(mine[0][1]) != stale_expected
+            or (mine[0][2] == 1) != (state == "stale") or mine[0][2] not in (0, 1)):
+        raise DomainError("invalid", "The stale hold is not this obligation's exact source-owned hold")
+    identity_id = data.get("identity_hold_id")
+    if initial is not None:
+        if identity_id is not None:
+            raise DomainError("invalid", "A known-context obligation has no identity hold")
+        return source["stale_hold_id"], None
+    identity_source = f"{source['source']}:{attempt_id}"
+    owned = [row for row in holds if (_hold_json(row[1]) or {}).get("source_id") == identity_source]
+    reason = connection.execute("SELECT epoch, kind, details, resolved FROM store_hold_reasons WHERE reason_id=?",
+                                (identity_id,)).fetchone() if isinstance(identity_id, str) else None
+    identity_expected = {"kind": "identity", "step_id": step_id, "source_id": identity_source, "hold_id": identity_id,
+                         "reason": _IDENTITY_HOLD_REASON}
+    details = {"plan_id": plan_id, "attempt_id": attempt_id, "step_id": step_id, "source": source["source"]}
+    unresolved = context is None
+    if (reason is None or len(owned) != 1 or owned[0][0] != identity_id or _hold_json(owned[0][1]) != identity_expected
+            or reason[0] != origin["request_epoch"] or reason[1] != "identity" or _hold_json(reason[2]) != details
+            or reason[3] != (0 if unresolved else 1) or owned[0][2] != (1 if unresolved else 0)):
+        raise DomainError("invalid", "The identity reason is not this obligation's exact source-owned reason")
+    return source["stale_hold_id"], identity_id
 
 
 def _imported_proof(connection, plan_id, attempt_id):
@@ -244,24 +298,25 @@ def _imported_proof(connection, plan_id, attempt_id):
             or source["import_id"] != origin["import_id"] or source["source"] != f"import:{origin['import_id']}"
             or source["step_id"] != step_id or not isinstance(source["stale_hold_id"], str)):
         raise DomainError("invalid", "The attempt is not an unresolved imported obligation")
-    if (origin["constructor_attempts"].get(step_id) != attempt_id
+    if (origin["constructor_attempts"].get(step_id) != attempt_id or step_id not in origin["initial_contexts"]
             or data.get("epoch") != origin["request_epoch"] or data.get("generation") != origin["plan_generation"]):
         raise DomainError("invalid", "The attempt is not the immutable constructor product of its origin")
     snapshot = origin["original_snapshot"]
-    original = next((item for item in snapshot.get("steps", []) if isinstance(item, dict) and item.get("id") == step_id), None)
+    original = next((item for item in snapshot["steps"] if isinstance(item, dict) and item.get("id") == step_id), None)
     if original is None or original.get("status") != "in-progress":
         raise DomainError("invalid", "The origin source step was not in progress")
     plan = plans._load_plan(connection, plan_id)
     node = next((item for item in plan.steps if item.step_id == step_id), None)
-    expected = legacy_definition_version(origin["host_id"], origin["source_directory_id"], origin["original_task_id"],
-                                         snapshot.get("generation"), snapshot.get("revision", 0), original)
-    if (node is None or data.get("definition") != node.definition or definition_version != expected
-            or node.definition.get("definition_version") != expected):
+    expected = plans.to_jsonable(legacy_step_definition(
+        origin["host_id"], origin["source_directory_id"], origin["original_task_id"],
+        snapshot.get("generation"), snapshot.get("revision", 0), original))
+    if (node is None or data.get("definition") != expected or definition_version != expected["definition_version"]
+            or node.definition != expected):
         raise DomainError("invalid", "The attempt definition contradicts its mapped origin step")
     if connection.execute("SELECT count(*) FROM capabilities WHERE plan_id=? AND json_valid(payload) AND "
                           "json_extract(payload, '$.attempt_id')=?", (plan_id, attempt_id)).fetchone()[0] != 0:
         raise DomainError("invalid", "An imported obligation never carries a worker capability")
-    initial = origin["initial_contexts"].get(step_id)
+    initial = origin["initial_contexts"][step_id]
     attached = []
     for (event_raw,) in connection.execute("SELECT payload FROM events WHERE plan_id=? AND kind='resolve_attempt'", (plan_id,)):
         event = resources._json_object(event_raw, "attachment event")
@@ -271,16 +326,30 @@ def _imported_proof(connection, plan_id, attempt_id):
     if initial is not None:
         if context != initial or attached:
             raise DomainError("invalid", "The attempt context contradicts its origin lineage")
-    elif context is not None and (len(attached) != 1 or attached[0].get("attached_context") != context
-                                  or attached[0].get("before_version") != 1):
-        raise DomainError("invalid", "The attached context lacks one valid immutable lineage")
-    elif context is None and attached:
+    elif context is not None:
+        event = attached[0] if len(attached) == 1 else None
+        if (event is None or set(event) != {"attempt_id", "step_id", "version", "definition_version", "resolution",
+                                            "before_version", "reason", "attached_context", "next_step_state"}
+                or event["step_id"] != step_id or event["definition_version"] != definition_version
+                or event["before_version"] != 1 or event["version"] != 2 or event["attached_context"] != context):
+            raise DomainError("invalid", "The attached context lacks one valid immutable lineage")
+    elif attached:
         raise DomainError("invalid", "An attachment exists without an attached context")
+    base = 2 if context is not None and initial is None else 1
+    if version != base + (0 if state == "stale" else 1):
+        raise DomainError("invalid", "The attempt version contradicts its immutable history")
     if context is not None:
         namespace, _ = resources.execution_uses(connection, plan_id, attempt_id)
         if namespace["implementation"]["writer"] is not None or namespace["groups"]:
             raise DomainError("invalid", "An imported cohort has unknown writer liveness and no verification roles")
-    return row, data, origin
+    holds = _bound_holds(connection, plan_id, attempt_id, step_id, state, data, origin, initial, context)
+    return row, data, origin, holds
+
+
+def clear_imported_stale(connection: sqlite3.Connection, plan_id: PlanId, attempt_id: AttemptId) -> None:
+    """Logical terminal ownership ended: clear only the proven source-owned stale hold of this obligation."""
+    _, _, _, (stale_id, _) = _imported_proof(connection, plan_id, attempt_id)
+    connection.execute("UPDATE holds SET active=0 WHERE hold_id=? AND plan_id=?", (stale_id, plan_id))
 
 
 def is_imported_attempt(connection: sqlite3.Connection, plan_id: PlanId, attempt_id: AttemptId) -> bool:
@@ -354,7 +423,7 @@ def create_unresolved_attempt(
     )
     # Source-owned stale plan hold for every imported in-progress obligation, known context or not.
     stale_reason = {"kind": "stale", "step_id": step_id, "source_id": f"{source}:{attempt_id}:stale",
-                    "reason": "Imported legacy in-progress obligation requires an explicit ownership decision"}
+                    "reason": _STALE_HOLD_REASON}
     connection.execute("INSERT INTO holds(hold_id, plan_id, reason, active, created_at) VALUES (?, ?, ?, 1, ?)",
                        (stale_hold_id, plan_id, json.dumps(stale_reason, sort_keys=True), ts))
 
@@ -372,7 +441,7 @@ def create_unresolved_attempt(
             "step_id": step_id,
             "source_id": f"{source}:{attempt_id}",
             "hold_id": hold_id,
-            "reason": "Missing required execution identity requires explicit attachment",
+            "reason": _IDENTITY_HOLD_REASON,
         }
         connection.execute(
             "INSERT INTO holds(hold_id, plan_id, reason, active, created_at) VALUES (?, ?, ?, 1, ?)",
@@ -394,8 +463,10 @@ def _attach_context(connection: sqlite3.Connection, plan, command: Command) -> M
             or payload["attached_context"] is None):
         raise DomainError("invalid", "Context attachment requires attached_context without replacement fields")
     row, data = _target(connection, plan, command)
-    if not is_imported_attempt(connection, plan.plan_id, command.attempt_id):
-        raise DomainError("unsupported", "Tokenless and restored origins require their producer recovery contract")
+    try:
+        _, _, _, (_, identity_id) = _imported_proof(connection, plan.plan_id, command.attempt_id)
+    except (DomainError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        raise DomainError("unsupported", "Tokenless and restored origins require their producer recovery contract") from None
     if row[3] != "stale":
         raise DomainError("stale", "Recovery requires ownership recorded stale")
     if data.get("context") is not None:
@@ -410,12 +481,12 @@ def _attach_context(connection: sqlite3.Connection, plan, command: Command) -> M
     version = row[4] + 1
     connection.execute("UPDATE attempts SET version=? WHERE plan_id=? AND attempt_id=?", (version, plan.plan_id, row[0]))
 
-    hold_id = data.get("identity_hold_id")
-    if hold_id:
-        connection.execute(
-            "UPDATE store_hold_reasons SET resolved = 1 WHERE epoch = ? AND reason_id = ?",
-            (plans._installation_epoch(connection), hold_id))
-        checkpoints._clear_holds(connection, [hold_id])
+    if identity_id is not None:
+        # Only the proven identity reason/hold of this exact obligation; the stale hold stays until a terminal decision.
+        if connection.execute("UPDATE store_hold_reasons SET resolved = 1 WHERE epoch = ? AND reason_id = ? AND resolved = 0",
+                              (plans._installation_epoch(connection), identity_id)).rowcount != 1:
+            raise DomainError("invalid", "The proven identity reason is no longer unresolved")
+        connection.execute("UPDATE holds SET active=0 WHERE hold_id=? AND plan_id=?", (identity_id, plan.plan_id))
 
     revision = plan.revision + 1
     committed = {
@@ -546,7 +617,7 @@ def _resolve_logical(connection, plan, command):
                            (payload["next_step_state"], plan.plan_id, step.step_id))
         previous = plans._commit_projection(connection, plan.plan_id, previous)
     if imported:
-        clear_imported_stale(connection, data)
+        clear_imported_stale(connection, plan.plan_id, row[0])
     elif marker and "hold_id" in marker:
         checkpoints._clear_holds(connection, [marker["hold_id"]])
     previous = plans._commit_projection(connection, plan.plan_id, previous)
