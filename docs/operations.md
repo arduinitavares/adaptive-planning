@@ -644,3 +644,206 @@ specific call/allowance gaps. This checkpoint grants no provider retry, account/
 billing change or client activation to close those gaps. Raw test evidence stays
 private; complete captures can contain diagnostic data and are not universally
 secret free.
+
+## Task 26 source contracts and release evidence
+
+This source candidate preserves the 29-tool catalog: six reads and 23 semantic
+mutations. `registered_handlers(service)` issues one mapping consumed once by
+`build_mcp`. Registration validates exact function identity, semantic name, read
+or mutation role, and common issuance batch before SDK registration, without
+requiring a plan or invoking handlers. Missing/unknown/replaced/swapped/copied
+attributes/mixed batches refuse; copying the genuine mapping is valid. Every
+mutation checks its kind, uses the real typed command parser, and resolves the
+current `service.execute` at invocation. Weak references and short synchronized
+bookkeeping make issuance collectible; this does not confine malicious trusted
+Python code.
+
+All six MCP read serializers and safe error `current_metadata` use the same
+checked public projection. It accepts exact declared public DTO shapes and valid
+JSON, detaches containers, and rejects typed private grants/receipts (including
+receipts with `private=None`), unknown/internal DTOs or altered DTO/scalar/sequence shapes, cycles,
+nonfinite numbers and nonstring keys with constant diagnostics. Valid arbitrary
+public metadata and prose, including labels `private`, `orchestrator_token` and
+`attempt_token`, remain intact. Intentional private mutation receipts retain
+their grants. Already flattened JSON or a credential embedded in arbitrary
+permitted prose needs a separate provenance/schema policy; this guard is not
+universal secret detection or a dashboard serializer guard.
+
+Verification was performed on 2026-10-09 from the accepted Task25 base
+`bfe4adfe27622231562729c3e25f672f8cc425eb`. The final code SHA256 is
+`91371443d8ed028fd62846a681fabf14efbc5748675d32f58eaea8979ff61851`;
+new matrix test SHA256 is
+`e1dd436ac9909f459a624e11cd2b7f012f288a47396c1377ee2eda8c52c4080e`.
+Complete private capture frames retain exact argv, exit, UTC times, full combined
+stdout/stderr bytes/hash, selected runtime and 71 before/after source hashes.
+Operations evidence is appended afterward; the verified code and tests remain
+identical. Private evidence filenames below identify coordinator-held records,
+not files shipped in the package.
+
+| Check and exact command | Actual result / evidence |
+| --- | --- |
+| `uv run --frozen python -B -m unittest tests.test_service_acceptance_matrix -v` | Initial RED: missing-validator assertion, 1 failed; expanded RED: 14 tests, 19 failures/6 derivative errors. `red-01.txt`, `red-02.txt`. Final scoped GREEN: 14 passed, clean unittest output, `green-03.txt`. |
+| `uv run --frozen python -B -m unittest tests.test_service_acceptance_matrix tests.test_service_sdk tests.test_service_http tests.test_service_interop -v` | 75 passed; `green-02.txt`. Existing diagnostics and synthetic public interop summaries retained; this combined output is not pristine. |
+| `uv run --frozen python -B .superpowers/final_python_suite.py` | 815 discovered, 814 passed, one actual-Windows-only handle-sharing skip; `final-python-01.txt`, body SHA256 `b9c1017467c5ef1923899d51a4d5fe534387e80840a0c905b3a610b8ad3dc777`. CPython3.13.15/SQLite3.53.1, subprocess-only selected runtime, downloads disabled. |
+| Full discovery includes `tests.test_service_packaging.TestService.test_wheel_assets_and_import_safety` and `test_sdist_assets_and_import_safety` | Built and installed each artifact in new environments outside checkout; actual package imports, packaged assets, ASGI routes, console entry/CLI help and import safety passed in the same full capture. No checkout fallback; inner frozen/hash-pinned installer commands were not `--offline`. |
+| `node --check assets/dashboard/app.js`; `node tests/test_frontend_dom.js` | Both exit0 on Node26.7.0; `final-node-01.txt`, `final-dom-01.txt`. DOM script is synthetic, not actual browser evidence. |
+| `uv build --offline` | Exit0, uv0.10.12; `final-build-01.txt`. Wheel SHA256 `76132854f4307e70a59b921fb22547f35dd24269902a60ca2a5b00695aec6687`; sdist SHA256 `42f0e24ae333e77ef49aa8c6f2b4da922dfbdd9dd784f7646839a5611eb8576a`. |
+
+The approved full-discovery wrapper forwards
+`["unittest","discover","-s","tests","-p","test_*.py"]` to the standard
+runner. Its SHA256 is
+`5fd35b740dea8582f8ddf9d54d160d3530d8bc3e32c147c6d9f748a1a474a8a4`.
+It limits only the output stream handler to WARNING while test-owned diagnostic
+capture remains active. No warnings filter or production logging change was
+applied. Expected negative-path warning/error tracebacks remain in the full
+capture; the root audit counted 390 warning-containing lines, not 390 events.
+The first noisy GREEN is preserved; only the final 14-test scoped capture is
+qualified as clean output. A passed full suite is not a pristine-output claim.
+
+The approved matrix contains 52 requested test labels: 45 exact method names
+exist and seven older shorthand labels map to these actual executed tests.
+These are explicit mappings, not claims that absent method names ran:
+
+| Approved shorthand | Actual current test/evidence |
+| --- | --- |
+| `test_backup_marker_and_export_redaction` | `test_local_cli_produces_private_coherent_backup_and_public_export` in `tests/test_service_admin.py` |
+| `test_isolated_replacement_keeps_old_resources` | `test_isolated_replacement_keeps_old_resources_and_fences_checkpoint_retry` in `tests/test_service_recovery.py` |
+| `test_submitted_overdue_requires_explicit_confirmation` | `test_submitted_overdue_requires_explicit_confirmation_then_reopen_same_attempt` in `tests/test_service_recovery.py` |
+| `test_restored_invalidation_verification_waits_for_inventory` | `test_actual_restore_preserves_open_invalidation_and_gates_writable_verification_until_inventory` in `tests/test_service_admin.py` |
+| `test_restore_holds_absent_postbackup_work` | `test_typed_inventory_clears_hold_without_reconstructing_postbackup_registry`, the preceding real restored-invalidation guard, and qualified Linux admin exercise |
+| `test_stale_checkpoint_and_fenced_late_evidence` | `test_recovery_checkpoint_is_event_only_and_confirmation_preserves_original_review`, replacement checkpoint fencing above, and `test_late_owner_evidence_only_appends_note_and_stop_report` |
+| `test_normal_restart_not_restore` | Exact `test_restart_preserves_epoch_and_events`, qualified Linux admin `verify_restart`, and fresh owned SDK/container lifecycle observations |
+
+The current acceptance matrix keeps automated evidence, bounded owned-fixture
+observations, historical reuse and genuine-client release gates separate. The
+52 approved test labels use the explicit seven mappings above where necessary.
+
+| Design check / review focus | Current source evidence | Additional observation or remaining gate |
+| --- | --- | --- |
+| 1: three-client tools/read/checkpoint | Full discovery passed current official SDK/protocol and synthetic worker-cycle tests; new matrix exercised all 29 actual handlers. | Genuine Codex/Antigravity/Copilot checkpoint and acceptance runs remain 0; all installed-client rows OPEN. |
+| 2: persistence/resume | Restart persistence test passed. | Fresh owned stop/start, restart and same-volume recreation results are recorded below. Actual installed-client close/reopen and the default Compose lifecycle gate remain OPEN. |
+| 3: assignment/resources/availability | Full discovery passed barrier/concurrency, physical/path identity, overlapping repository/external-resource and checked-base tests. | These are scoped source-test fixtures; no additional user worktree or shared resource was activated. |
+| 4: idempotency/fencing | Full discovery passed lost-bootstrap-response, request replay/CAS, capability and takeover/fencing tests. New matrix confirms real parse/dispatch and read/error token boundaries. | Fresh outage replay uses the retained original key/body; it does not simulate an actually lost server response. |
+| 5: frozen definitions/adaptation/review | Full discovery passed frozen-definition, atomic material holds, review binding, corrective history, retirement and invalidation tests. | Qualified Linux admin restore/hold observations are described below. Synthetic reviewers establish API behavior, not independent human/AI review. |
+| 6: evidence/interleaving | Full discovery passed checkpoint and interleaving tests. | Current owned browser observations below retain two independent local workers' actual arithmetic outcomes, evidence and reassessment; failed work stays blocked. |
+| 7: scope | Full discovery passed plan-only/global-latch/active-import tests. | No takeover, restart or import in this candidate grants additional task authorization. |
+| 8: stale/relay/resources | Full discovery passed injected-clock, replacement/fenced evidence and exclusive-workspace handoff tests. | The browser shows that host edits are uncontrolled. No actual host stop or elapsed-time heartbeat is invented. |
+| 9: dashboard | Full discovery passed dashboard freshness/projection tests; Node DOM script passed. | Current owned browser viewport/CSP/escaping/holds/reviews/reconnect observations are recorded below with explicit bounds. Historical Task8 evidence is qualified separately. |
+| 10: unavailable behavior | Both current instruction/unavailable and relay tests passed in full discovery. | Current owned fixture literally stops its service during assigned work and retains unpublished observations without creating a fallback server/plan. |
+| 11: legacy/import/restore | Full discovery passed legacy and current import/restore tests, including the mapped shorthand methods. | Accepted Linux core/admin backup/export/restore/newer-schema refusal is reused only for unchanged directly exercised source and runtime bindings. |
+| 12: container/auth | Full discovery passed Host/Origin/auth, logs/URLs and container-contract tests. | Current owned Linux inspect and authenticated protocol observations are recorded below. Known-token scans have stated coverage; they are not universal secret detection. |
+| Review Focus 1: superseded private receipts/fencing | Lost-bootstrap and cached-mutation tests passed; new matrix preserves intentional private mutation receipts and rejects them on reads. | No restored/cached grant is treated as authority. |
+| Review Focus 2: physical/canonical resource identity | Alias/device/path/reconciliation tests passed. | Source-fixture attestations retain conservative matching and explicit case behavior. |
+| Review Focus 3: atomic checkpoint/holds | Concurrent atomic-hold tests passed. | Browser observation is additional committed-state evidence, not the atomicity proof. |
+| Review Focus 4: absent work after restore | Actual restored-invalidation and typed-inventory tests passed. | Qualified unchanged Linux admin exercise retains the whole-store hold until inventory reconciles absent host work. |
+| Review Focus 5: relay/outage honesty | Relay and unavailable tests passed. | Actual owned outage observations are bounded local checks with explicit origin; no fabricated host stop, heartbeat or AI-client checkpoint. |
+
+The fresh owned Linux/browser fixture ran once under each separately approved
+producer version. Final exact command
+`uv run --frozen python -B .superpowers/native-linux-release-v5.py` exited0;
+`linux-release-04.txt` preserves all 989 child-output bytes, SHA256
+`ba197984af1ef8322c69e10b4dbc6078399c4faa7c1f4d17e026a463b98fb53e`.
+Public observations are in
+`native-linux-public-evidence-f5c8eeeeddf74cd88054ea8a107bd895.json`, SHA256
+`de21c9be874e7a235a68949976cb248ca796aae8af13b339422df33e3fdb57fa`.
+The current-byte 71-path snapshot SHA256 is
+`0571695bc9c4fa3e6d99d0dc0a6fbb9f786293d5ef681a0da36a4f3183cfe766`;
+all bindings stayed identical during the run. The later operations append is
+outside that built snapshot; product code/tests and all 22 installed
+production/asset byte hashes match the completed Python and runtime evidence.
+
+The fresh uniquely owned image ID is
+`sha256:8d48534cd7f44d8d42308a9d70b66a1e670767a04cf3d986d3a9f2eb21b50835`.
+Actual Docker context was `desktop-linux` through its Unix socket. Inspect
+confirmed Linux/arm64, UID/GID10001, read-only root, loopback-only
+`http://127.0.0.1:64405`, a fresh named volume and no host bind mounts. The real
+container port, external base URL, metadata/dashboard URLs and allowed Host
+used that observed ephemeral port; this did not activate the default8790
+service. The installed package loaded from `/app/.venv`, with CPython3.13.16,
+SQLite3.53.4, serialized thread safety3, MCP2.3.0 and Pydantic2.13.5.
+SQLite loaded `/usr/local/lib/libsqlite3.so.0`, SHA256
+`504724703dbad6b3820e6db9de8607cd0d14419bab5d3b830f008d4ee293d09a`;
+source ID and complete compile options are retained in the observation record.
+
+All six actual authenticated MCP reads succeeded. The actual SDK listing
+contained exactly29 tools with no next cursor; negotiated protocol was
+`2026-07-28`. Literal stop/start and restart preserved the same container ID;
+stop/remove/recreate used a different container ID and the same owned volume.
+Each of the three completed lifecycle comparisons retained both exact plan
+DTOs, event lists, metadata/URLs and accepted results without redispatch.
+The unavailable-service exercise retained actual local CSV verification and
+unpublished observations during real read/publish `ConnectError`, then reread,
+sweep/reconcile and replayed the identical command body/key without duplicate
+events. Its separately recorded review is explicitly a local simulated role.
+These owned CLI operations are bounded source/runtime evidence, not the actual
+installed-client or default `docker compose` lifecycle gate, nor real Mac sleep.
+
+The current browser was isolated headless Google Chrome153.0.8010.50, using
+installed Playwright CLI0.1.22/Playwright1.64.0-alpha-1790635538000 with no new
+browser/dependency download or global profile/configuration change. At
+1440x1000 it observed two plans on the index with optional workflow omitted,
+two independently connected/authorized active local workers, and both actual
+arithmetic outcomes: sum5 passed, product6 failed the expected7 check. Both
+original checkpoint evidence/reassessment payloads appeared intact in the
+browser DOM; failed work stayed blocked, with two submitted attempts, one hold
+and one original passing local simulated review. Escaped script/image-looking
+text remained text, the actual CSP prohibited inline/eval execution, and no
+fixture execution flag or executable evidence element appeared. The actual
+service outage displayed the reconnect banner and retained revision8/store
+sequence14; reconnect and same-volume recreation hid the banner and retained
+those values plus holds/reviews. Viewport screenshots are retained; lower
+holds/reviews were checked in the parsed DOM and are not a full-page visual
+claim. User-opened-details retention, exhaustive interaction/storage inspection
+and exact polling timing were not newly established.
+
+There were60 captured Docker operations and40 captured browser CLI operations.
+Cleanup independently inspected the exact owner/source/image/port/volume
+bindings, then closed only the private named browser and removed only the owned
+container and volume; subsequent registry/inspect calls showed absence. The
+private credential directory is absent; uniquely owned images and private
+captures are retained. Each main run had a finite900s total, subprocess30s
+(build600s), async-call12s and readiness20s bounds, with separate180s cleanup;
+synchronous children have their own timeout and are not preempted by asyncio.
+Bearer and issued grants stayed in memory or private0600 files. Published
+observations and selected outputs were checked for known issued values; before
+token acquisition the known-secret set was empty. The reused private SDK helper
+disables client logging, so absent client logs do not establish leak-free
+production logging. Production logging and log-absence tests are unchanged.
+
+Earlier failed owned attempts are preserved: `linux-release-01.txt` failed
+initial readiness because the actual configured container port differed from
+the publish target; `linux-release-02.txt` failed after successful runtime,
+worker/browser and offline observations (no exception leaf was preserved; the
+subsequent URL assertion correction followed unchanged source); and
+`linux-release-03.txt` passed all six reads/first-plan equality before the
+captured `TypeError` at the SDK listing assertion. Its `Client.list_tools`
+result was a `ListToolsResult`, requiring `.tools`. Each corrected producer was
+fully inspected and approved separately before a single execution. No product
+change, automatic retry or prior-attempt PASS was manufactured.
+
+Accepted Task23 Linux admin evidence
+`task-23-linux-exercise-c230c48992ee.json` and its root validation are reused only
+for directly exercised unchanged core/admin backup/export/restore,
+newer-schema refusal, absent-work inventory hold and normal-restart behavior.
+Exactly27 of its30 source bindings still match; transport, operations and import
+tests differ, so the old image establishes neither the new transport nor a
+whole-current-source PASS. The actual admin exercise source SHA256 remains
+`749ae4beffcaf18c8e82be57e59ffcab776bd0aea3c2363c938543b087d4ff75`;
+current fresh runtime independently confirms the same Linux Python/SQLite
+versions and loaded-library identity. Historical Task8 browser records retain
+14 passed/5 UNKNOWN at their original Chrome153.0.8010.50/Python3.14.3 runtime.
+Only index/style assets and the HTTP test still match that browser catalog;
+changed dashboard JavaScript/production/test sources prevent carrying those
+functional PASS claims into this candidate. Current browser claims rely on the
+fresh bounded observations above; historical unknowns are retained.
+
+Release acceptance remains OPEN with zero genuine three-client checkpoint runs.
+The existing planning and Task20 installed-client tables remain unfilled. Codex's
+full actual scenario is pending coordinator execution; Antigravity's genuine
+configuration boundary remains unresolved; Copilot has user-confirmed zero
+credits. An earlier selected Antigravity credit error does not prove that all
+Gemini quota is exhausted. SDK, HTTP, unit, synthetic role, Linux and browser
+observations cannot fill any genuine client row. Fresh task review and separate
+independent whole-change review are coordinator-owned gates; no implementer
+self-approval is recorded. A local commit does not complete Task26, the whole
+plan or release acceptance, or authorize default activation/deployment.

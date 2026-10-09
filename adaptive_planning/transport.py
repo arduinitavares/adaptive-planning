@@ -1,12 +1,17 @@
 """Typed semantic tools over the official MCP server and the shared service authority."""
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import is_dataclass
 import json
 import logging
+import math
 from threading import RLock
+from types import FunctionType
 from typing import Annotated, Any, Literal, TYPE_CHECKING
+import weakref
 
 from mcp import MCPError
 from mcp.server import MCPServer, ServerRequestContext
@@ -16,8 +21,8 @@ from mcp.types import CallToolResult, ErrorData, JSONRPCError, TextContent, Tool
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from adaptive_planning import plans
-from adaptive_planning.types import DomainError, Metadata, parse_command
+from adaptive_planning import plans, types as domain
+from adaptive_planning.types import DomainError, Metadata, PlanView, parse_command
 
 if TYPE_CHECKING:
     from adaptive_planning.app import PlanningService
@@ -593,11 +598,93 @@ _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_field
                            "plan_id", "include_terminal", "after", "limit", *_ARGUMENTS})
 
 
+# Explicit public shapes: adding a DTO or field requires a public-contract decision.
+# Input-only/internal command envelopes and private receipts are never projected here.
+_PUBLIC_DTOS = {
+    domain.InstallationView: ("epoch", "schema_version", "host_id", "dashboard_url", "store_hold", "restore_cutoff"),
+    Metadata: ("epoch", "plan_id", "generation", "revision", "ownership_version", "dashboard_url"),
+    domain.ArtifactRef: ("kind", "identity", "version", "digest", "summary"),
+    domain.DocumentRef: ("path", "branch", "commit", "version", "task_id"),
+    domain.StepDefinition: ("step_id", "title", "dependencies", "completion_check", "document", "definition_version", "review_required", "final_gate"),
+    domain.Authorization: ("mode", "interval", "since_revision", "note", "baseline", "claimed"),
+    domain.ReservationView: ("use_id", "plan_id", "attempt_id", "absent_work_id", "resource_ids", "actor", "writer_active", "unresolved", "repository_exclusive"),
+    domain.ExecutionContext: ("kind", "repository_id", "workspace_id", "repository_exclusive", "external_ids", "writes", "checked_base"),
+    domain.Evidence: ("summary", "artifact", "workspace_id", "check", "result", "limitations", "blockers"),
+    domain.PlanDraft: ("objective", "acceptance_criteria", "constraints", "facts", "assumptions", "next_check", "authorization", "steps", "documents", "workspace_refs", "workflow", "horizon", "stop_reason", "block_reason"),
+    domain.Reassessment: ("summary", "facts", "assumptions", "disposition", "reason", "affected_steps", "unbounded", "proposed_draft"),
+    domain.Checkpoint: ("outcome", "check", "evidence", "reassessment", "origin_worker", "relay", "artifact"),
+    domain.Review: ("reviewer", "artifact", "verdict", "findings", "evidence", "verification_use_id"),
+    domain.ReviewView: ("plan_id", "step_id", "attempt_id", "definition_version", "recorded_sequence", "review"),
+    domain.AttemptView: ("attempt_id", "step_id", "assignee", "state", "prior_state", "version", "definition_version", "last_activity", "context", "recovery_required", "result_version"),
+    domain.HoldView: ("hold_id", "kind", "step_id", "source_id", "reason"),
+    domain.InvalidationView: ("invalidation_id", "producer_step_id", "result_version", "affected_steps", "resolved_steps", "recorded_sequence"),
+    domain.CoordinationItem: ("kind", "value"),
+    domain.CoordinationPage: ("plan_id", "revision", "store_sequence", "items", "next_cursor", "total_counts"),
+    domain.CoordinationView: ("attempts", "reservations", "holds", "reviews", "result_versions", "store_hold", "restore_cutoff", "ownership_actor", "ownership_version", "store_sequence", "next_cursor", "total_counts", "has_live_attempts", "has_unresolved_uses", "has_plan_holds"),
+    PlanView: ("plan_id", "metadata", "draft", "legacy_snapshot", "legacy_publication", "coordination", "status", "published_at"),
+    domain.Event: ("sequence", "plan_revision", "plan_id", "kind", "actor", "origin_worker", "relay", "published_at", "payload"),
+    domain.ReadyStep: ("step_id", "ready", "reasons"),
+}
+
+
+def _public_json(value: Any) -> Any:
+    """Detach known public DTOs and JSON; refuse typed private or unknown shapes.
+
+    Arbitrary valid JSON keys/prose remain user data. Flattened credentials cannot
+    be distinguished from identical legitimate JSON without a new domain policy.
+    """
+    active: set[int] = set()
+
+    def reject():
+        raise DomainError("internal_error", "The public result violates the release contract.") from None
+
+    def convert(item):
+        item_type = type(item)
+        if item_type in (type(None), str, bool, int):
+            return item
+        if item_type is float:
+            if not math.isfinite(item):
+                reject()
+            return item
+        fields = _PUBLIC_DTOS.get(item_type)
+        if fields is None and (is_dataclass(item) or not isinstance(item, Mapping) and item_type not in (list, tuple)):
+            reject()
+        identity = id(item)
+        if identity in active:
+            reject()
+        active.add(identity)
+        try:
+            if fields is not None:
+                if set(vars(item)) != set(fields):
+                    reject()
+                return {field: convert(getattr(item, field)) for field in fields}
+            if isinstance(item, Mapping):
+                result = {}
+                for key, child in item.items():
+                    if type(key) is not str:
+                        reject()
+                    result[key] = convert(child)
+                return result
+            return [convert(child) for child in item]
+        finally:
+            active.remove(identity)
+
+    try:
+        return convert(value)
+    except Exception:
+        # No offending value, key, path, subclass name or recursive diagnostic escapes.
+        reject()
+
+
 def _error_payload(code: str, metadata: Metadata | None = None) -> dict[str, Any]:
     code = code if code in _MESSAGES else "internal_error"
     error: dict[str, Any] = {"code": code, "message": _MESSAGES[code]}
-    if isinstance(metadata, Metadata):
-        error["current_metadata"] = plans.to_jsonable(metadata)
+    if type(metadata) is Metadata:
+        try:
+            error["current_metadata"] = _public_json(metadata)
+        except DomainError:
+            # Preserve the safe domain code while omitting contaminated public metadata.
+            pass
     return {"error": error}
 
 
@@ -656,169 +743,163 @@ class _PlanningMCPServer(MCPServer):
                               structured_content=payload, is_error=True)
 
 
-def build_mcp(service: PlanningService) -> MCPServer:
-    server = _PlanningMCPServer("adaptive-planning", middleware=[_safe_protocol_errors])
-    read = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
-    write = ToolAnnotations(read_only_hint=False, idempotent_hint=True, open_world_hint=False)
+# Identity provenance is weak and batch-local; function attributes convey no authority.
+# Each callback retains only an integer key and compares the exact expired reference.
+_HANDLER_LOCK = RLock()
+_HANDLER_ISSUANCE: dict[int, tuple[weakref.ReferenceType, str, str, object]] = {}
 
-    def read_value(operation):
-        try:
-            return plans.to_jsonable(operation())
-        except DomainError as error:
-            raise _ServiceToolError(error) from None
 
-    def execute(kind: str, command: CommandInput):
+def _issue_handler(handler: Callable, name: str, role: str, batch: object) -> None:
+    identity = id(handler)
+
+    def collected(reference):
+        with _HANDLER_LOCK:
+            current = _HANDLER_ISSUANCE.get(identity)
+            if current is not None and current[0] is reference:
+                del _HANDLER_ISSUANCE[identity]
+
+    reference = weakref.ref(handler, collected)
+    with _HANDLER_LOCK:
+        _HANDLER_ISSUANCE[identity] = (reference, name, role, batch)
+
+
+def _validate_registered_handlers(tool_handlers: Mapping[str, Callable]) -> dict[str, Callable]:
+    def reject():
+        raise DomainError("internal_error", "The registered tools violate the release contract.") from None
+
+    try:
+        handlers = dict(tool_handlers)  # Hold genuine functions while validating a stable snapshot.
+    except Exception:
+        reject()
+    mutations = domain.BOOTSTRAP_KINDS | domain.ORCHESTRATOR_KINDS | domain.WORKER_KINDS
+    expected = mutations | _READ_NAMES
+    if (set(handlers) != expected or set(_ARGUMENTS) != expected
+            or set(_MUTATION_DESCRIPTIONS) != mutations
+            or any(_ARGUMENTS[name] != frozenset({"command"}) for name in mutations)):
+        reject()
+    batch = None
+    with _HANDLER_LOCK:
+        for name, handler in handlers.items():
+            if type(handler) is not FunctionType:
+                reject()
+            issued = _HANDLER_ISSUANCE.get(id(handler))
+            if issued is None:
+                reject()
+            reference, issued_name, role, issued_batch = issued
+            referent = reference()  # One dereference yields a strong local reference.
+            if (referent is not handler or issued_name != name or handler.__name__ != name
+                    or role != ("read" if name in _READ_NAMES else "mutation")):
+                reject()
+            if batch is None:
+                batch = issued_batch
+            elif batch is not issued_batch:
+                reject()
+    return handlers
+
+
+def validate_release_contract(tool_handlers: Mapping[str, Callable], public_view: PlanView) -> None:
+    """Audit actual issued handlers and the same projection used by public reads.
+
+    This audits the registration contract; it does not confine malicious trusted
+    Python code or claim universal detection of credentials already flattened to JSON.
+    """
+    _validate_registered_handlers(tool_handlers)
+    _public_json(public_view)
+
+
+_MUTATION_DESCRIPTIONS = {
+    'create_plan': 'Create an authorized plan and return its private bootstrap receipt.',
+    'import_plan': 'Import an authorized legacy plan with explicit publisher authority handoff.',
+    'revise_plan': 'Revise a plan with current metadata and its orchestrator grant.',
+    'takeover': 'Take over a plan using the expected ownership version; return the new grant privately.',
+    'register_resource': "Register current-host identity with the current plan owner's grant; create no execution use.",
+    'reconcile_resources': 'Reconcile explicitly attested equivalent identities while preserving every unresolved use.',
+    'assign_step': 'Assign one frozen authorized step after atomic scope, ownership and resource checks.',
+    'bind_availability': "Bind accepted prerequisite outputs to one assigned consumer's final checked base.",
+    'start_step': 'Start an authenticated worker after final-base input and current execution guards.',
+    'report_activity': 'Record actual authenticated worker observation without changing execution lifecycle.',
+    'record_checkpoint': 'Submit attributed worker findings and provisional reassessment holds atomically.',
+    'resolve_reassessment': 'Classify one checkpoint and its residual holds; relay affected workers at a safe boundary.',
+    'invalidate_result': 'Invalidate an accepted output and hold its producer and transitive consumers without deleting history.',
+    'resolve_invalidation': 'Resolve one affected hold with exact artifact proof or an actual revised consumer route.',
+    'record_review': 'Record an immutable verdict for the exact submitted or invalidated accepted artifact.',
+    'accept_step': 'Accept one exact submitted output; stop only explicitly named original implementation resources.',
+    'reserve_verification': 'Reserve an attributable writable verifier group without freeing retained implementation use.',
+    'release_resource_use': 'Record an exact stopped-use observation and release the complete named use only when confirmed.',
+    'reopen_attempt': 'Reopen the same current submitted attempt after scope, hold and retained-use checks.',
+    'sweep_stale': 'Explicitly record overdue ownership in one target-plan batch without releasing resources.',
+    'resolve_attempt': 'Confirm observed ownership or explicitly cancel, retire or replace an exact swept native attempt.',
+    'append_late_evidence': 'Retain attributed historical observations and stop reports without releasing or accepting work.',
+    'resolve_store_hold': 'Record explicit local absent-writer inventory and exact resource observations after restore.',
+}
+
+
+def _mutation_handler(service: PlanningService, kind: str) -> Callable:
+    def handler(command: CommandInput) -> dict[str, Any]:
         try:
             if command.kind != kind:
                 raise DomainError("invalid", "The command kind must match its semantic tool.")
             parsed = parse_command(command.model_dump(mode="python"))
+            # Resolve live authority at invocation, after registration and fixture setup.
             return plans.to_jsonable(service.execute(parsed))
         except DomainError as error:
             raise _ServiceToolError(error) from None
 
-    @server.tool(annotations=read)
+    handler.__name__ = kind
+    handler.__qualname__ = f"registered_handlers.<locals>.{kind}"
+    handler.__doc__ = _MUTATION_DESCRIPTIONS[kind]
+    return handler
+
+
+def registered_handlers(service: PlanningService) -> Mapping[str, Callable]:
+    """Issue one complete batch of actual read and centrally gated mutation handlers."""
+    def read_value(operation):
+        try:
+            return _public_json(operation())
+        except DomainError as error:
+            raise _ServiceToolError(error) from None
+
     def read_service_info() -> dict[str, Any]:
         """Read the public installation identity and dashboard URL."""
         return read_value(service.read_service_info)
 
-    @server.tool(annotations=read)
     def list_plans(include_terminal: StrictBool = False) -> dict[str, Any]:
         """List complete public plan views within the public response limit."""
         return {"plans": read_value(lambda: service.list_plans(include_terminal))}
 
-    @server.tool(annotations=read)
     def read_plan(plan_id: str) -> dict[str, Any]:
         """Read a public plan, metadata and bounded coordination summary."""
         return read_value(lambda: service.read_plan(plan_id))
 
-    @server.tool(annotations=read)
     def read_events(plan_id: str, after: StrictInt = 0, limit: StrictInt = 100) -> dict[str, Any]:
         """Read a bounded public event page after the given sequence."""
         return {"events": read_value(lambda: service.read_events(plan_id, after, limit))}
 
-    @server.tool(annotations=read)
     def list_ready(plan_id: str) -> dict[str, Any]:
         """Read planning readiness and reasons without assigning execution."""
         return {"steps": read_value(lambda: service.list_ready(plan_id))}
 
-    @server.tool(annotations=read)
     def read_coordination(plan_id: str, after: str | None = None, limit: StrictInt = 100) -> dict[str, Any]:
         """Read a bounded public coordination page using its opaque cursor."""
         return read_value(lambda: service.read_coordination(plan_id, after, limit))
 
-    @server.tool(annotations=write)
-    def create_plan(command: CommandInput) -> dict[str, Any]:
-        """Create an authorized plan and return its private bootstrap receipt."""
-        return execute("create_plan", command)
+    handlers = {
+        "read_service_info": read_service_info, "list_plans": list_plans,
+        "read_plan": read_plan, "read_events": read_events,
+        "list_ready": list_ready, "read_coordination": read_coordination,
+    }
+    handlers.update((kind, _mutation_handler(service, kind)) for kind in _MUTATION_DESCRIPTIONS)
+    batch = object()  # Standalone identity; does not retain service, handlers or SDK server.
+    for name, handler in handlers.items():
+        _issue_handler(handler, name, "read" if name in _READ_NAMES else "mutation", batch)
+    return handlers
 
-    @server.tool(annotations=write)
-    def import_plan(command: CommandInput) -> dict[str, Any]:
-        """Import an authorized legacy plan with explicit publisher authority handoff."""
-        return execute("import_plan", command)
 
-    @server.tool(annotations=write)
-    def revise_plan(command: CommandInput) -> dict[str, Any]:
-        """Revise a plan with current metadata and its orchestrator grant."""
-        return execute("revise_plan", command)
-
-    @server.tool(annotations=write)
-    def takeover(command: CommandInput) -> dict[str, Any]:
-        """Take over a plan using the expected ownership version; return the new grant privately."""
-        return execute("takeover", command)
-
-    @server.tool(annotations=write)
-    def register_resource(command: CommandInput) -> dict[str, Any]:
-        """Register current-host identity with the current plan owner's grant; create no execution use."""
-        return execute("register_resource", command)
-
-    @server.tool(annotations=write)
-    def reconcile_resources(command: CommandInput) -> dict[str, Any]:
-        """Reconcile explicitly attested equivalent identities while preserving every unresolved use."""
-        return execute("reconcile_resources", command)
-
-    @server.tool(annotations=write)
-    def assign_step(command: CommandInput) -> dict[str, Any]:
-        """Assign one frozen authorized step after atomic scope, ownership and resource checks."""
-        return execute("assign_step", command)
-
-    @server.tool(annotations=write)
-    def bind_availability(command: CommandInput) -> dict[str, Any]:
-        """Bind accepted prerequisite outputs to one assigned consumer's final checked base."""
-        return execute("bind_availability", command)
-
-    @server.tool(annotations=write)
-    def start_step(command: CommandInput) -> dict[str, Any]:
-        """Start an authenticated worker after final-base input and current execution guards."""
-        return execute("start_step", command)
-
-    @server.tool(annotations=write)
-    def report_activity(command: CommandInput) -> dict[str, Any]:
-        """Record actual authenticated worker observation without changing execution lifecycle."""
-        return execute("report_activity", command)
-
-    @server.tool(annotations=write)
-    def record_checkpoint(command: CommandInput) -> dict[str, Any]:
-        """Submit attributed worker findings and provisional reassessment holds atomically."""
-        return execute("record_checkpoint", command)
-
-    @server.tool(annotations=write)
-    def resolve_reassessment(command: CommandInput) -> dict[str, Any]:
-        """Classify one checkpoint and its residual holds; relay affected workers at a safe boundary."""
-        return execute("resolve_reassessment", command)
-
-    @server.tool(annotations=write)
-    def invalidate_result(command: CommandInput) -> dict[str, Any]:
-        """Invalidate an accepted output and hold its producer and transitive consumers without deleting history."""
-        return execute("invalidate_result", command)
-
-    @server.tool(annotations=write)
-    def resolve_invalidation(command: CommandInput) -> dict[str, Any]:
-        """Resolve one affected hold with exact artifact proof or an actual revised consumer route."""
-        return execute("resolve_invalidation", command)
-
-    @server.tool(annotations=write)
-    def record_review(command: CommandInput) -> dict[str, Any]:
-        """Record an immutable verdict for the exact submitted or invalidated accepted artifact."""
-        return execute("record_review", command)
-
-    @server.tool(annotations=write)
-    def accept_step(command: CommandInput) -> dict[str, Any]:
-        """Accept one exact submitted output; stop only explicitly named original implementation resources."""
-        return execute("accept_step", command)
-
-    @server.tool(annotations=write)
-    def reserve_verification(command: CommandInput) -> dict[str, Any]:
-        """Reserve an attributable writable verifier group without freeing retained implementation use."""
-        return execute("reserve_verification", command)
-
-    @server.tool(annotations=write)
-    def release_resource_use(command: CommandInput) -> dict[str, Any]:
-        """Record an exact stopped-use observation and release the complete named use only when confirmed."""
-        return execute("release_resource_use", command)
-
-    @server.tool(annotations=write)
-    def reopen_attempt(command: CommandInput) -> dict[str, Any]:
-        """Reopen the same current submitted attempt after scope, hold and retained-use checks."""
-        return execute("reopen_attempt", command)
-
-    @server.tool(annotations=write)
-    def sweep_stale(command: CommandInput) -> dict[str, Any]:
-        """Explicitly record overdue ownership in one target-plan batch without releasing resources."""
-        return execute("sweep_stale", command)
-
-    @server.tool(annotations=write)
-    def resolve_attempt(command: CommandInput) -> dict[str, Any]:
-        """Confirm observed ownership or explicitly cancel, retire or replace an exact swept native attempt."""
-        return execute("resolve_attempt", command)
-
-    @server.tool(annotations=write)
-    def append_late_evidence(command: CommandInput) -> dict[str, Any]:
-        """Retain attributed historical observations and stop reports without releasing or accepting work."""
-        return execute("append_late_evidence", command)
-
-    @server.tool(annotations=write)
-    def resolve_store_hold(command: CommandInput) -> dict[str, Any]:
-        """Record explicit local absent-writer inventory and exact resource observations after restore."""
-        return execute('resolve_store_hold',command)
-
+def build_mcp(service: PlanningService) -> MCPServer:
+    handlers = _validate_registered_handlers(registered_handlers(service))
+    server = _PlanningMCPServer("adaptive-planning", middleware=[_safe_protocol_errors])
+    read = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
+    write = ToolAnnotations(read_only_hint=False, idempotent_hint=True, open_world_hint=False)
+    for name, handler in handlers.items():
+        server.tool(name=name, annotations=read if name in _READ_NAMES else write)(handler)
     return server
