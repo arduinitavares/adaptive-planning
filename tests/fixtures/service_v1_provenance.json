@@ -1,0 +1,1106 @@
+{
+  "format": 1,
+  "identity_history": {
+    "absent_host_work": [
+      [
+        1,
+        "seeded-orphan",
+        "synthetic-host",
+        "00000000-0000-0000-0000-000000000042",
+        "workspace",
+        "synthetic-orphan",
+        "unresolved",
+        "2026-10-06T14:00:00+00:00"
+      ]
+    ],
+    "aliases": [
+      [
+        1,
+        "00000000-0000-0000-0000-000000000023",
+        "synthetic-host",
+        "/synthetic/v1-repo",
+        "00000000-0000-0000-0000-000000000022",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        2,
+        "00000000-0000-0000-0000-000000000027",
+        "synthetic-host",
+        "/synthetic/v1-repo/work",
+        "00000000-0000-0000-0000-000000000026",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        3,
+        "00000000-0000-0000-0000-000000000043",
+        "synthetic-host",
+        "/synthetic/v1-orphan",
+        "00000000-0000-0000-0000-000000000042",
+        "2026-10-06T14:00:00+00:00"
+      ],
+      [
+        4,
+        "00000000-0000-0000-0000-000000000047",
+        "synthetic-host",
+        "/synthetic/v1-import-source-True",
+        "00000000-0000-0000-0000-000000000046",
+        "2026-10-06T14:00:00+00:00"
+      ],
+      [
+        5,
+        "00000000-0000-0000-0000-00000000004c",
+        "synthetic-host",
+        "/synthetic/v1-import-writer",
+        "00000000-0000-0000-0000-00000000004b",
+        "2026-10-06T14:00:00+00:00"
+      ],
+      [
+        6,
+        "00000000-0000-0000-0000-000000000053",
+        "synthetic-host",
+        "/synthetic/v1-import-source-False",
+        "00000000-0000-0000-0000-000000000052",
+        "2026-10-06T14:00:00+00:00"
+      ]
+    ],
+    "attempts": [
+      [
+        1,
+        "00000000-0000-0000-0000-000000000008",
+        "00000000-0000-0000-0000-00000000000e",
+        "a",
+        "worker-a",
+        "accepted",
+        4,
+        "v1",
+        "2026-10-06T12:00:00+00:00",
+        null,
+        "{\"accepted_sequence\": 6, \"artifact\": {\"digest\": null, \"identity\": \"synthetic-artifact\", \"kind\": \"code\", \"summary\": \"Synthetic artifact output\", \"version\": \"v1\"}, \"checkpoint_sequence\": 4, \"context\": {\"checked_base\": null, \"external_ids\": [], \"kind\": \"read-only\", \"repository_exclusive\": false, \"repository_id\": null, \"workspace_id\": null, \"writes\": false}, \"definition\": {\"completion_check\": \"Check for step a\", \"definition_version\": \"v1\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": true, \"step_id\": \"a\", \"title\": \"Step a\"}, \"definition_version\": \"v1\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"execution_uses\": {\"groups\": {}, \"implementation\": {\"members\": [], \"writer\": {\"actor\": \"synthetic-orchestrator\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000009\", \"ownership_version\": 1, \"reason\": \"Declared implementation assignment\", \"sequence\": 2, \"state\": \"active\"}}, \"source\": {\"assignee\": \"worker-a\", \"attempt_id\": \"00000000-0000-0000-0000-00000000000e\", \"definition\": {\"completion_check\": \"Check for step a\", \"definition_version\": \"v1\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": true, \"step_id\": \"a\", \"title\": \"Step a\"}, \"definition_version\": \"v1\", \"origin_epoch\": \"epoch-00000000000000000000000000000006\", \"origin_generation\": \"00000000-0000-0000-0000-000000000009\", \"plan_id\": \"00000000-0000-0000-0000-000000000008\", \"step_id\": \"a\"}, \"v\": 1}, \"generation\": \"00000000-0000-0000-0000-000000000009\", \"last_activity\": \"2026-10-06T12:00:00+00:00\", \"observed_activity\": \"started\", \"recovery_required\": false, \"result_version\": \"00000000-0000-0000-0000-000000000019\", \"review_id\": \"00000000-0000-0000-0000-000000000016\", \"review_sequence\": 5}"
+      ],
+      [
+        2,
+        "00000000-0000-0000-0000-00000000001c",
+        "00000000-0000-0000-0000-00000000002d",
+        "a",
+        "worker-a",
+        "active",
+        2,
+        "v1",
+        "2026-10-06T12:00:00+00:00",
+        null,
+        "{\"context\": {\"checked_base\": null, \"external_ids\": [\"00000000-0000-0000-0000-00000000002a\"], \"kind\": \"repository\", \"repository_exclusive\": false, \"repository_id\": \"00000000-0000-0000-0000-000000000022\", \"workspace_id\": \"00000000-0000-0000-0000-000000000026\", \"writes\": true}, \"definition\": {\"completion_check\": \"Check for step a\", \"definition_version\": \"v1\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": false, \"step_id\": \"a\", \"title\": \"Step a\"}, \"epoch\": \"epoch-00000000000000000000000000000006\", \"execution_uses\": {\"groups\": {}, \"implementation\": {\"members\": [{\"created_at\": \"2026-10-06T12:00:00+00:00\", \"resource_id\": \"00000000-0000-0000-0000-000000000026\", \"scope\": \"workspace\", \"use_id\": \"00000000-0000-0000-0000-00000000002f\"}, {\"created_at\": \"2026-10-06T12:00:00+00:00\", \"resource_id\": \"00000000-0000-0000-0000-00000000002a\", \"scope\": \"external\", \"use_id\": \"00000000-0000-0000-0000-000000000030\"}], \"writer\": {\"actor\": \"synthetic-orchestrator\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-00000000001d\", \"ownership_version\": 1, \"reason\": \"Declared implementation assignment\", \"sequence\": 11, \"state\": \"active\"}}, \"source\": {\"assignee\": \"worker-a\", \"attempt_id\": \"00000000-0000-0000-0000-00000000002d\", \"definition\": {\"completion_check\": \"Check for step a\", \"definition_version\": \"v1\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": false, \"step_id\": \"a\", \"title\": \"Step a\"}, \"definition_version\": \"v1\", \"origin_epoch\": \"epoch-00000000000000000000000000000006\", \"origin_generation\": \"00000000-0000-0000-0000-00000000001d\", \"plan_id\": \"00000000-0000-0000-0000-00000000001c\", \"step_id\": \"a\"}, \"v\": 1}, \"generation\": \"00000000-0000-0000-0000-00000000001d\", \"last_activity\": \"2026-10-06T12:00:00+00:00\", \"observed_activity\": \"started\", \"recovery_required\": false}"
+      ],
+      [
+        3,
+        "00000000-0000-0000-0000-000000000035",
+        "00000000-0000-0000-0000-00000000003b",
+        "a",
+        "worker-a",
+        "stale",
+        2,
+        "v1",
+        null,
+        null,
+        "{\"context\": {\"checked_base\": null, \"external_ids\": [], \"kind\": \"read-only\", \"repository_exclusive\": false, \"repository_id\": null, \"workspace_id\": null, \"writes\": false}, \"definition\": {\"completion_check\": \"Check for step a\", \"definition_version\": \"v1\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": false, \"step_id\": \"a\", \"title\": \"Step a\"}, \"epoch\": \"epoch-00000000000000000000000000000006\", \"execution_uses\": {\"groups\": {}, \"implementation\": {\"members\": [], \"writer\": {\"actor\": \"synthetic-orchestrator\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000036\", \"ownership_version\": 1, \"reason\": \"Declared implementation assignment\", \"sequence\": 14, \"state\": \"active\"}}, \"source\": {\"assignee\": \"worker-a\", \"attempt_id\": \"00000000-0000-0000-0000-00000000003b\", \"definition\": {\"completion_check\": \"Check for step a\", \"definition_version\": \"v1\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": false, \"step_id\": \"a\", \"title\": \"Step a\"}, \"definition_version\": \"v1\", \"origin_epoch\": \"epoch-00000000000000000000000000000006\", \"origin_generation\": \"00000000-0000-0000-0000-000000000036\", \"plan_id\": \"00000000-0000-0000-0000-000000000035\", \"step_id\": \"a\"}, \"v\": 1}, \"generation\": \"00000000-0000-0000-0000-000000000036\", \"last_activity\": \"2026-10-06T12:00:00+00:00\", \"prior_state\": \"assigned\", \"recovery_required\": true, \"stale_source\": {\"event_id\": \"15\", \"hold_id\": \"00000000-0000-0000-0000-00000000003f\", \"source_id\": \"15:00000000-0000-0000-0000-00000000003b\", \"version\": 2}}"
+      ],
+      [
+        4,
+        "00000000-0000-0000-0000-000000000048",
+        "00000000-0000-0000-0000-00000000004d",
+        "step-1",
+        "legacy-unresolved:step-1",
+        "stale",
+        1,
+        "legacy:e566ce1945cd8ef1f45ebabbcbef2c74501427dc9954b7ad77a00da2d0419d8f",
+        null,
+        null,
+        "{\"context\": {\"checked_base\": null, \"external_ids\": [], \"kind\": \"non-repository\", \"repository_exclusive\": false, \"repository_id\": null, \"workspace_id\": \"00000000-0000-0000-0000-00000000004b\", \"writes\": true}, \"definition\": {\"completion_check\": \"Database migrations execute with exit code 0\", \"definition_version\": \"legacy:e566ce1945cd8ef1f45ebabbcbef2c74501427dc9954b7ad77a00da2d0419d8f\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": false, \"step_id\": \"step-1\", \"title\": \"Set up database schema\"}, \"epoch\": \"epoch-00000000000000000000000000000006\", \"execution_uses\": {\"groups\": {}, \"implementation\": {\"members\": [{\"created_at\": \"2026-10-06T14:00:00+00:00\", \"resource_id\": \"00000000-0000-0000-0000-00000000004b\", \"scope\": \"workspace\", \"use_id\": \"00000000-0000-0000-0000-00000000004f\"}], \"writer\": null}, \"source\": {\"assignee\": \"legacy-unresolved:step-1\", \"attempt_id\": \"00000000-0000-0000-0000-00000000004d\", \"definition\": {\"completion_check\": \"Database migrations execute with exit code 0\", \"definition_version\": \"legacy:e566ce1945cd8ef1f45ebabbcbef2c74501427dc9954b7ad77a00da2d0419d8f\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": false, \"step_id\": \"step-1\", \"title\": \"Set up database schema\"}, \"definition_version\": \"legacy:e566ce1945cd8ef1f45ebabbcbef2c74501427dc9954b7ad77a00da2d0419d8f\", \"origin_epoch\": \"epoch-00000000000000000000000000000006\", \"origin_generation\": \"00000000-0000-0000-0000-000000000049\", \"plan_id\": \"00000000-0000-0000-0000-000000000048\", \"step_id\": \"step-1\"}, \"v\": 1}, \"generation\": \"00000000-0000-0000-0000-000000000049\", \"import_source\": {\"import_id\": \"00000000-0000-0000-0000-00000000004a\", \"source\": \"import:00000000-0000-0000-0000-00000000004a\", \"stale_hold_id\": \"00000000-0000-0000-0000-00000000004e\", \"step_id\": \"step-1\"}, \"last_activity\": null, \"prior_state\": \"active\", \"recovery_required\": true, \"started_at\": null}"
+      ],
+      [
+        5,
+        "00000000-0000-0000-0000-000000000054",
+        "00000000-0000-0000-0000-000000000057",
+        "step-1",
+        "legacy-unresolved:step-1",
+        "stale",
+        1,
+        "legacy:3edbaf67736cac4bc49c813e84e6aac75338aeaa402bbc2faeaa6b655274a506",
+        null,
+        null,
+        "{\"context\": null, \"definition\": {\"completion_check\": \"Database migrations execute with exit code 0\", \"definition_version\": \"legacy:3edbaf67736cac4bc49c813e84e6aac75338aeaa402bbc2faeaa6b655274a506\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": false, \"step_id\": \"step-1\", \"title\": \"Set up database schema\"}, \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000055\", \"identity_hold_id\": \"00000000-0000-0000-0000-000000000059\", \"import_source\": {\"import_id\": \"00000000-0000-0000-0000-000000000056\", \"source\": \"import:00000000-0000-0000-0000-000000000056\", \"stale_hold_id\": \"00000000-0000-0000-0000-000000000058\", \"step_id\": \"step-1\"}, \"last_activity\": null, \"prior_state\": \"active\", \"recovery_required\": true, \"started_at\": null}"
+      ]
+    ],
+    "availability": [],
+    "capabilities": [
+      [
+        1,
+        "00000000-0000-0000-0000-00000000000b",
+        "epoch-00000000000000000000000000000006",
+        "00000000-0000-0000-0000-000000000008",
+        "orchestrator",
+        "36011831bf5c135779f6112efa2d9ee937eb1d9df0b8a719c7cad8b71c706f9e",
+        null,
+        0,
+        "{\"actor\": \"synthetic-orchestrator\"}"
+      ],
+      [
+        2,
+        "00000000-0000-0000-0000-00000000000f",
+        "epoch-00000000000000000000000000000006",
+        "00000000-0000-0000-0000-000000000008",
+        "attempt",
+        "d29f3da03b34f9faf3ab66787d2b6e0fce850d8b515a8e3c91ea5c07ce72f3b4",
+        null,
+        0,
+        "{\"attempt_id\": \"00000000-0000-0000-0000-00000000000e\", \"generation\": \"00000000-0000-0000-0000-000000000009\"}"
+      ],
+      [
+        3,
+        "00000000-0000-0000-0000-00000000001f",
+        "epoch-00000000000000000000000000000006",
+        "00000000-0000-0000-0000-00000000001c",
+        "orchestrator",
+        "c0c59f686f9ceb13673d482475254582bb4219ca2fa703a0cd69d5fbcbeda559",
+        null,
+        0,
+        "{\"actor\": \"synthetic-orchestrator\"}"
+      ],
+      [
+        4,
+        "00000000-0000-0000-0000-00000000002e",
+        "epoch-00000000000000000000000000000006",
+        "00000000-0000-0000-0000-00000000001c",
+        "attempt",
+        "d01d45f4b9265eeeb3b0a4e533ef014e6906543ec7e8f2ae7e16525df25ec20e",
+        null,
+        0,
+        "{\"attempt_id\": \"00000000-0000-0000-0000-00000000002d\", \"generation\": \"00000000-0000-0000-0000-00000000001d\"}"
+      ],
+      [
+        5,
+        "00000000-0000-0000-0000-000000000038",
+        "epoch-00000000000000000000000000000006",
+        "00000000-0000-0000-0000-000000000035",
+        "orchestrator",
+        "f0b6e2af361c70f7a70db572cf42fd914c9f5e2e6d81db7c0b24f0f8b895b90f",
+        null,
+        0,
+        "{\"actor\": \"synthetic-orchestrator\"}"
+      ],
+      [
+        6,
+        "00000000-0000-0000-0000-00000000003c",
+        "epoch-00000000000000000000000000000006",
+        "00000000-0000-0000-0000-000000000035",
+        "attempt",
+        "d04c64ec05fdcb083fe054d6093992eb21aa95e5bcdc20376887c82898946aa3",
+        null,
+        0,
+        "{\"attempt_id\": \"00000000-0000-0000-0000-00000000003b\", \"generation\": \"00000000-0000-0000-0000-000000000036\"}"
+      ],
+      [
+        7,
+        "00000000-0000-0000-0000-000000000050",
+        "epoch-00000000000000000000000000000006",
+        "00000000-0000-0000-0000-000000000048",
+        "orchestrator",
+        "3a54f1097c5d72106a2ae46d9e19d23e0d341d229ee006df6ed877b930a3e00d",
+        null,
+        0,
+        "{\"actor\": \"synthetic-orchestrator\"}"
+      ],
+      [
+        8,
+        "00000000-0000-0000-0000-00000000005a",
+        "epoch-00000000000000000000000000000006",
+        "00000000-0000-0000-0000-000000000054",
+        "orchestrator",
+        "3e184d39becadf8ca0964f3696734b54f39ba9d9c216b16c41b11092539a200e",
+        null,
+        0,
+        "{\"actor\": \"synthetic-orchestrator\"}"
+      ]
+    ],
+    "checkpoints": [
+      [
+        1,
+        "00000000-0000-0000-0000-000000000008",
+        "00000000-0000-0000-0000-00000000000e",
+        4,
+        "passed",
+        "Synthetic checkpoint check",
+        "[{\"artifact\": {\"digest\": null, \"identity\": \"synthetic-artifact\", \"kind\": \"code\", \"summary\": \"Synthetic artifact output\", \"version\": \"v1\"}, \"blockers\": [], \"check\": \"Synthetic checkpoint check\", \"limitations\": [], \"result\": \"passed\", \"summary\": \"Synthetic evidence summary\", \"workspace_id\": null}]",
+        "worker-a",
+        null,
+        "{\"digest\": null, \"identity\": \"synthetic-artifact\", \"kind\": \"code\", \"summary\": \"Synthetic artifact output\", \"version\": \"v1\"}",
+        "{\"affected_steps\": [], \"assumptions\": [], \"disposition\": \"unchanged\", \"facts\": [], \"proposed_draft\": null, \"reason\": \"Synthetic unchanged\", \"summary\": \"Synthetic reassessment\", \"unbounded\": false}",
+        "2026-10-06T12:00:00+00:00"
+      ]
+    ],
+    "creation_ids": [
+      [
+        1,
+        "epoch-00000000000000000000000000000006",
+        "v1-accepted",
+        "00000000-0000-0000-0000-000000000008",
+        "ed3ace3974241962aa6fd19d01045ad8eb1fc83944fd766fa95b5888fbbadfd2",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        2,
+        "epoch-00000000000000000000000000000006",
+        "v1-active",
+        "00000000-0000-0000-0000-00000000001c",
+        "f8c376d425a7ce368b8838a403cacd9aadf74e1573f354917543e23ad3482a89",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        3,
+        "epoch-00000000000000000000000000000006",
+        "v1-stale",
+        "00000000-0000-0000-0000-000000000035",
+        "f8c376d425a7ce368b8838a403cacd9aadf74e1573f354917543e23ad3482a89",
+        "2026-10-06T12:00:00+00:00"
+      ]
+    ],
+    "events": [
+      [
+        1,
+        1,
+        "00000000-0000-0000-0000-000000000008",
+        1,
+        "create_plan",
+        "synthetic-orchestrator",
+        null,
+        null,
+        "2026-10-06T12:00:00+00:00",
+        "{\"authorization_note\": \"Synthetic authorization for testing\", \"authorization_renewed\": true, \"new_plan_intent\": \"Synthetic new-plan intent for fixture\", \"retired_steps\": [], \"summary\": \"Plan created\"}"
+      ],
+      [
+        2,
+        2,
+        "00000000-0000-0000-0000-000000000008",
+        2,
+        "assign_step",
+        "synthetic-orchestrator",
+        null,
+        null,
+        "2026-10-06T12:00:00+00:00",
+        "{\"assignee\": \"worker-a\", \"attempt_id\": \"00000000-0000-0000-0000-00000000000e\", \"definition\": {\"completion_check\": \"Check for step a\", \"definition_version\": \"v1\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": true, \"step_id\": \"a\", \"title\": \"Step a\"}, \"definition_version\": \"v1\", \"execution_transitions\": [{\"actor\": \"synthetic-orchestrator\", \"anchor\": null, \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000009\", \"ownership_version\": 1, \"reason\": \"Declared implementation assignment\", \"role\": \"implementation\", \"state\": \"active\", \"use_ids\": []}], \"step_id\": \"a\", \"version\": 1}"
+      ],
+      [
+        3,
+        3,
+        "00000000-0000-0000-0000-000000000008",
+        3,
+        "start_step",
+        "worker-a",
+        "worker-a",
+        null,
+        "2026-10-06T12:00:00+00:00",
+        "{\"attempt_id\": \"00000000-0000-0000-0000-00000000000e\", \"definition_version\": \"v1\", \"observed_activity\": \"started\", \"step_id\": \"a\", \"version\": 2}"
+      ],
+      [
+        4,
+        4,
+        "00000000-0000-0000-0000-000000000008",
+        4,
+        "record_checkpoint",
+        "worker-a",
+        "worker-a",
+        null,
+        "2026-10-06T12:00:00+00:00",
+        "{\"attempt_id\": \"00000000-0000-0000-0000-00000000000e\", \"checkpoint\": {\"artifact\": {\"digest\": null, \"identity\": \"synthetic-artifact\", \"kind\": \"code\", \"summary\": \"Synthetic artifact output\", \"version\": \"v1\"}, \"check\": \"Synthetic checkpoint check\", \"evidence\": [{\"artifact\": {\"digest\": null, \"identity\": \"synthetic-artifact\", \"kind\": \"code\", \"summary\": \"Synthetic artifact output\", \"version\": \"v1\"}, \"blockers\": [], \"check\": \"Synthetic checkpoint check\", \"limitations\": [], \"result\": \"passed\", \"summary\": \"Synthetic evidence summary\", \"workspace_id\": null}], \"origin_worker\": \"worker-a\", \"outcome\": \"passed\", \"reassessment\": {\"affected_steps\": [], \"assumptions\": [], \"disposition\": \"unchanged\", \"facts\": [], \"proposed_draft\": null, \"reason\": \"Synthetic unchanged\", \"summary\": \"Synthetic reassessment\", \"unbounded\": false}, \"relay\": null}, \"checkpoint_id\": \"4\", \"definition\": {\"completion_check\": \"Check for step a\", \"definition_version\": \"v1\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": true, \"step_id\": \"a\", \"title\": \"Step a\"}, \"definition_version\": \"v1\", \"step_id\": \"a\", \"version\": 3}"
+      ],
+      [
+        5,
+        5,
+        "00000000-0000-0000-0000-000000000008",
+        5,
+        "record_review",
+        "synthetic-orchestrator",
+        null,
+        null,
+        "2026-10-06T12:00:00+00:00",
+        "{\"artifact\": {\"digest\": null, \"identity\": \"synthetic-artifact\", \"kind\": \"code\", \"summary\": \"Synthetic artifact output\", \"version\": \"v1\"}, \"attempt_id\": \"00000000-0000-0000-0000-00000000000e\", \"cycle\": {\"attempt_id\": \"00000000-0000-0000-0000-00000000000e\", \"checkpoint_sequence\": 4, \"definition_version\": \"v1\", \"kind\": \"submission\", \"plan_id\": \"00000000-0000-0000-0000-000000000008\", \"step_id\": \"a\"}, \"definition\": {\"completion_check\": \"Check for step a\", \"definition_version\": \"v1\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": true, \"step_id\": \"a\", \"title\": \"Step a\"}, \"definition_version\": \"v1\", \"review_id\": \"00000000-0000-0000-0000-000000000016\", \"reviewer\": \"synthetic-reviewer\", \"step_id\": \"a\", \"verdict\": \"passed\", \"verification_use_id\": null}"
+      ],
+      [
+        6,
+        6,
+        "00000000-0000-0000-0000-000000000008",
+        6,
+        "accept_step",
+        "synthetic-orchestrator",
+        null,
+        null,
+        "2026-10-06T12:00:00+00:00",
+        "{\"artifact\": {\"digest\": null, \"identity\": \"synthetic-artifact\", \"kind\": \"code\", \"summary\": \"Synthetic artifact output\", \"version\": \"v1\"}, \"attempt_id\": \"00000000-0000-0000-0000-00000000000e\", \"checkpoint_sequence\": 4, \"definition\": {\"completion_check\": \"Check for step a\", \"definition_version\": \"v1\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": true, \"step_id\": \"a\", \"title\": \"Step a\"}, \"definition_version\": \"v1\", \"released_use_ids\": [], \"result_version\": \"00000000-0000-0000-0000-000000000019\", \"review_id\": \"00000000-0000-0000-0000-000000000016\", \"review_sequence\": 5, \"step_id\": \"a\", \"stopped_reason\": null, \"stopped_resource_ids\": [], \"version\": 4}"
+      ],
+      [
+        7,
+        7,
+        "00000000-0000-0000-0000-00000000001c",
+        1,
+        "create_plan",
+        "synthetic-orchestrator",
+        null,
+        null,
+        "2026-10-06T12:00:00+00:00",
+        "{\"authorization_note\": \"Synthetic authorization for testing\", \"authorization_renewed\": true, \"new_plan_intent\": \"Synthetic new-plan intent for fixture\", \"retired_steps\": [], \"summary\": \"Plan created\"}"
+      ],
+      [
+        8,
+        8,
+        "00000000-0000-0000-0000-00000000001c",
+        2,
+        "register_resource",
+        "synthetic-orchestrator",
+        null,
+        null,
+        "2026-10-06T12:00:00+00:00",
+        "{\"resource_id\": \"00000000-0000-0000-0000-000000000022\"}"
+      ],
+      [
+        9,
+        9,
+        "00000000-0000-0000-0000-00000000001c",
+        3,
+        "register_resource",
+        "synthetic-orchestrator",
+        null,
+        null,
+        "2026-10-06T12:00:00+00:00",
+        "{\"resource_id\": \"00000000-0000-0000-0000-000000000026\"}"
+      ],
+      [
+        10,
+        10,
+        "00000000-0000-0000-0000-00000000001c",
+        4,
+        "register_resource",
+        "synthetic-orchestrator",
+        null,
+        null,
+        "2026-10-06T12:00:00+00:00",
+        "{\"resource_id\": \"00000000-0000-0000-0000-00000000002a\"}"
+      ],
+      [
+        11,
+        11,
+        "00000000-0000-0000-0000-00000000001c",
+        5,
+        "assign_step",
+        "synthetic-orchestrator",
+        null,
+        null,
+        "2026-10-06T12:00:00+00:00",
+        "{\"assignee\": \"worker-a\", \"attempt_id\": \"00000000-0000-0000-0000-00000000002d\", \"definition\": {\"completion_check\": \"Check for step a\", \"definition_version\": \"v1\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": false, \"step_id\": \"a\", \"title\": \"Step a\"}, \"definition_version\": \"v1\", \"execution_transitions\": [{\"actor\": \"synthetic-orchestrator\", \"anchor\": null, \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-00000000001d\", \"ownership_version\": 1, \"reason\": \"Declared implementation assignment\", \"role\": \"implementation\", \"state\": \"active\", \"use_ids\": [\"00000000-0000-0000-0000-00000000002f\", \"00000000-0000-0000-0000-000000000030\"]}], \"step_id\": \"a\", \"version\": 1}"
+      ],
+      [
+        12,
+        12,
+        "00000000-0000-0000-0000-00000000001c",
+        6,
+        "start_step",
+        "worker-a",
+        "worker-a",
+        null,
+        "2026-10-06T12:00:00+00:00",
+        "{\"attempt_id\": \"00000000-0000-0000-0000-00000000002d\", \"definition_version\": \"v1\", \"observed_activity\": \"started\", \"step_id\": \"a\", \"version\": 2}"
+      ],
+      [
+        13,
+        13,
+        "00000000-0000-0000-0000-000000000035",
+        1,
+        "create_plan",
+        "synthetic-orchestrator",
+        null,
+        null,
+        "2026-10-06T12:00:00+00:00",
+        "{\"authorization_note\": \"Synthetic authorization for testing\", \"authorization_renewed\": true, \"new_plan_intent\": \"Synthetic new-plan intent for fixture\", \"retired_steps\": [], \"summary\": \"Plan created\"}"
+      ],
+      [
+        14,
+        14,
+        "00000000-0000-0000-0000-000000000035",
+        2,
+        "assign_step",
+        "synthetic-orchestrator",
+        null,
+        null,
+        "2026-10-06T12:00:00+00:00",
+        "{\"assignee\": \"worker-a\", \"attempt_id\": \"00000000-0000-0000-0000-00000000003b\", \"definition\": {\"completion_check\": \"Check for step a\", \"definition_version\": \"v1\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": false, \"step_id\": \"a\", \"title\": \"Step a\"}, \"definition_version\": \"v1\", \"execution_transitions\": [{\"actor\": \"synthetic-orchestrator\", \"anchor\": null, \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000036\", \"ownership_version\": 1, \"reason\": \"Declared implementation assignment\", \"role\": \"implementation\", \"state\": \"active\", \"use_ids\": []}], \"step_id\": \"a\", \"version\": 1}"
+      ],
+      [
+        15,
+        15,
+        "00000000-0000-0000-0000-000000000035",
+        3,
+        "sweep_stale",
+        "synthetic-orchestrator",
+        null,
+        null,
+        "2026-10-06T14:00:00+00:00",
+        "{\"attempts\": [{\"assignee\": \"worker-a\", \"attempt_id\": \"00000000-0000-0000-0000-00000000003b\", \"before_version\": 1, \"context\": {\"checked_base\": null, \"external_ids\": [], \"kind\": \"read-only\", \"repository_exclusive\": false, \"repository_id\": null, \"workspace_id\": null, \"writes\": false}, \"definition\": {\"completion_check\": \"Check for step a\", \"definition_version\": \"v1\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": false, \"step_id\": \"a\", \"title\": \"Step a\"}, \"definition_version\": \"v1\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000036\", \"hold_id\": \"00000000-0000-0000-0000-00000000003f\", \"last_activity\": \"2026-10-06T12:00:00+00:00\", \"prior_state\": \"assigned\", \"step_id\": \"a\", \"version\": 2}], \"observed_at\": \"2026-10-06T14:00:00+00:00\", \"threshold_seconds\": 900}"
+      ],
+      [
+        16,
+        16,
+        "00000000-0000-0000-0000-00000000001c",
+        7,
+        "register_resource",
+        "synthetic-orchestrator",
+        null,
+        null,
+        "2026-10-06T14:00:00+00:00",
+        "{\"resource_id\": \"00000000-0000-0000-0000-000000000042\"}"
+      ],
+      [
+        17,
+        17,
+        null,
+        null,
+        "seeded_orphan_use",
+        "synthetic-orphan",
+        null,
+        null,
+        "2026-10-06T14:00:00+00:00",
+        "{\"resource_id\": \"00000000-0000-0000-0000-000000000042\", \"use_id\": \"00000000-0000-0000-0000-000000000045\"}"
+      ],
+      [
+        18,
+        18,
+        "00000000-0000-0000-0000-000000000048",
+        1,
+        "import_plan",
+        "synthetic-orchestrator",
+        null,
+        null,
+        "2026-10-06T14:00:00+00:00",
+        "{\"authorization_note_missing\": false, \"authorization_renewed\": false, \"command_digest\": \"3506477eef4d16b7cc5fd6e332c67392e22842e19c1aee2b8c6b4830f91b731f\", \"committed_source_directory_id\": \"00000000-0000-0000-0000-000000000046\", \"constructor_attempts\": {\"step-1\": \"00000000-0000-0000-0000-00000000004d\"}, \"content_digest\": \"6cf4392b528311f4dcd8f86f3c9f7a2596b288f0a846b82d592ca71a1d7cef31\", \"host_id\": \"synthetic-host\", \"import_id\": \"00000000-0000-0000-0000-00000000004a\", \"initial_contexts\": {\"step-1\": {\"checked_base\": null, \"external_ids\": [], \"kind\": \"non-repository\", \"repository_exclusive\": false, \"repository_id\": null, \"workspace_id\": \"00000000-0000-0000-0000-00000000004b\", \"writes\": true}}, \"original_snapshot\": {\"changeSummary\": \"Initial v2 plan configuration\", \"executionMode\": \"first-step\", \"generation\": \"00000000-0000-4000-8000-000000000001\", \"history\": [{\"authorizationNote\": \"synthetic legacy authorization\", \"revision\": 1, \"summary\": \"Initial v2 plan configuration\", \"timestamp\": \"2026-10-06T00:00:00+00:00\"}], \"nextStepId\": \"step-1\", \"objective\": \"Verify the v2 test harness\", \"revision\": 1, \"schemaVersion\": 2, \"scope\": {\"baseline\": [], \"claimed\": \"step-1\", \"mode\": \"first-step\", \"sinceRevision\": 1}, \"status\": \"running\", \"steps\": [{\"check\": \"Database migrations execute with exit code 0\", \"dependsOn\": [], \"evidence\": [], \"id\": \"step-1\", \"status\": \"in-progress\", \"title\": \"Set up database schema\"}, {\"check\": \"User count equals 10\", \"dependsOn\": [\"step-1\"], \"evidence\": [], \"id\": \"step-2\", \"status\": \"pending\", \"title\": \"Seed baseline data\"}], \"taskId\": \"task-test-01\", \"updatedAt\": \"2026-10-06T00:00:00+00:00\"}, \"original_task_id\": \"task-test-01\", \"plan_generation\": \"00000000-0000-0000-0000-000000000049\", \"plan_id\": \"00000000-0000-0000-0000-000000000048\", \"provenance\": {\"branch\": null, \"commit\": null, \"path\": \"synthetic-legacy.json\", \"task_id\": null, \"version\": \"v1\"}, \"request_epoch\": \"epoch-00000000000000000000000000000006\", \"request_key\": \"v1-import-True\", \"source_directory_id\": \"00000000-0000-0000-0000-000000000046\", \"v\": 1, \"writers_stopped\": \"synthetic publisher stopped; worker unconfirmed\"}"
+      ],
+      [
+        19,
+        19,
+        "00000000-0000-0000-0000-000000000054",
+        1,
+        "import_plan",
+        "synthetic-orchestrator",
+        null,
+        null,
+        "2026-10-06T14:00:00+00:00",
+        "{\"authorization_note_missing\": false, \"authorization_renewed\": false, \"command_digest\": \"4bce58031c020e0bafd0643734e2fcb2706264813bb25434edb612c6c3c75e4c\", \"committed_source_directory_id\": \"00000000-0000-0000-0000-000000000052\", \"constructor_attempts\": {\"step-1\": \"00000000-0000-0000-0000-000000000057\"}, \"content_digest\": \"6cf4392b528311f4dcd8f86f3c9f7a2596b288f0a846b82d592ca71a1d7cef31\", \"host_id\": \"synthetic-host\", \"import_id\": \"00000000-0000-0000-0000-000000000056\", \"initial_contexts\": {\"step-1\": null}, \"original_snapshot\": {\"changeSummary\": \"Initial v2 plan configuration\", \"executionMode\": \"first-step\", \"generation\": \"00000000-0000-4000-8000-000000000001\", \"history\": [{\"authorizationNote\": \"synthetic legacy authorization\", \"revision\": 1, \"summary\": \"Initial v2 plan configuration\", \"timestamp\": \"2026-10-06T00:00:00+00:00\"}], \"nextStepId\": \"step-1\", \"objective\": \"Verify the v2 test harness\", \"revision\": 1, \"schemaVersion\": 2, \"scope\": {\"baseline\": [], \"claimed\": \"step-1\", \"mode\": \"first-step\", \"sinceRevision\": 1}, \"status\": \"running\", \"steps\": [{\"check\": \"Database migrations execute with exit code 0\", \"dependsOn\": [], \"evidence\": [], \"id\": \"step-1\", \"status\": \"in-progress\", \"title\": \"Set up database schema\"}, {\"check\": \"User count equals 10\", \"dependsOn\": [\"step-1\"], \"evidence\": [], \"id\": \"step-2\", \"status\": \"pending\", \"title\": \"Seed baseline data\"}], \"taskId\": \"task-test-01\", \"updatedAt\": \"2026-10-06T00:00:00+00:00\"}, \"original_task_id\": \"task-test-01\", \"plan_generation\": \"00000000-0000-0000-0000-000000000055\", \"plan_id\": \"00000000-0000-0000-0000-000000000054\", \"provenance\": {\"branch\": null, \"commit\": null, \"path\": \"synthetic-legacy.json\", \"task_id\": null, \"version\": \"v1\"}, \"request_epoch\": \"epoch-00000000000000000000000000000006\", \"request_key\": \"v1-import-False\", \"source_directory_id\": \"00000000-0000-0000-0000-000000000052\", \"v\": 1, \"writers_stopped\": \"synthetic publisher stopped; worker unconfirmed\"}"
+      ]
+    ],
+    "holds": [
+      [
+        1,
+        "00000000-0000-0000-0000-00000000003f",
+        "00000000-0000-0000-0000-000000000035",
+        "{\"kind\": \"stale\", \"reason\": \"Recorded inactivity requires an explicit ownership decision\", \"source_id\": \"15:00000000-0000-0000-0000-00000000003b\", \"step_id\": \"a\"}",
+        1,
+        "2026-10-06T14:00:00+00:00"
+      ],
+      [
+        2,
+        "00000000-0000-0000-0000-00000000004e",
+        "00000000-0000-0000-0000-000000000048",
+        "{\"kind\": \"stale\", \"reason\": \"Imported legacy in-progress obligation requires an explicit ownership decision\", \"source_id\": \"import:00000000-0000-0000-0000-00000000004a:00000000-0000-0000-0000-00000000004d:stale\", \"step_id\": \"step-1\"}",
+        1,
+        "2026-10-06T14:00:00+00:00"
+      ],
+      [
+        3,
+        "00000000-0000-0000-0000-000000000058",
+        "00000000-0000-0000-0000-000000000054",
+        "{\"kind\": \"stale\", \"reason\": \"Imported legacy in-progress obligation requires an explicit ownership decision\", \"source_id\": \"import:00000000-0000-0000-0000-000000000056:00000000-0000-0000-0000-000000000057:stale\", \"step_id\": \"step-1\"}",
+        1,
+        "2026-10-06T14:00:00+00:00"
+      ],
+      [
+        4,
+        "00000000-0000-0000-0000-000000000059",
+        "00000000-0000-0000-0000-000000000054",
+        "{\"hold_id\": \"00000000-0000-0000-0000-000000000059\", \"kind\": \"identity\", \"reason\": \"Missing required execution identity requires explicit attachment\", \"source_id\": \"import:00000000-0000-0000-0000-000000000056:00000000-0000-0000-0000-000000000057\", \"step_id\": \"step-1\"}",
+        1,
+        "2026-10-06T14:00:00+00:00"
+      ]
+    ],
+    "imports": [
+      [
+        1,
+        "00000000-0000-0000-0000-00000000004a",
+        "synthetic-host",
+        "00000000-0000-0000-0000-000000000046",
+        "task-test-01",
+        "00000000-0000-0000-0000-000000000048",
+        "6cf4392b528311f4dcd8f86f3c9f7a2596b288f0a846b82d592ca71a1d7cef31",
+        "2026-10-06T14:00:00+00:00"
+      ],
+      [
+        2,
+        "00000000-0000-0000-0000-000000000056",
+        "synthetic-host",
+        "00000000-0000-0000-0000-000000000052",
+        "task-test-01",
+        "00000000-0000-0000-0000-000000000054",
+        "6cf4392b528311f4dcd8f86f3c9f7a2596b288f0a846b82d592ca71a1d7cef31",
+        "2026-10-06T14:00:00+00:00"
+      ]
+    ],
+    "installation": [
+      [
+        1,
+        1,
+        "epoch-00000000000000000000000000000006",
+        1,
+        "synthetic-host",
+        "authority",
+        "",
+        0,
+        null,
+        "2026-10-06T12:00:00+00:00"
+      ]
+    ],
+    "plans": [
+      [
+        1,
+        "00000000-0000-0000-0000-000000000008",
+        "00000000-0000-0000-0000-000000000009",
+        6,
+        "complete",
+        "Synthetic plan draft objective",
+        1,
+        "2026-10-06T12:00:00+00:00",
+        "2026-10-06T12:00:00+00:00",
+        "{\"draft\": {\"acceptance_criteria\": [\"Acceptance criterion 1\", \"Acceptance criterion 2\"], \"assumptions\": [\"Assumption 1\"], \"authorization\": {\"baseline\": [], \"claimed\": null, \"interval\": \"00000000-0000-0000-0000-00000000000a\", \"mode\": \"complete-task\", \"note\": \"Synthetic authorization for testing\", \"since_revision\": 1}, \"block_reason\": null, \"constraints\": [\"Constraint 1\"], \"documents\": [], \"facts\": [\"Fact 1\"], \"horizon\": 10, \"next_check\": \"Check next step\", \"objective\": \"Synthetic plan draft objective\", \"stop_reason\": null, \"workflow\": null, \"workspace_refs\": []}}"
+      ],
+      [
+        2,
+        "00000000-0000-0000-0000-00000000001c",
+        "00000000-0000-0000-0000-00000000001d",
+        7,
+        "running",
+        "Synthetic plan draft objective",
+        1,
+        "2026-10-06T12:00:00+00:00",
+        "2026-10-06T14:00:00+00:00",
+        "{\"draft\": {\"acceptance_criteria\": [\"Acceptance criterion 1\", \"Acceptance criterion 2\"], \"assumptions\": [\"Assumption 1\"], \"authorization\": {\"baseline\": [], \"claimed\": null, \"interval\": \"00000000-0000-0000-0000-00000000001e\", \"mode\": \"complete-task\", \"note\": \"Synthetic authorization for testing\", \"since_revision\": 1}, \"block_reason\": null, \"constraints\": [\"Constraint 1\"], \"documents\": [], \"facts\": [\"Fact 1\"], \"horizon\": 10, \"next_check\": \"Check next step\", \"objective\": \"Synthetic plan draft objective\", \"stop_reason\": null, \"workflow\": null, \"workspace_refs\": []}}"
+      ],
+      [
+        3,
+        "00000000-0000-0000-0000-000000000035",
+        "00000000-0000-0000-0000-000000000036",
+        3,
+        "blocked",
+        "Synthetic plan draft objective",
+        1,
+        "2026-10-06T12:00:00+00:00",
+        "2026-10-06T14:00:00+00:00",
+        "{\"draft\": {\"acceptance_criteria\": [\"Acceptance criterion 1\", \"Acceptance criterion 2\"], \"assumptions\": [\"Assumption 1\"], \"authorization\": {\"baseline\": [], \"claimed\": null, \"interval\": \"00000000-0000-0000-0000-000000000037\", \"mode\": \"complete-task\", \"note\": \"Synthetic authorization for testing\", \"since_revision\": 1}, \"block_reason\": null, \"constraints\": [\"Constraint 1\"], \"documents\": [], \"facts\": [\"Fact 1\"], \"horizon\": 10, \"next_check\": \"Check next step\", \"objective\": \"Synthetic plan draft objective\", \"stop_reason\": null, \"workflow\": null, \"workspace_refs\": []}}"
+      ],
+      [
+        4,
+        "00000000-0000-0000-0000-000000000048",
+        "00000000-0000-0000-0000-000000000049",
+        1,
+        "blocked",
+        "Verify the v2 test harness",
+        1,
+        "2026-10-06T14:00:00+00:00",
+        "2026-10-06T14:00:00+00:00",
+        "{\"draft\": {\"acceptance_criteria\": [], \"assumptions\": [], \"authorization\": {\"baseline\": [], \"claimed\": \"step-1\", \"interval\": \"legacy:ad2dc84ea0d98aee3f9af2379f9221d2b27fed497c6dc56f62ffe15577ba9887\", \"mode\": \"first-step\", \"note\": \"synthetic legacy authorization\", \"since_revision\": 1}, \"block_reason\": null, \"constraints\": [], \"documents\": [{\"branch\": null, \"commit\": null, \"path\": \"synthetic-legacy.json\", \"task_id\": null, \"version\": \"v1\"}], \"facts\": [], \"horizon\": 10, \"next_check\": \"Database migrations execute with exit code 0\", \"objective\": \"Verify the v2 test harness\", \"stop_reason\": null, \"workflow\": null, \"workspace_refs\": []}}"
+      ],
+      [
+        5,
+        "00000000-0000-0000-0000-000000000054",
+        "00000000-0000-0000-0000-000000000055",
+        1,
+        "blocked",
+        "Verify the v2 test harness",
+        1,
+        "2026-10-06T14:00:00+00:00",
+        "2026-10-06T14:00:00+00:00",
+        "{\"draft\": {\"acceptance_criteria\": [], \"assumptions\": [], \"authorization\": {\"baseline\": [], \"claimed\": \"step-1\", \"interval\": \"legacy:6d3bf5d120e7e9c83538720c0eb0d93476cac01cb206bea07df42e85e610929a\", \"mode\": \"first-step\", \"note\": \"synthetic legacy authorization\", \"since_revision\": 1}, \"block_reason\": null, \"constraints\": [], \"documents\": [{\"branch\": null, \"commit\": null, \"path\": \"synthetic-legacy.json\", \"task_id\": null, \"version\": \"v1\"}], \"facts\": [], \"horizon\": 10, \"next_check\": \"Database migrations execute with exit code 0\", \"objective\": \"Verify the v2 test harness\", \"stop_reason\": null, \"workflow\": null, \"workspace_refs\": []}}"
+      ]
+    ],
+    "requests": [
+      [
+        1,
+        "00000000-0000-0000-0000-00000000000c",
+        "epoch-00000000000000000000000000000006",
+        "00000000000000000000000000000007",
+        "f55f5e4bd8f7791e6488ad8c444cad45ecbbddc84fe2e4a185dc1c617383ff45",
+        "00000000-0000-0000-0000-000000000008",
+        "{\"committed\": {\"creation_id\": \"v1-accepted\", \"generation\": \"00000000-0000-0000-0000-000000000009\", \"plan_id\": \"00000000-0000-0000-0000-000000000008\", \"revision\": 1}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-000000000008\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000009\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-000000000008\", \"revision\": 1}, \"private\": {\"attempt_token\": null, \"orchestrator_token\": \"synthetic-only-token-00000000000000000000000000000001\"}}",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        2,
+        "00000000-0000-0000-0000-000000000010",
+        "epoch-00000000000000000000000000000006",
+        "0000000000000000000000000000000d",
+        "93d1889a915d16b7a500bbee3b5b403276b26fe7cec59fd14faeb3c1e34c7f40",
+        "00000000-0000-0000-0000-000000000008",
+        "{\"committed\": {\"attempt_id\": \"00000000-0000-0000-0000-00000000000e\", \"definition_version\": \"v1\", \"version\": 1}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-000000000008\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000009\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-000000000008\", \"revision\": 2}, \"private\": {\"attempt_token\": \"synthetic-only-token-00000000000000000000000000000002\", \"orchestrator_token\": null}}",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        3,
+        "00000000-0000-0000-0000-000000000012",
+        "epoch-00000000000000000000000000000006",
+        "00000000000000000000000000000011",
+        "342e3fef2d382e701648d0bc5a42dabed7d8fd4d44b9b856b62ff5e382ac25b3",
+        "00000000-0000-0000-0000-000000000008",
+        "{\"committed\": {\"attempt_id\": \"00000000-0000-0000-0000-00000000000e\", \"definition_version\": \"v1\", \"step_id\": \"a\", \"version\": 2}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-000000000008\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000009\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-000000000008\", \"revision\": 3}, \"private\": null}",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        4,
+        "00000000-0000-0000-0000-000000000014",
+        "epoch-00000000000000000000000000000006",
+        "00000000000000000000000000000013",
+        "679cbc158d52425a4094b61fabf85ffe1f8bc864200a005690804e6e1cffd939",
+        "00000000-0000-0000-0000-000000000008",
+        "{\"committed\": {\"attempt_id\": \"00000000-0000-0000-0000-00000000000e\", \"checkpoint_id\": \"4\", \"definition_version\": \"v1\", \"step_id\": \"a\", \"version\": 3}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-000000000008\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000009\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-000000000008\", \"revision\": 4}, \"private\": null}",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        5,
+        "00000000-0000-0000-0000-000000000017",
+        "epoch-00000000000000000000000000000006",
+        "00000000000000000000000000000015",
+        "42512e82c4f9578b19bfe764b99550c34923be9eeec0ae247a38d1c9e702da5e",
+        "00000000-0000-0000-0000-000000000008",
+        "{\"committed\": {\"attempt_id\": \"00000000-0000-0000-0000-00000000000e\", \"review_id\": \"00000000-0000-0000-0000-000000000016\", \"verdict\": \"passed\"}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-000000000008\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000009\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-000000000008\", \"revision\": 5}, \"private\": null}",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        6,
+        "00000000-0000-0000-0000-00000000001a",
+        "epoch-00000000000000000000000000000006",
+        "00000000000000000000000000000018",
+        "acb28ee90e63b15ed81e7883bd631f2af7d2cd6103212a4e14c253ccfbe8cab0",
+        "00000000-0000-0000-0000-000000000008",
+        "{\"committed\": {\"attempt_id\": \"00000000-0000-0000-0000-00000000000e\", \"definition_version\": \"v1\", \"result_version\": \"00000000-0000-0000-0000-000000000019\", \"step_id\": \"a\", \"version\": 4}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-000000000008\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000009\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-000000000008\", \"revision\": 6}, \"private\": null}",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        7,
+        "00000000-0000-0000-0000-000000000020",
+        "epoch-00000000000000000000000000000006",
+        "0000000000000000000000000000001b",
+        "82a3b8c1f557cc444e4e3733609134a70aeb2c2d9d3abd78c1b7453ee6affe04",
+        "00000000-0000-0000-0000-00000000001c",
+        "{\"committed\": {\"creation_id\": \"v1-active\", \"generation\": \"00000000-0000-0000-0000-00000000001d\", \"plan_id\": \"00000000-0000-0000-0000-00000000001c\", \"revision\": 1}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-00000000001c\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-00000000001d\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-00000000001c\", \"revision\": 1}, \"private\": {\"attempt_token\": null, \"orchestrator_token\": \"synthetic-only-token-00000000000000000000000000000003\"}}",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        8,
+        "00000000-0000-0000-0000-000000000024",
+        "epoch-00000000000000000000000000000006",
+        "00000000000000000000000000000021",
+        "d9fd374e6d653bf1969fb4289bfcb0835b1600115555cd67ba5150fd758c250f",
+        "00000000-0000-0000-0000-00000000001c",
+        "{\"committed\": {\"resource_id\": \"00000000-0000-0000-0000-000000000022\"}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-00000000001c\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-00000000001d\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-00000000001c\", \"revision\": 2}, \"private\": null}",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        9,
+        "00000000-0000-0000-0000-000000000028",
+        "epoch-00000000000000000000000000000006",
+        "00000000000000000000000000000025",
+        "8e7fdc05512da74a292e693fa23875dd94cda2aa87571e36d7f9bf777f38deec",
+        "00000000-0000-0000-0000-00000000001c",
+        "{\"committed\": {\"resource_id\": \"00000000-0000-0000-0000-000000000026\"}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-00000000001c\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-00000000001d\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-00000000001c\", \"revision\": 3}, \"private\": null}",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        10,
+        "00000000-0000-0000-0000-00000000002b",
+        "epoch-00000000000000000000000000000006",
+        "00000000000000000000000000000029",
+        "ea0e8dddfba98bdce84364dc6cb7233eee3eaba7ffd8cd2cbd9f5dc1ac159737",
+        "00000000-0000-0000-0000-00000000001c",
+        "{\"committed\": {\"resource_id\": \"00000000-0000-0000-0000-00000000002a\"}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-00000000001c\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-00000000001d\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-00000000001c\", \"revision\": 4}, \"private\": null}",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        11,
+        "00000000-0000-0000-0000-000000000031",
+        "epoch-00000000000000000000000000000006",
+        "0000000000000000000000000000002c",
+        "fbf025142244d4535ecf9320f7ae6057932cbd16536e0053537b20538ff0e266",
+        "00000000-0000-0000-0000-00000000001c",
+        "{\"committed\": {\"attempt_id\": \"00000000-0000-0000-0000-00000000002d\", \"definition_version\": \"v1\", \"version\": 1}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-00000000001c\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-00000000001d\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-00000000001c\", \"revision\": 5}, \"private\": {\"attempt_token\": \"synthetic-only-token-00000000000000000000000000000004\", \"orchestrator_token\": null}}",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        12,
+        "00000000-0000-0000-0000-000000000033",
+        "epoch-00000000000000000000000000000006",
+        "00000000000000000000000000000032",
+        "332eeaca859fe6b6aef569603b518483718722a6b4d3f9adfab780b6d7ad1eda",
+        "00000000-0000-0000-0000-00000000001c",
+        "{\"committed\": {\"attempt_id\": \"00000000-0000-0000-0000-00000000002d\", \"definition_version\": \"v1\", \"step_id\": \"a\", \"version\": 2}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-00000000001c\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-00000000001d\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-00000000001c\", \"revision\": 6}, \"private\": null}",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        13,
+        "00000000-0000-0000-0000-000000000039",
+        "epoch-00000000000000000000000000000006",
+        "00000000000000000000000000000034",
+        "2076600a10a6dbde5256d4f8cebc7de1292f2397411cbb9bcc377925ef925b72",
+        "00000000-0000-0000-0000-000000000035",
+        "{\"committed\": {\"creation_id\": \"v1-stale\", \"generation\": \"00000000-0000-0000-0000-000000000036\", \"plan_id\": \"00000000-0000-0000-0000-000000000035\", \"revision\": 1}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-000000000035\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000036\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-000000000035\", \"revision\": 1}, \"private\": {\"attempt_token\": null, \"orchestrator_token\": \"synthetic-only-token-00000000000000000000000000000005\"}}",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        14,
+        "00000000-0000-0000-0000-00000000003d",
+        "epoch-00000000000000000000000000000006",
+        "0000000000000000000000000000003a",
+        "d1f2db39d305c0af4619a9143423efbe17e3441455d79182e13ed780baa0f2de",
+        "00000000-0000-0000-0000-000000000035",
+        "{\"committed\": {\"attempt_id\": \"00000000-0000-0000-0000-00000000003b\", \"definition_version\": \"v1\", \"version\": 1}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-000000000035\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000036\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-000000000035\", \"revision\": 2}, \"private\": {\"attempt_token\": \"synthetic-only-token-00000000000000000000000000000006\", \"orchestrator_token\": null}}",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        15,
+        "00000000-0000-0000-0000-000000000040",
+        "epoch-00000000000000000000000000000006",
+        "0000000000000000000000000000003e",
+        "ee6b172ed2cc7429dc0ec333da81696888ed9632cf2f4b467ee974da4015f278",
+        "00000000-0000-0000-0000-000000000035",
+        "{\"committed\": {\"attempt_ids\": [\"00000000-0000-0000-0000-00000000003b\"]}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-000000000035\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000036\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-000000000035\", \"revision\": 3}, \"private\": null}",
+        "2026-10-06T14:00:00+00:00"
+      ],
+      [
+        16,
+        "00000000-0000-0000-0000-000000000044",
+        "epoch-00000000000000000000000000000006",
+        "00000000000000000000000000000041",
+        "6cf39ec11580bc1aaa60b982ad889b7042d7cdf1eca30cdc9de7a0fda8c03618",
+        "00000000-0000-0000-0000-00000000001c",
+        "{\"committed\": {\"resource_id\": \"00000000-0000-0000-0000-000000000042\"}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-00000000001c\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-00000000001d\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-00000000001c\", \"revision\": 7}, \"private\": null}",
+        "2026-10-06T14:00:00+00:00"
+      ],
+      [
+        17,
+        "00000000-0000-0000-0000-000000000051",
+        "epoch-00000000000000000000000000000006",
+        "v1-import-True",
+        "3506477eef4d16b7cc5fd6e332c67392e22842e19c1aee2b8c6b4830f91b731f",
+        "00000000-0000-0000-0000-000000000048",
+        "{\"committed\": {\"source_directory_id\": \"00000000-0000-0000-0000-000000000046\"}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-000000000048\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000049\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-000000000048\", \"revision\": 1}, \"private\": {\"attempt_token\": null, \"orchestrator_token\": \"synthetic-only-token-00000000000000000000000000000007\"}}",
+        "2026-10-06T14:00:00+00:00"
+      ],
+      [
+        18,
+        "00000000-0000-0000-0000-00000000005b",
+        "epoch-00000000000000000000000000000006",
+        "v1-import-False",
+        "4bce58031c020e0bafd0643734e2fcb2706264813bb25434edb612c6c3c75e4c",
+        "00000000-0000-0000-0000-000000000054",
+        "{\"committed\": {\"source_directory_id\": \"00000000-0000-0000-0000-000000000052\"}, \"committed_metadata\": {\"dashboard_url\": \"http://127.0.0.1:8790/plans/00000000-0000-0000-0000-000000000054\", \"epoch\": \"epoch-00000000000000000000000000000006\", \"generation\": \"00000000-0000-0000-0000-000000000055\", \"ownership_version\": 1, \"plan_id\": \"00000000-0000-0000-0000-000000000054\", \"revision\": 1}, \"private\": {\"attempt_token\": null, \"orchestrator_token\": \"synthetic-only-token-00000000000000000000000000000008\"}}",
+        "2026-10-06T14:00:00+00:00"
+      ]
+    ],
+    "resource_redirects": [],
+    "resource_uses": [
+      [
+        1,
+        "00000000-0000-0000-0000-00000000002f",
+        "00000000-0000-0000-0000-000000000026",
+        "00000000-0000-0000-0000-00000000001c",
+        "00000000-0000-0000-0000-00000000002d",
+        null,
+        "workspace",
+        "active",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        2,
+        "00000000-0000-0000-0000-000000000030",
+        "00000000-0000-0000-0000-00000000002a",
+        "00000000-0000-0000-0000-00000000001c",
+        "00000000-0000-0000-0000-00000000002d",
+        null,
+        "external",
+        "active",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        3,
+        "00000000-0000-0000-0000-000000000045",
+        "00000000-0000-0000-0000-000000000042",
+        null,
+        null,
+        "seeded-orphan",
+        "workspace",
+        "unresolved",
+        "2026-10-06T14:00:00+00:00"
+      ],
+      [
+        4,
+        "v1-orphan-released",
+        "00000000-0000-0000-0000-000000000042",
+        null,
+        null,
+        "seeded-orphan",
+        "workspace",
+        "released",
+        "2026-10-06T14:00:00+00:00"
+      ],
+      [
+        5,
+        "v1-orphan-second",
+        "00000000-0000-0000-0000-000000000042",
+        null,
+        null,
+        "seeded-orphan",
+        "workspace",
+        "unresolved",
+        "2026-10-06T14:00:00+00:00"
+      ],
+      [
+        6,
+        "00000000-0000-0000-0000-00000000004f",
+        "00000000-0000-0000-0000-00000000004b",
+        "00000000-0000-0000-0000-000000000048",
+        "00000000-0000-0000-0000-00000000004d",
+        null,
+        "workspace",
+        "unresolved",
+        "2026-10-06T14:00:00+00:00"
+      ]
+    ],
+    "resources": [
+      [
+        1,
+        "00000000-0000-0000-0000-000000000022",
+        "synthetic-host",
+        "repository",
+        null,
+        "{\"case_insensitive\":false,\"device\":\"7\",\"external_identity\":null,\"inode\":\"901\",\"v\":1}",
+        "/synthetic/v1-repo",
+        "active",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        2,
+        "00000000-0000-0000-0000-000000000026",
+        "synthetic-host",
+        "workspace",
+        "00000000-0000-0000-0000-000000000022",
+        "{\"case_insensitive\":false,\"device\":\"7\",\"external_identity\":null,\"inode\":\"902\",\"v\":1}",
+        "/synthetic/v1-repo/work",
+        "active",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        3,
+        "00000000-0000-0000-0000-00000000002a",
+        "synthetic-host",
+        "external",
+        null,
+        "{\"case_insensitive\":false,\"device\":null,\"external_identity\":\"synthetic:v1-external\",\"inode\":null,\"v\":1}",
+        null,
+        "active",
+        "2026-10-06T12:00:00+00:00"
+      ],
+      [
+        4,
+        "00000000-0000-0000-0000-000000000042",
+        "synthetic-host",
+        "workspace",
+        null,
+        "{\"case_insensitive\":false,\"device\":\"7\",\"external_identity\":null,\"inode\":\"903\",\"v\":1}",
+        "/synthetic/v1-orphan",
+        "active",
+        "2026-10-06T14:00:00+00:00"
+      ],
+      [
+        5,
+        "00000000-0000-0000-0000-000000000046",
+        "synthetic-host",
+        "workspace",
+        null,
+        "{\"case_insensitive\":false,\"device\":\"7\",\"external_identity\":null,\"inode\":\"905\",\"v\":1}",
+        "/synthetic/v1-import-source-True",
+        "active",
+        "2026-10-06T14:00:00+00:00"
+      ],
+      [
+        6,
+        "00000000-0000-0000-0000-00000000004b",
+        "synthetic-host",
+        "workspace",
+        null,
+        "{\"case_insensitive\":false,\"device\":\"7\",\"external_identity\":null,\"inode\":\"904\",\"v\":1}",
+        "/synthetic/v1-import-writer",
+        "active",
+        "2026-10-06T14:00:00+00:00"
+      ],
+      [
+        7,
+        "00000000-0000-0000-0000-000000000052",
+        "synthetic-host",
+        "workspace",
+        null,
+        "{\"case_insensitive\":false,\"device\":\"7\",\"external_identity\":null,\"inode\":\"907\",\"v\":1}",
+        "/synthetic/v1-import-source-False",
+        "active",
+        "2026-10-06T14:00:00+00:00"
+      ]
+    ],
+    "result_versions": [
+      [
+        1,
+        "00000000-0000-0000-0000-000000000008",
+        "00000000-0000-0000-0000-000000000019",
+        "a",
+        "code",
+        "synthetic-artifact",
+        "Synthetic artifact output",
+        null,
+        "2026-10-06T12:00:00+00:00"
+      ]
+    ],
+    "reviews": [
+      [
+        1,
+        "00000000-0000-0000-0000-000000000016",
+        "00000000-0000-0000-0000-000000000008",
+        "00000000-0000-0000-0000-00000000000e",
+        "a",
+        "synthetic-reviewer",
+        "passed",
+        "[]",
+        "[{\"artifact\": {\"digest\": null, \"identity\": \"synthetic-artifact\", \"kind\": \"code\", \"summary\": \"Synthetic artifact output\", \"version\": \"v1\"}, \"blockers\": [], \"check\": \"Synthetic checkpoint check\", \"limitations\": [], \"result\": \"passed\", \"summary\": \"Synthetic evidence summary\", \"workspace_id\": null}]",
+        "{\"digest\": null, \"identity\": \"synthetic-artifact\", \"kind\": \"code\", \"summary\": \"Synthetic artifact output\", \"version\": \"v1\"}",
+        null,
+        "2026-10-06T12:00:00+00:00"
+      ]
+    ],
+    "steps": [
+      [
+        1,
+        "00000000-0000-0000-0000-000000000008",
+        "a",
+        "Step a",
+        "complete",
+        "v1",
+        "{\"definition\": {\"completion_check\": \"Check for step a\", \"definition_version\": \"v1\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": true, \"step_id\": \"a\", \"title\": \"Step a\"}, \"evidence\": [\"Synthetic evidence summary | check: Synthetic checkpoint check | result: passed | artifact: synthetic-artifact version v1 (code: Synthetic artifact output)\"], \"ordinal\": 0}"
+      ],
+      [
+        2,
+        "00000000-0000-0000-0000-00000000001c",
+        "a",
+        "Step a",
+        "in-progress",
+        "v1",
+        "{\"definition\": {\"completion_check\": \"Check for step a\", \"definition_version\": \"v1\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": false, \"step_id\": \"a\", \"title\": \"Step a\"}, \"evidence\": [], \"ordinal\": 0}"
+      ],
+      [
+        3,
+        "00000000-0000-0000-0000-000000000035",
+        "a",
+        "Step a",
+        "pending",
+        "v1",
+        "{\"definition\": {\"completion_check\": \"Check for step a\", \"definition_version\": \"v1\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": false, \"step_id\": \"a\", \"title\": \"Step a\"}, \"evidence\": [], \"ordinal\": 0}"
+      ],
+      [
+        4,
+        "00000000-0000-0000-0000-000000000048",
+        "step-1",
+        "Set up database schema",
+        "in-progress",
+        "legacy:e566ce1945cd8ef1f45ebabbcbef2c74501427dc9954b7ad77a00da2d0419d8f",
+        "{\"definition\": {\"completion_check\": \"Database migrations execute with exit code 0\", \"definition_version\": \"legacy:e566ce1945cd8ef1f45ebabbcbef2c74501427dc9954b7ad77a00da2d0419d8f\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": false, \"step_id\": \"step-1\", \"title\": \"Set up database schema\"}, \"evidence\": [], \"ordinal\": 0}"
+      ],
+      [
+        5,
+        "00000000-0000-0000-0000-000000000048",
+        "step-2",
+        "Seed baseline data",
+        "pending",
+        "legacy:8043cd77fe9552ded40fe9568428952934610343df786a3f0fd81f0efc4b831c",
+        "{\"definition\": {\"completion_check\": \"User count equals 10\", \"definition_version\": \"legacy:8043cd77fe9552ded40fe9568428952934610343df786a3f0fd81f0efc4b831c\", \"dependencies\": [\"step-1\"], \"document\": null, \"final_gate\": false, \"review_required\": false, \"step_id\": \"step-2\", \"title\": \"Seed baseline data\"}, \"evidence\": [], \"ordinal\": 1}"
+      ],
+      [
+        6,
+        "00000000-0000-0000-0000-000000000054",
+        "step-1",
+        "Set up database schema",
+        "in-progress",
+        "legacy:3edbaf67736cac4bc49c813e84e6aac75338aeaa402bbc2faeaa6b655274a506",
+        "{\"definition\": {\"completion_check\": \"Database migrations execute with exit code 0\", \"definition_version\": \"legacy:3edbaf67736cac4bc49c813e84e6aac75338aeaa402bbc2faeaa6b655274a506\", \"dependencies\": [], \"document\": null, \"final_gate\": false, \"review_required\": false, \"step_id\": \"step-1\", \"title\": \"Set up database schema\"}, \"evidence\": [], \"ordinal\": 0}"
+      ],
+      [
+        7,
+        "00000000-0000-0000-0000-000000000054",
+        "step-2",
+        "Seed baseline data",
+        "pending",
+        "legacy:db6654e1ac7282bbc3dc45ef7b2b2bc2b04685940279959506788aa4d95165b2",
+        "{\"definition\": {\"completion_check\": \"User count equals 10\", \"definition_version\": \"legacy:db6654e1ac7282bbc3dc45ef7b2b2bc2b04685940279959506788aa4d95165b2\", \"dependencies\": [\"step-1\"], \"document\": null, \"final_gate\": false, \"review_required\": false, \"step_id\": \"step-2\", \"title\": \"Seed baseline data\"}, \"evidence\": [], \"ordinal\": 1}"
+      ]
+    ],
+    "store_hold_reasons": [
+      [
+        1,
+        "00000000-0000-0000-0000-000000000059",
+        "epoch-00000000000000000000000000000006",
+        "identity",
+        "{\"attempt_id\": \"00000000-0000-0000-0000-000000000057\", \"plan_id\": \"00000000-0000-0000-0000-000000000054\", \"source\": \"import:00000000-0000-0000-0000-000000000056\", \"step_id\": \"step-1\"}",
+        0,
+        "2026-10-06T14:00:00+00:00"
+      ]
+    ]
+  },
+  "image_sha256": "7cbcb7edfe57b4bd4b0d18ea572755a7e5e898b87cac2a03681e863e38060f1d",
+  "named_ids": {
+    "accepted_plan": "00000000-0000-0000-0000-000000000008",
+    "active_attempt": "00000000-0000-0000-0000-00000000002d",
+    "active_plan": "00000000-0000-0000-0000-00000000001c",
+    "imported_plans": [
+      "00000000-0000-0000-0000-000000000048",
+      "00000000-0000-0000-0000-000000000054"
+    ],
+    "orphan_use": "00000000-0000-0000-0000-000000000045",
+    "stale_attempt": "00000000-0000-0000-0000-00000000003b",
+    "stale_plan": "00000000-0000-0000-0000-000000000035"
+  },
+  "normal_producers": true,
+  "python": "3.14.3 (main, Mar 10 2026, 18:02:52) [Clang 21.1.4 ]",
+  "source_commit": "b199c13c220660312269389c467b9f428ee14c9c",
+  "source_schema_version": 1,
+  "source_sha256": {
+    "adaptive_planning/admin.py": "2a8273ba679eb669a4171ce29f3a666873a75a1c8f450a430a993953c22396ef",
+    "adaptive_planning/app.py": "b36071229b56700c0619ccded8ec8ada37936bc59a480e76f8273afe93f2f2a3",
+    "adaptive_planning/attempts.py": "137aea824e22803da2a402ddd528a271579ca0bc7c801115090cae2928dc2f42",
+    "adaptive_planning/checkpoints.py": "55fceca8dc3cdebb1802b6fe729a957bbe2fde1e8c5a6dedf612fc2202b70c82",
+    "adaptive_planning/config.py": "17ba416993307396e675f10013518f91eb5bf441b4db826795b2aca9d8cdc4ac",
+    "adaptive_planning/core.py": "b4dc61c69f85c3721d16d2d4827211046cac458ec09b968016c51ed2d104d67a",
+    "adaptive_planning/imports.py": "c0666772a410b7a53d8b12e0a9b4d4f7cbeba250133cbbec350956a365b8dad7",
+    "adaptive_planning/ownership.py": "b1cbaf235a4cac9bafb053f64966246443490d34247cc2dc1829714f2c020fa6",
+    "adaptive_planning/plans.py": "71f6e9c6887b40c6bb75cf5c5081c491b91547cd56aab3225eaff171af74e9be",
+    "adaptive_planning/recovery.py": "236b4e5897d5aa18b86a45ff5c74e4a3f6c16f5ec382d3bb362d18e602ba6870",
+    "adaptive_planning/resources.py": "2734075f121c9cd31d2c71a1fb020db5bbbe1180937cd37ad1aee9f9f2a58d1d",
+    "adaptive_planning/reviews.py": "246d4287ab8e25faef020340527067eaee1badbe723cc457bf929975e0614231",
+    "adaptive_planning/schema.py": "2923e8359416fa4e176a97507605c190b3a1ced7c55e67b1c9bfffcb6e8873de",
+    "adaptive_planning/store.py": "740dead54d67ea4d824e9c338d4ec52bbf526a358cb15b9bc13ac06888eda630",
+    "adaptive_planning/types.py": "2cfc2facd7e56561c9519d332b51c364d3d1d9354daa1667e6d022b8a3d7c939",
+    "tests/service_fixtures.py": "cc1696b9933b4205fd2d6596b9f75e715a2fa4af1aa8bcbf8848d21350c9cee4"
+  },
+  "sqlite": "3.50.4",
+  "synthetic_only": true,
+  "test_only_seeds": [
+    "seeded-orphan singleton",
+    "same-resource multiple orphan uses and released history"
+  ],
+  "uv_lock_sha256": "b01f33c9baf5e77e5e367d912763b71ba4cc5d989cef935e876a61ef806b95af"
+}

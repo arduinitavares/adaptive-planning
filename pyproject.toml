@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling==1.32.4"]
+build-backend = "hatchling.build"
+
+[project]
+name = "adaptive-planning"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "mcp==2.3.0",
+    "mcp-types==2.3.0",
+    "starlette==1.7.0",
+    "uvicorn==0.54.0",
+    "httpx2==2.13.1",
+    "pydantic==2.13.5",
+]
+
+[project.scripts]
+adaptive-planning = "adaptive_planning.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["adaptive_planning"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"assets/dashboard" = "adaptive_planning/assets/dashboard"
+
+[tool.hatch.build.targets.sdist]
+include = ["/adaptive_planning", "/assets/dashboard", "/pyproject.toml", "/uv.lock"]
