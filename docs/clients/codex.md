@@ -49,7 +49,7 @@ The [command reference](https://learn.chatgpt.com/docs/developer-commands)
 documents `/mcp` and `/mcp verbose` for session diagnostics. A configured entry or
 status panel alone does not prove authenticated discovery or a committed event.
 
-Complete the [three-client planning gate](../operations.md#three-client-planning-gate)
+Complete the [two-client planning gate](../operations.md#two-client-planning-gate)
 using the actual chosen CLI or Desktop surface. Record the installed version,
 observed MCP negotiation, fresh tool list, installation identity, plan ID,
 committed revision, dashboard URL and creator-close/resume evidence. App-server
@@ -136,16 +136,32 @@ artifact and final checked base. Invalidation holds producers and affected
 consumers until their named remediation; required revalidation uses a current
 post-invalidation review. Resource identity reconciliation, visible tools and
 readiness do not grant execution or renew authorization. `plan-only` still
-refuses assignment. The [worker gate](../operations.md#three-client-worker-checkpoint-gate)
+refuses assignment. The [worker gate](../operations.md#two-client-worker-checkpoint-gate)
 lists the current 29-tool source catalog (six reads and 23 mutations), with no
-disabled future kinds. That catalog has synthetic SDK evidence; genuine installed
-Codex discovery and worker acceptance remain unverified.
+disabled future kinds. At the historical Task 20 source-only checkpoint,
+that catalog had synthetic SDK evidence; genuine installed Codex discovery and
+worker acceptance were unverified.
 
-Task 20 exercises three synthetic official SDK clients per negotiated protocol:
-auto `2026-07-28` and legacy `2025-11-25`. `codex-worker` is an actor label, not
-a Codex run. The genuine Codex finished-worker and close/reopen/service-restart/
-container-recreation rows are **NOT RUN**; actual client runs remain **0** and
-full Task 20 acceptance remains **false**. Historical Task 10 planning probes
-do not satisfy this gate. Record the actual chosen surface/version, negotiated
-protocol, shared plan, visible checkpoint sequence and owner acceptance/review
-IDs only from a later authorized installed-client run.
+In the historical Task 20 source-only snapshot, three synthetic official SDK
+clients exercised each negotiated protocol: auto `2026-07-28` and legacy
+`2025-11-25`. `codex-worker` was an actor label, not a Codex run. The genuine
+Codex finished-worker and close/reopen/service-restart/container-recreation
+rows were **NOT RUN**; actual client runs were **0** and full Task 20 acceptance
+was **false**. Historical Task 10 planning probes do not satisfy this gate.
+Record the actual chosen surface/version, negotiated protocol, shared plan,
+visible checkpoint sequence and owner acceptance/review IDs only from a later
+authorized installed-client run.
+
+The later [dated closure evidence](../operations.md) records five genuine Codex
+processes against the image identified there. Those runs remain bounded to the
+recorded image and tested flows. Permanent installed-client activation and full
+Task 20 acceptance remain pending.
+
+
+## Installed CLI activation, 2026-10-13
+
+A fresh installed Codex 0.160.1 app-server authenticated through the permanent private `adaptivePlanning` entry at `http://127.0.0.1:8790/mcp`, discovered 29 tools and completed actual installation and plan reads against schema v2. The eight unrelated server entries were preserved. No model turn or planning mutation was submitted during this activation check. Its direct status did not expose the downstream MCP protocol, so no protocol version is inferred. The [dated local activation evidence](../operations.md#local-activation-evidence-2026-10-13) records the source, migration and runtime boundaries. Overall two-client worker acceptance remains pending the fresh AGY checkpoint/resume gate. Desktop and Mac sleep/reboot behavior are not established by this CLI check.
+
+## Shared AGY checkpoint read, 2026-10-13
+
+A later fresh installed Codex 0.160.1 app-server used the same permanent global entry to discover 29 tools and make five native read calls. It read the labelled AGY plan `97c76387-f8a9-408d-8661-f4e94f94e819`, including A's exact accepted result UUID, public history and remaining eligible work. No model turn or mutation was submitted; the client exited and its owned terminal was closed. The subsequent genuine AGY continuation completed B. The [native client acceptance record](../operations.md#native-client-acceptance-completed-2026-10-13) supersedes the preceding pending AGY gate while preserving earlier protocol, lifecycle and client-surface boundaries.

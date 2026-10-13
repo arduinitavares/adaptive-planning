@@ -193,6 +193,12 @@
     let transportStatus = 'connecting'; // 'connected' | 'connecting' | 'offline'
     let availabilityWarning = false;
     let consistencyWarning = false;
+    let renderedPublicationIdentity = null;
+    let renderedGraphContent = null;
+    let renderedDetailsContent = null;
+    let renderedHistoryContent = null;
+    let renderedRetiredContent = null;
+    const renderedBadges = new WeakMap();
 
     // Status visual configurations
     const STATUS_CONFIG = {
@@ -266,17 +272,23 @@
 
     function renderStatusBadge(container, statusKey, customLabel) {
       const conf = STATUS_CONFIG[statusKey] || STATUS_CONFIG.pending;
+      const label = customLabel || conf.label;
+      const content = JSON.stringify([conf.iconType, label]);
+      if (renderedBadges.get(container) === content) return container;
       container.textContent = '';
       const icon = createSvgIcon(conf.iconType);
       container.appendChild(icon);
       const labelSpan = document.createElement('span');
-      setText(labelSpan, customLabel || conf.label);
+      setText(labelSpan, label);
       container.appendChild(labelSpan);
+      renderedBadges.set(container, content);
       return container;
     }
 
     function setText(el, text) {
-      if (el) el.textContent = text != null ? String(text) : '';
+      if (!el) return;
+      const value = text != null ? String(text) : '';
+      if (el.textContent !== value) el.textContent = value;
     }
 
     function formatTimeAgo(isoString) {
@@ -623,6 +635,10 @@
 
     function renderRetired(retiredSteps) {
       if (!retiredSection || !retiredCount || !retiredList) return;
+      const content = JSON.stringify((retiredSteps || []).map(step =>
+        [step.id, step.title, step.retiredReason || '']));
+      if (renderedRetiredContent === content) return;
+      renderedRetiredContent = content;
 
       if (!retiredSteps || retiredSteps.length === 0) {
         retiredSection.hidden = true;
@@ -687,6 +703,9 @@
       if (activeSteps.length === 0 && retiredSteps.length === 0) {
         graphEmpty.hidden = false;
         graphViewport.hidden = true;
+        nodeElementsMap.forEach(node => node.remove());
+        nodeElementsMap.clear();
+        graphSvg.querySelectorAll('.edge-path').forEach(edge => edge.remove());
         renderRetired([]);
         return;
       }
@@ -736,6 +755,20 @@
     }
 
     function renderDetails() {
+      const steps = currentPlan && currentPlan.steps || [];
+      const step = steps.find(item => item.id === selectedStepId);
+      const content = JSON.stringify(step ? [
+        step.id, step.title, step.status,
+        step.status === 'retired' ? step.retiredReason || '' : '',
+        step.summary || '', step.details || '', step.check || 'None specified.',
+        step.evidence || [],
+        (step.dependsOn || []).map(id => {
+          const dependency = steps.find(item => item.id === id);
+          return [id, dependency ? dependency.status : 'pending'];
+        })
+      ] : [steps.length ? 'unselected' : 'empty']);
+      if (renderedDetailsContent === content) return;
+      renderedDetailsContent = content;
       detailsContainer.textContent = '';
 
       if (!currentPlan || !currentPlan.steps || currentPlan.steps.length === 0) {
@@ -746,7 +779,6 @@
         return;
       }
 
-      const step = currentPlan.steps.find(s => s.id === selectedStepId);
       if (!step) {
         const p = document.createElement('p');
         p.className = 'empty-message';
@@ -935,8 +967,14 @@
     }
 
     function renderHistory(plan) {
-      historyList.textContent = '';
       const history = plan.history || [];
+      const content = JSON.stringify(history.map(entry => [
+        entry.revision, entry.timestamp, entry.summary || 'Plan updated.',
+        entry.authorizationNote || '', entry.recoveryNote || ''
+      ]));
+      if (renderedHistoryContent === content) return;
+      renderedHistoryContent = content;
+      historyList.textContent = '';
 
       if (history.length === 0) {
         historyEmpty.hidden = false;
@@ -1020,10 +1058,17 @@
       renderAcceptedPlan(decision.plan, rawText);
     }
 
-    function renderAcceptedPlan(plan, rawText) {
+    function renderAcceptedPlan(plan, rawText, publicationIdentity) {
       const identityChanged = currentPlan && (currentPlan.taskId !== plan.taskId ||
-        (currentPlan.schemaVersion === 2 && plan.generation !== currentPlan.generation));
-      if (identityChanged) selectedStepId = null;
+        (currentPlan.schemaVersion === 2 && plan.generation !== currentPlan.generation) ||
+        (publicationIdentity !== undefined && publicationIdentity !== renderedPublicationIdentity));
+      if (identityChanged) {
+        selectedStepId = null;
+        nodeElementsMap.forEach(node => node.remove());
+        nodeElementsMap.clear();
+        renderedGraphContent = renderedDetailsContent = renderedHistoryContent = renderedRetiredContent = null;
+      }
+      if (publicationIdentity !== undefined) renderedPublicationIdentity = publicationIdentity;
       currentPlan = plan;
       lastRawText = rawText;
 
@@ -1047,7 +1092,16 @@
         }
       }
 
-      renderGraph(currentPlan);
+      const graphContent = JSON.stringify([
+        currentPlan.nextStepId,
+        steps.map(step => step.status === 'retired'
+          ? [step.id, step.title, step.status, step.retiredReason || '']
+          : [step.id, step.title, step.status, step.dependsOn || []])
+      ]);
+      if (renderedGraphContent !== graphContent) {
+        renderGraph(currentPlan);
+        renderedGraphContent = graphContent;
+      }
       renderDetails();
       renderHistory(currentPlan);
     }
@@ -1086,6 +1140,180 @@
       if (!views.length) list.appendChild(textElement('p', 'empty-message', 'No committed plans.'));
     }
 
+    // Compact pages remain separate from the backward-compatible full-plan index.
+    const compactIndexUrl = !bodyData.planId && typeof bodyData.plansUrl === 'string' &&
+      bodyData.plansUrl.split(/[?#]/)[0] === '/api/plan-index' ? bodyData.plansUrl : null;
+    const compactIndexQuery = compactIndexUrl === null ? null :
+      new URLSearchParams((compactIndexUrl.split('?')[1] || '').split('#')[0]);
+    const compactIndexLimit = compactIndexQuery && compactIndexQuery.has('limit') ? compactIndexQuery.get('limit') : '25';
+    const compactIndexLimitQuery = 'limit=' + encodeURIComponent(compactIndexLimit);
+    const compactIndexFirstHref = '/?' + compactIndexLimitQuery;
+    const compactIndexContinuation = compactIndexQuery && (compactIndexQuery.has('after') || compactIndexQuery.has('before'));
+    let compactIndexNav = null;
+    let compactIndexNotice = null;
+    const compactIndexAnchors = new Map();
+
+    function compactIndexUnavailable() {
+      const error = new Error('Invalid or unavailable public plan index');
+      error.code = 'unavailable';
+      return error;
+    }
+
+    function prepareCompactIndex(value) {
+      const limit = Number(compactIndexLimit);
+      const object = item => item !== null && typeof item === 'object' && !Array.isArray(item);
+      const keys = (item, expected) => object(item) && Object.keys(item).length === expected.length &&
+        expected.every(key => Object.prototype.hasOwnProperty.call(item, key));
+      const nonempty = item => typeof item === 'string' && item.trim().length > 0;
+      const cursor = item => item === null || (typeof item === 'string' && item.length > 0 && item.length <= 1024);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100 || String(limit) !== compactIndexLimit ||
+          !keys(value, ['plans', 'next_cursor', 'previous_cursor', 'epoch', 'collection_fence', 'store_sequence']) ||
+          !Array.isArray(value.plans) || value.plans.length > limit || !nonempty(value.epoch) ||
+          !cursor(value.next_cursor) || !cursor(value.previous_cursor) ||
+          !keys(value.collection_fence, ['count', 'max_rowid']) ||
+          !Number.isInteger(value.collection_fence.count) || value.collection_fence.count < 0 ||
+          !Number.isInteger(value.collection_fence.max_rowid) || value.collection_fence.max_rowid < 0 ||
+          !Number.isSafeInteger(value.store_sequence) || value.store_sequence < 0) throw compactIndexUnavailable();
+      const seen = new Set();
+      for (const plan of value.plans) {
+        if (!keys(plan, ['plan_id', 'objective', 'status', 'revision', 'published_at', 'dashboard_url']) ||
+            !nonempty(plan.plan_id) || typeof plan.objective !== 'string' ||
+            !['planning', 'running', 'blocked', 'stopped', 'complete'].includes(plan.status) ||
+            !Number.isSafeInteger(plan.revision) || plan.revision < 1 ||
+            awareMicros(plan.published_at) === null || !nonempty(plan.dashboard_url) || seen.has(plan.plan_id)) {
+          throw compactIndexUnavailable();
+        }
+        seen.add(plan.plan_id);
+      }
+      // Prepare every relative href before any card, navigation or accepted content changes.
+      return {
+        plans: value.plans.map(plan => ({summary: plan, href: '/plans/' + encodeURIComponent(plan.plan_id)})),
+        navigation: [
+          ['first', 'First', compactIndexContinuation || value.previous_cursor !== null ? compactIndexFirstHref : null],
+          ['newer', 'Newer', value.previous_cursor === null ? null :
+            '/?before=' + encodeURIComponent(value.previous_cursor) + '&' + compactIndexLimitQuery],
+          ['older', 'Older', value.next_cursor === null ? null :
+            '/?after=' + encodeURIComponent(value.next_cursor) + '&' + compactIndexLimitQuery]
+        ],
+        emptyText: value.collection_fence.count === 0 ? 'No committed plans.' : 'No plans on this page.'
+      };
+    }
+
+    async function readCompactIndex() {
+      const response = await fetch(compactIndexUrl, {cache: 'no-store', credentials: 'same-origin'});
+      if (response.status === 409) {
+        const error = new Error('The plan list changed');
+        error.code = 'plan_index_conflict';
+        throw error;
+      }
+      if (!response.ok) throw compactIndexUnavailable();
+      return prepareCompactIndex(await response.json());
+    }
+
+    function compactIndexNavigation() {
+      if (!compactIndexNav) {
+        compactIndexNav = document.getElementById('plan-index-nav');
+        if (!compactIndexNav) {
+          compactIndexNav = textElement('nav', 'plan-index-nav', '');
+          compactIndexNav.id = 'plan-index-nav';
+          compactIndexNav.setAttribute('id', 'plan-index-nav');
+          compactIndexNav.setAttribute('aria-label', 'Plan pages');
+          const list = document.getElementById('plan-list');
+          (list.parentNode || document.body).appendChild(compactIndexNav);
+        }
+      }
+      return compactIndexNav;
+    }
+
+    function compactIndexAnchor(nav, key, label, href) {
+      const id = 'plan-index-' + key;
+      let anchor = compactIndexAnchors.get(key) || Array.from(nav.querySelectorAll('a')).find(node =>
+        (node.id || node.getAttribute('id')) === id);
+      if (!anchor) {
+        anchor = textElement('a', '', label);
+        anchor.id = id;
+        anchor.setAttribute('id', id);
+      }
+      compactIndexAnchors.set(key, anchor);
+      setText(anchor, label);
+      if (anchor.getAttribute('href') !== href) anchor.setAttribute('href', href);
+      return anchor;
+    }
+
+    function compactIndexCard(card, plan, href) {
+      let heading = card && card.querySelector('h2');
+      let link = heading && heading.querySelector('a');
+      let meta = card && card.querySelector('.plan-card-meta');
+      let time = card && card.querySelector('time');
+      let code = card && card.querySelector('.task-id-code');
+      let published = card && Array.from(card.children).find(node =>
+        node.tagName.toLowerCase() === 'p' && node.querySelector('time') === time);
+      if (!link || !meta || !time || !code || !published || published.textContent !== 'Published: ' + time.textContent) {
+        card = textElement('article', 'plan-card', '');
+        card.dataset.planId = plan.plan_id;
+        card.setAttribute('data-plan-id', plan.plan_id);
+        heading = textElement('h2', '', '');
+        link = textElement('a', '', '');
+        heading.appendChild(link);
+        meta = textElement('p', 'plan-card-meta', '');
+        published = textElement('p', '', 'Published: ');
+        time = textElement('time', '', '');
+        published.appendChild(time);
+        code = textElement('code', 'task-id-code', '');
+        card.appendChild(heading);
+        card.appendChild(meta);
+        card.appendChild(published);
+        card.appendChild(code);
+      }
+      // Equality checks preserve matching SSR descendants, including their text nodes.
+      setText(link, plan.objective);
+      if (link.getAttribute('href') !== href) link.setAttribute('href', href);
+      setText(meta, `${plan.status} · Rev #${plan.revision}`);
+      setText(time, plan.published_at);
+      if (time.getAttribute('datetime') !== plan.published_at) time.setAttribute('datetime', plan.published_at);
+      setText(code, plan.plan_id);
+      return card;
+    }
+
+    function renderCompactIndex(page) {
+      const list = document.getElementById('plan-list');
+      const cards = new Map();
+      for (const card of Array.from(list.children)) {
+        if (!card.classList.contains('plan-card')) continue;
+        const id = card.getAttribute('data-plan-id') || card.dataset.planId;
+        if (!cards.has(id)) cards.set(id, card);
+      }
+      const nodes = page.plans.map(item => compactIndexCard(cards.get(item.summary.plan_id), item.summary, item.href));
+      if (!nodes.length) {
+        const empty = list.querySelector('.empty-message') || textElement('p', 'empty-message', '');
+        setText(empty, page.emptyText);
+        nodes.push(empty);
+      }
+      syncServiceChildren(list, nodes);
+      const nav = compactIndexNavigation();
+      const anchors = page.navigation.filter(item => item[2] !== null).map(item => compactIndexAnchor(nav, ...item));
+      syncServiceChildren(nav, anchors);
+    }
+
+    function setCompactIndexNotice(message, restart) {
+      if (compactIndexNotice) {
+        compactIndexNotice.remove();
+        compactIndexNotice = null;
+      }
+      if (message === null) return;
+      compactIndexNotice = textElement('p', 'index-notice', '');
+      compactIndexNotice.setAttribute('role', 'alert');
+      compactIndexNotice.appendChild(textElement('span', '', message));
+      if (restart) {
+        const first = textElement('a', '', 'First');
+        first.setAttribute('href', compactIndexFirstHref);
+        compactIndexNotice.appendChild(textElement('span', '', ' '));
+        compactIndexNotice.appendChild(first);
+      }
+      const list = document.getElementById('plan-list');
+      (list.parentNode || document.body).appendChild(compactIndexNotice);
+    }
+
     function coordinationLabel(item) {
       const value = item.value;
       if (item.kind === 'attempt') return `Step ${value.step_id} · ${value.state} · ${value.assignee} · ${value.attempt_id}`;
@@ -1111,13 +1339,37 @@
       return records;
     }
 
-    function serviceRecordDetails(records, identity, className) {
+    function serviceRecordDetails(records, identity, className, summary, content) {
       const key = JSON.stringify(identity);
       // Reuse only this durable record's node; its current open state belongs to the user.
-      const details = records.get(key) || textElement('details', className, '');
-      details.dataset.recordIdentity = key;
-      details.textContent = '';
+      let details = records.get(key);
+      if (!details) {
+        details = textElement('details', className, '');
+        details.dataset.recordIdentity = key;
+        details.appendChild(textElement('summary', '', summary));
+        details.appendChild(textElement('pre', '', content));
+        records.set(key, details);
+      } else {
+        setText(details.querySelector('summary'), summary);
+        setText(details.querySelector('pre'), content);
+      }
       return details;
+    }
+
+    function syncServiceChildren(container, nodes) {
+      const desired = [...new Set(nodes)];
+      const retained = new Set(desired);
+      for (const child of Array.from(container.childNodes)) {
+        if (!retained.has(child)) container.removeChild(child);
+      }
+      // Keep the longest desired prefix already in DOM order; append only the remainder.
+      let prefix = 0;
+      for (const child of Array.from(container.children)) {
+        if (child === desired[prefix]) prefix++;
+      }
+      for (let index = prefix; index < desired.length; index++) {
+        container.appendChild(desired[index]);
+      }
     }
 
     function renderServiceState(view, items, events, sequence) {
@@ -1137,15 +1389,17 @@
       const identity = [view.metadata.epoch, view.plan_id, view.metadata.generation];
       const list = document.getElementById('coordination-list');
       const coordinationDetails = serviceDetailsByIdentity(list);
-      list.textContent = '';
+      const coordinationNodes = [];
       for (const item of items) {
         const details = serviceRecordDetails(coordinationDetails, [...identity, item.kind, coordinationIdentity(item)],
-          'coordination-item coordination-item--' + item.kind);
-        details.appendChild(textElement('summary', '', coordinationLabel(item)));
-        details.appendChild(textElement('pre', '', JSON.stringify(item.value, null, 2)));
-        list.appendChild(details);
+          'coordination-item coordination-item--' + item.kind, coordinationLabel(item), JSON.stringify(item.value, null, 2));
+        coordinationNodes.push(details);
       }
-      if (!items.length) list.appendChild(textElement('p', 'empty-message', 'No coordination records.'));
+      if (!items.length) {
+        coordinationNodes.push(list.querySelector('.empty-message') ||
+          textElement('p', 'empty-message', 'No coordination records.'));
+      }
+      syncServiceChildren(list, coordinationNodes);
       const recovery = [coord.store_hold ? 'Store hold active.' : 'No store hold.'];
       if (coord.restore_cutoff) recovery.push(`Restored backup cutoff: ${coord.restore_cutoff}.`);
       if (items.some(item => item.kind === 'attempt' && (item.value.state === 'stale' ||
@@ -1159,18 +1413,27 @@
         `${events.length} committed events · last plan event sequence ${sequence}. All pages consumed for this published state.`);
       const eventList = document.getElementById('service-events');
       const eventDetails = serviceDetailsByIdentity(eventList);
-      eventList.textContent = '';
+      const eventRows = new Map();
+      for (const row of eventList.children) {
+        const details = row.querySelector('details');
+        if (details) eventRows.set(details.dataset.recordIdentity, row);
+      }
+      const eventNodes = [];
       for (const event of events) {
-        const li = textElement('li', 'event-item', '');
-        const details = serviceRecordDetails(eventDetails, [...identity, event.sequence], '');
-        details.appendChild(textElement('summary', '',
+        const details = serviceRecordDetails(eventDetails, [...identity, event.sequence], '',
           `#${event.sequence} ${event.kind} · ${event.published_at} · actor ${event.actor}` +
           (event.origin_worker === null ? '' : ` · origin ${event.origin_worker}`) +
-          (event.relay === null ? '' : ` · relay ${event.relay}`)));
-        details.appendChild(textElement('pre', '', JSON.stringify(event.payload, null, 2)));
-        li.appendChild(details);
-        eventList.appendChild(li);
+          (event.relay === null ? '' : ` · relay ${event.relay}`),
+          JSON.stringify(event.payload, null, 2));
+        let li = eventRows.get(details.dataset.recordIdentity);
+        if (!li) {
+          li = textElement('li', 'event-item', '');
+          li.appendChild(details);
+          eventRows.set(details.dataset.recordIdentity, li);
+        }
+        eventNodes.push(li);
       }
+      syncServiceChildren(eventList, eventNodes);
     }
 
     async function fetchPublic(url) {
@@ -1352,11 +1615,35 @@
       if (polling) return;
       polling = true;
       try {
+        if (compactIndexUrl !== null) {
+          try {
+            renderCompactIndex(await readCompactIndex());
+            availabilityWarning = false;
+            consistencyWarning = false;
+            setTransportStatus('connected');
+            setCompactIndexNotice(null);
+          } catch (error) {
+            const conflict = error && error.code === 'plan_index_conflict';
+            availabilityWarning = !conflict;
+            consistencyWarning = false;
+            setTransportStatus(conflict ? 'connected' : 'offline');
+            if (conflict) {
+              const nav = compactIndexNavigation();
+              const first = compactIndexAnchor(nav, 'first', 'First', compactIndexFirstHref);
+              syncServiceChildren(nav, [first, ...Array.from(nav.children).filter(node => node !== first)]);
+            }
+            // Apply the index notice after the generic status banner has updated.
+            setCompactIndexNotice(conflict
+              ? 'The plan list changed since this page was opened. Restart from the first page to continue.'
+              : 'Plan list unavailable. Retaining last confirmed page.', conflict);
+          }
+          return;
+        }
         for (let attempt = 0; attempt < 2; attempt++) {
           try {
             if (bodyData.planId) {
               const state = await readServicePublication();
-              renderAcceptedPlan(state.plan, JSON.stringify(state.plan));
+              renderAcceptedPlan(state.plan, JSON.stringify(state.plan), state.identity);
               renderServiceState(state.view, state.items, state.events, state.sequence);
               renderServiceWarnings(state.warnings);
               serviceWarningPublication = state.warningPublication;

@@ -7,7 +7,9 @@ The service MCP endpoint is `http://127.0.0.1:8790/mcp`; the dashboard is
 This setup material retains Task 10 preparation. Task 20 source tests do not
 refresh installed versions, activate configuration or verify current CLI/VS Code
 environment handling; each actual surface still needs its own runtime evidence.
-Copilot entries remain stopped due to user-confirmed exhausted credits.
+As of 2026-10-13, the user no longer uses Copilot. It is excluded from the current
+release gate. These setup examples and their unverified surface distinctions
+remain as historical reference.
 
 ```json
 {
@@ -76,8 +78,8 @@ servers needing interactive inputs are not forwarded to Agent Host by the
 documented current behavior. A VS Code result does not prove Copilot CLI's
 environment expansion.
 
-Complete the [three-client planning gate](../operations.md#three-client-planning-gate)
-with the actual selected surface, installed version, negotiated protocol, fresh
+For a future, separately requested Copilot validation, use the scenario in the
+[two-client planning gate](../operations.md#two-client-planning-gate) with the selected surface, installed version, negotiated protocol, fresh
 tools, plan ID, committed revision and dashboard observation. Record unavailable
 call capability or allowance as a gap. An official SDK equivalent is separate
 from installed Copilot acceptance.
@@ -158,7 +160,7 @@ Consumer availability must bind the actual acceptance-returned result UUID,
 exact artifact and final checked base. Invalidation holds the producer and each
 affected consumer for explicit named remediation, with a post-invalidation
 review when required. Tools, reads and readiness do not renew scope or grant
-execution; `plan-only` still refuses assignment. The [worker gate](../operations.md#three-client-worker-checkpoint-gate)
+execution; `plan-only` still refuses assignment. The [worker gate](../operations.md#two-client-worker-checkpoint-gate)
 records the current 29-tool source catalog (six reads and 23 mutations), with no
 disabled future kinds, and proof fields. The catalog has synthetic SDK evidence;
 genuine installed Copilot discovery and acceptance remain unverified.

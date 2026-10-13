@@ -463,7 +463,7 @@ def release_resource_use(connection: sqlite3.Connection, command: Command) -> Mu
         raise DomainError("invalid", "Release must name the entire exact current canonical resource set")
     previous = plans.project_plan(connection, plan.plan_id)
     revision, ts = plan.revision + 1, plans._timestamp(plan.updated_at)
-    event = {"use_id": row[0], "resource_ids": list(payload["resource_ids"]), "stopped": payload["stopped"],
+    event = {"use_id": row[0], "resource_ids": sorted(supplied), "stopped": payload["stopped"],
              "reason": payload["reason"], "use_ids": ids}
     if namespace is not None:
         event.update({"attempt_id": row[3], "step_id": namespace["source"]["step_id"],
@@ -476,7 +476,7 @@ def release_resource_use(connection: sqlite3.Connection, command: Command) -> Mu
                                                                            command, plan, sequence, payload["reason"])]
             connection.execute("UPDATE events SET payload=? WHERE plan_id=? AND sequence=?",
                                (json.dumps(event, sort_keys=True, ensure_ascii=False), plan.plan_id, sequence))
-            resources.save_execution_uses(connection, plan.plan_id, row[3], namespace)
+            resources.save_execution_uses(connection, plan.plan_id, row[3], namespace, releasing_verification=True)
         _release_rows(connection, ids)
     connection.execute("UPDATE plans SET revision=?,updated_at=? WHERE plan_id=?", (revision, ts, plan.plan_id))
     view = plans._commit_projection(connection, plan.plan_id, previous)

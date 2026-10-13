@@ -133,6 +133,12 @@ class PlanningService:
     def read_plan(self, plan_id: PlanId) -> PlanView:
         return self._run_read(lambda db: plans.project_plan(db, plan_id))  # type: ignore[return-value]
 
+    def read_plan_index(
+        self, after: str | None = None, before: str | None = None, limit: int = plans.PLAN_INDEX_DEFAULT,
+    ) -> dict:
+        return self._run_read(  # type: ignore[return-value]
+            lambda db: plans.read_plan_index(db, after, before, limit))
+
     def list_ready(self, plan_id: PlanId) -> tuple[ReadyStep, ...]:
         return self._run_read(lambda db: attempts.ready_steps(db, plan_id))  # type: ignore[return-value]
 

@@ -9,15 +9,16 @@ from html.parser import HTMLParser
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 from adaptive_planning import plans
 from adaptive_planning.admin import initialize_installation, load_service_token
 from adaptive_planning.app import build_app
 from adaptive_planning.app import PlanningService
 from adaptive_planning.config import Config, http_allowlist
-from tests.service_fixtures import checkpoint, make_service, step
+from tests.service_fixtures import checkpoint, draft, make_service, step
 from tests.test_service_http import call
-from tests.test_service_plans import dump, insert_attempt
+from tests.test_service_plans import complete_all_steps, dump, insert_attempt, insert_store_hold, set_step_state
 
 
 class Page(HTMLParser):
@@ -32,6 +33,24 @@ class Page(HTMLParser):
 
     def handle_data(self, data):
         self.text.append(data)
+
+
+COMPACT_PLAN_KEYS = {"plan_id", "objective", "status", "revision", "published_at", "dashboard_url"}
+
+
+def root_navigation(html):
+    """Plan links and relative navigation queries from root HTML, read by href and visible text only."""
+    page = Page(html)
+    hrefs = [attrs["href"] for tag, attrs in page.tags if tag == "a" and "href" in attrs]
+    navigation = {"after": [], "before": [], "first": []}
+    for href in hrefs:
+        parts = urlsplit(href)
+        if parts.path in ("", "/") and not parts.scheme and not parts.netloc and parts.query:
+            query = parse_qs(parts.query, keep_blank_values=True)
+            kind = "after" if "after" in query else "before" if "before" in query else "first"
+            navigation[kind].append(parts.query)
+    plans = [unquote(href[len("/plans/"):]) for href in hrefs if href.startswith("/plans/")]
+    return {"hrefs": hrefs, "plans": plans, "text": "".join(page.text), **navigation}
 
 
 class TestService(unittest.TestCase):
@@ -88,7 +107,7 @@ class TestService(unittest.TestCase):
         page = Page(body.decode())
         body_attrs = next(attrs for tag, attrs in page.tags if tag == "body")
         self.assertEqual(body_attrs["data-mode"], "service")
-        self.assertEqual(body_attrs["data-plans-url"], "/api/plans")
+        self.assertEqual(body_attrs["data-plans-url"], "/api/plan-index")
         links = [attrs.get("href") for tag, attrs in page.tags if tag == "a"]
         self.assertIn("/plans/" + self.plan_id, links)
         self.assertIn("/plans/" + other.current_metadata.plan_id, links)
@@ -402,6 +421,476 @@ class TestService(unittest.TestCase):
         self.assertEqual(json.loads(body), {"error": {
             "code": "internal_error", "message": "The request could not be completed."}})
         self.assertNotIn("CORRUPT PRIVATE MARKER", body.decode() + " ".join(logs.output))
+
+    def test_actual_aggregate_capacity_keeps_compact_index_and_root_available(self):
+        created, tokens = [self.plan_id], [self.p.private.orchestrator_token]
+        for n in (1, 2):
+            large = dataclasses.replace(draft(), objective="Synthetic independent capacity " + str(n),
+                                        facts=("x" * 10000,) * 600)
+            receipt = self.f.service.execute(self.f.command("create_plan", {
+                "creation_id": "independent-capacity-" + str(n), "draft": large,
+                "new_plan_intent": "Synthetic independent capacity plan " + str(n) + " for the compact index"}))
+            created.append(receipt.current_metadata.plan_id)
+            tokens.append(receipt.private.orchestrator_token)
+        self.assertEqual(len(set(created)), 3)
+        for plan_id in created:
+            with self.subTest(plan_id=plan_id):
+                self.assertEqual(self.request("/api/plans/" + plan_id)[0], 200)
+        status, _, body = self.request("/api/plans")
+        self.assertEqual(status, 413)
+        self.assertEqual(json.loads(body)["error"]["code"], "limit_exceeded")
+        status, _, body = self.request("/api/plan-index")
+        self.assertEqual(status, 200)
+        self.assertLess(len(body), 100_000)
+        self.assertNotIn(b"x" * 1000, body)
+        index = json.loads(body)
+        self.assertEqual(len(index["plans"]), 3)
+        self.assertEqual({item["plan_id"] for item in index["plans"]}, set(created))
+        for item in index["plans"]:
+            view = self.f.service.read_plan(item["plan_id"])
+            self.assertEqual(set(item), COMPACT_PLAN_KEYS)
+            self.assertEqual({key: item[key] for key in COMPACT_PLAN_KEYS - {"dashboard_url"}}, {
+                "plan_id": view.plan_id, "objective": view.draft.objective, "status": view.status,
+                "revision": view.metadata.revision, "published_at": view.published_at})
+            url = urlsplit(item["dashboard_url"])
+            self.assertTrue(url.scheme and url.netloc)
+            self.assertEqual((url.path, url.query, url.fragment), ("/plans/" + quote(item["plan_id"], safe=""), "", ""))
+        status, _, html = self.request("/")
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"x" * 1000, html)
+        root = root_navigation(html.decode())
+        self.assertEqual(len(root["plans"]), 3)
+        self.assertEqual(set(root["plans"]), set(created))
+        self.assertFalse([href for href in root["hrefs"] if urlsplit(href).scheme or urlsplit(href).netloc])
+        for token in tokens:
+            self.assertNotIn(token.encode(), body + html)
+        for plan_id in created:
+            self.assertIn(plan_id, root["text"])
+
+    def test_compact_plan_index_and_root_pages_cover_all_plans_newest_first(self):
+        second = self.f.create(creation_id="index-page-second").current_metadata.plan_id
+        third = self.f.create(creation_id="index-page-third").current_metadata.plan_id
+        expected = [third, second, self.plan_id]
+        stored = dump(self.f.store)
+
+        def read(**query):
+            status, _, body = self.request("/api/plan-index", query=urlencode(query).encode())
+            self.assertEqual(status, 200)
+            value = json.loads(body)
+            self.assertLessEqual({"plans", "next_cursor", "previous_cursor"}, set(value))
+            metadata = value["metadata"] if isinstance(value.get("metadata"), dict) else value
+            self.assertLessEqual({"epoch", "collection_fence", "store_sequence"}, set(metadata))
+            for item in value["plans"]:
+                self.assertEqual(set(item), COMPACT_PLAN_KEYS)
+            return value
+
+        def ids(value):
+            return [item["plan_id"] for item in value["plans"]]
+
+        everything = read()
+        self.assertEqual(ids(everything), expected)
+        self.assertEqual((everything["next_cursor"], everything["previous_cursor"]), (None, None))
+        forward = [read(limit=1)]
+        for _ in expected:
+            if forward[-1]["next_cursor"] is None:
+                break
+            forward.append(read(after=forward[-1]["next_cursor"], limit=1))
+        else:
+            self.fail("Forward paging did not reach the final page")
+        self.assertEqual([ids(page) for page in forward], [[plan_id] for plan_id in expected])
+        self.assertIsNone(forward[0]["previous_cursor"])
+        self.assertTrue(all(page["previous_cursor"] for page in forward[1:]))
+        reverse = [forward[-1]]
+        for _ in expected:
+            if reverse[-1]["previous_cursor"] is None:
+                break
+            reverse.append(read(before=reverse[-1]["previous_cursor"], limit=1))
+        else:
+            self.fail("Reverse paging did not reach the newest page")
+        self.assertEqual([ids(page) for page in reverse], [[plan_id] for plan_id in reversed(expected)])
+        self.assertTrue(all(page["next_cursor"] for page in reverse[1:]))
+        wide = read(before=forward[-1]["previous_cursor"], limit=2)
+        self.assertEqual(ids(wide), [third, second])
+        self.assertIsNone(wide["previous_cursor"])
+        self.assertTrue(wide["next_cursor"])
+
+        def root(query):
+            status, _, body = self.request("/", query=query.encode())
+            self.assertEqual(status, 200)
+            view = root_navigation(body.decode())
+            for key in ("after", "before", "first"):
+                for link in view[key]:
+                    self.assertEqual(parse_qs(link).get("limit"), ["1"])
+            for label, key in (("Older", "after"), ("Newer", "before"), ("First", "first")):
+                if view[key]:
+                    self.assertIn(label, view["text"])
+            return view
+
+        views = [root("limit=1")]
+        for _ in expected:
+            if not views[-1]["after"]:
+                break
+            link = views[-1]["after"][0]
+            self.assertEqual(parse_qs(link).get("after"), [forward[len(views) - 1]["next_cursor"]])
+            views.append(root(link))
+        else:
+            self.fail("Root Older links did not reach the final page")
+        self.assertEqual([view["plans"] for view in views], [[plan_id] for plan_id in expected])
+        self.assertTrue(views[0]["after"])
+        self.assertEqual(views[0]["before"], [])
+        self.assertTrue(all(view["before"] and view["first"] for view in views[1:]))
+        walked = [views[-1]]
+        for _ in expected:
+            if not walked[-1]["before"]:
+                break
+            link = walked[-1]["before"][0]
+            self.assertEqual(parse_qs(link).get("before"), [forward[len(expected) - len(walked)]["previous_cursor"]])
+            walked.append(root(link))
+        else:
+            self.fail("Root Newer links did not reach the first page")
+        self.assertEqual([view["plans"] for view in walked], [[plan_id] for plan_id in reversed(expected)])
+        first = views[-1]["first"][0]
+        self.assertEqual(parse_qs(first), {"limit": ["1"]})
+        self.assertEqual(root(first)["plans"], [third])
+        self.assertEqual(dump(self.f.store), stored)
+
+    def test_compact_plan_index_rejects_invalid_queries_and_foreign_cursors(self):
+        self.f.create(creation_id="index-invalid-second")
+        insert_attempt(self.f.store, self.plan_id, "cursor-a", "a", "active")
+        insert_attempt(self.f.store, self.plan_id, "cursor-b", "b", "active")
+        coordination_cursor = self.f.service.read_coordination(self.plan_id, limit=1).next_cursor
+        self.assertTrue(coordination_cursor)
+        status, _, body = self.request("/api/plan-index", query=b"limit=1")
+        self.assertEqual(status, 200)
+        valid = json.loads(body)["next_cursor"]
+        self.assertTrue(valid)
+        queries = [b"unexpected=x", b"limit=1&limit=2", b"limit=1&unexpected=x", b"limit=",
+                   b"limit=0", b"limit=101", b"limit=-1", b"limit=true", b"limit=1.5",
+                   urlencode([("after", valid), ("after", valid)]).encode(),
+                   urlencode([("before", valid), ("before", valid)]).encode(),
+                   urlencode({"after": valid, "before": valid}).encode(),
+                   urlencode({"after": valid, "before": valid, "limit": 1}).encode(),
+                   urlencode({"after": valid, "unexpected": "x"}).encode(),
+                   urlencode({"after": valid, "limit": 0}).encode(),
+                   urlencode({"before": valid, "limit": 101}).encode()]
+        for name in ("after", "before"):
+            for cursor in ("not-a-cursor", "!!!", "A" * 20000, coordination_cursor):
+                queries.append(urlencode({name: cursor, "limit": 1}).encode())
+        stored = dump(self.f.store)
+        for query in queries:
+            with self.subTest(query=query[:120]):
+                status, _, body = self.request("/api/plan-index", query=query)
+                self.assertEqual(status, 400)
+                self.assertEqual(json.loads(body)["error"]["code"], "invalid")
+        self.assertEqual(dump(self.f.store), stored)
+        self.assertEqual(self.request("/api/plan-index", query=urlencode({"after": valid, "limit": 1}).encode())[0], 200)
+
+    def test_plan_index_cursor_survives_existing_changes_but_not_inserts_or_epoch(self):
+        other = self.f.create(creation_id="cursor-lifecycle-second").current_metadata.plan_id
+
+        def page(**query):
+            status, _, body = self.request("/api/plan-index", query=urlencode(query).encode())
+            self.assertNotEqual(status, 404, "/api/plan-index endpoint is missing")
+            return status, json.loads(body)
+
+        def identities(value):
+            return ([item["plan_id"] for item in value["plans"]], value["next_cursor"],
+                    value["previous_cursor"], value["epoch"], value["collection_fence"])
+
+        status, first = page(limit=1)
+        self.assertEqual(status, 200)
+        self.assertEqual([item["plan_id"] for item in first["plans"]], [other])
+        cursor = first["next_cursor"]
+        self.assertTrue(cursor)
+        status, baseline = page(after=cursor, limit=1)
+        self.assertEqual(status, 200)
+        self.assertEqual([item["plan_id"] for item in baseline["plans"]], [self.plan_id])
+        self.assertEqual(set(baseline["plans"][0]), COMPACT_PLAN_KEYS)
+        sequences = [baseline["store_sequence"]]
+
+        def assert_continuation_survives():
+            status, current = page(after=cursor, limit=1)
+            self.assertEqual(status, 200)
+            self.assertEqual(identities(current), identities(baseline))
+            self.assertGreater(current["store_sequence"], sequences[-1])
+            sequences.append(current["store_sequence"])
+
+        self.f.service.execute(self.f.command("revise_plan", {
+            "draft": self.f.service.read_plan(self.plan_id).draft, "reason": "cursor-preserving revision",
+            "authorization_change": None, "retire_steps": ()}, receipt=self.p))
+        assert_continuation_survives()
+        active = self.f.start(self.p, self.f.assign(self.p))
+        assert_continuation_survives()
+        heartbeat = self.f.command("report_activity", {
+            "origin_worker": "worker-a", "relay": None, "observed_activity": "cursor heartbeat",
+        }, receipt=self.p, attempt=active)
+        self.f.service.execute(dataclasses.replace(heartbeat, expected_revision=None, ownership_version=None))
+        assert_continuation_survives()
+        newest = self.f.create(creation_id="cursor-lifecycle-inserted").current_metadata.plan_id
+        status, error = page(after=cursor, limit=1)
+        self.assertEqual(status, 409)
+        self.assertEqual(error["error"]["code"], "conflict")
+        status, headers, body = self.request("/", query=urlencode({"after": cursor, "limit": 1}).encode())
+        self.assertIn(status, (200, 409))
+        self.assertIn("text/html", dict(headers)["content-type"])
+        html = body.decode()
+        self.assertFalse(html.lstrip().startswith("{"))
+        navigation = root_navigation(html)
+        visible = navigation["text"].lower()
+        self.assertTrue("changed" in visible or "restart" in visible, visible)
+        self.assertIn("First", navigation["text"])
+        firsts = [link for link in navigation["first"] if parse_qs(link) == {"limit": ["1"]}]
+        self.assertEqual(len(firsts), 1)
+        status, _, body = self.request("/", query=firsts[0].encode())
+        self.assertEqual(status, 200)
+        self.assertEqual(root_navigation(body.decode())["plans"], [newest])
+        status, fresh = page(limit=1)
+        self.assertEqual((status, [item["plan_id"] for item in fresh["plans"]]), (200, [newest]))
+        fresh_cursor = fresh["next_cursor"]
+        self.assertTrue(fresh_cursor)
+        self.assertEqual(page(after=fresh_cursor, limit=1)[0], 200)
+        self.f.store.write(lambda db: db.execute(
+            "UPDATE installation SET epoch=? WHERE id=1", ("00000000-0000-4000-8000-000000000001",)))
+        status, error = page(after=fresh_cursor, limit=1)
+        self.assertEqual(status, 409)
+        self.assertEqual(error["error"]["code"], "conflict")
+
+    def test_compact_and_full_status_match_canonical_authority_and_malformed_authority_fails_closed(self):
+        def revised(receipt, **changes):
+            base = self.f.service.read_plan(receipt.current_metadata.plan_id).draft
+            self.f.service.execute(self.f.command("revise_plan", {
+                "draft": dataclasses.replace(base, **changes), "reason": "synthetic canonical status",
+                "authorization_change": None, "retire_steps": ()}, receipt=receipt))
+
+        running = self.f.create(creation_id="canonical-running").current_metadata.plan_id
+        set_step_state(self.f.store, running, "a", "in-progress")
+        insert_attempt(self.f.store, running, "canonical-running-attempt", "a", "active")
+        blocked_receipt = self.f.create(creation_id="canonical-blocked")
+        revised(blocked_receipt, block_reason="needs input")
+        stopped_receipt = self.f.create(creation_id="canonical-stopped")
+        revised(stopped_receipt, stop_reason="user stopped")
+        complete = self.f.create(creation_id="canonical-complete").current_metadata.plan_id
+        complete_all_steps(self.f.store, complete)
+        blocked = blocked_receipt.current_metadata.plan_id
+        stopped = stopped_receipt.current_metadata.plan_id
+
+        def assert_canonical(expected):
+            for plan_id, literal in expected.items():
+                with self.subTest(plan_id=plan_id, literal=literal):
+                    self.assertEqual(self.f.service.read_plan(plan_id).status, literal)
+                    status, _, body = self.request("/api/plans/" + plan_id)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(json.loads(body)["status"], literal)
+            status, _, body = self.request("/api/plan-index")
+            self.assertEqual(status, 200)
+            self.assertEqual({item["plan_id"]: item["status"] for item in json.loads(body)["plans"]}, expected)
+
+        assert_canonical({self.plan_id: "planning", running: "running", blocked: "blocked",
+                          stopped: "stopped", complete: "complete"})
+        insert_store_hold(self.f.store, self.f.store.installation_epoch())
+        assert_canonical({self.plan_id: "blocked", running: "blocked", blocked: "blocked",
+                          stopped: "stopped", complete: "blocked"})
+        for stop_reason in ("", 7, ["user stopped"]):
+            def corrupt(db):
+                row = db.execute("SELECT payload FROM plans WHERE plan_id = ?", (stopped,)).fetchone()
+                payload = json.loads(row[0])
+                payload["draft"]["stop_reason"] = stop_reason
+                db.execute("UPDATE plans SET payload = ? WHERE plan_id = ?", (json.dumps(payload), stopped))
+            self.f.store.write(corrupt)
+            for path in ("/api/plans/" + stopped, "/api/plan-index"):
+                with self.subTest(stop_reason=stop_reason, path=path):
+                    status, _, body = self.request(path)
+                    self.assertEqual(status, 400)
+                    decoded = json.loads(body)
+                    self.assertEqual(set(decoded), {"error"})
+                    self.assertEqual(decoded["error"]["code"], "invalid")
+
+    def test_plan_index_rejects_out_of_range_cursor_keys(self):
+        import base64
+
+        status, _, body = self.request("/api/plan-index")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        epoch = data["epoch"]
+        fence = data["collection_fence"]
+        count, max_rowid = fence["count"], fence["max_rowid"]
+
+        def make_cursor(direction, key):
+            raw = json.dumps({"c": count, "d": direction, "e": epoch, "k": key, "m": max_rowid,
+                              "t": "plan-index", "v": 1},
+                             sort_keys=True, separators=(",", ":")).encode("utf-8")
+            return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+        for direction in ("after", "before"):
+            for key in (2**63, 2**63 - 1):
+                cursor = make_cursor(direction, key)
+                status, _, body = self.request("/api/plan-index", query=urlencode({direction: cursor, "limit": 1}).encode())
+                self.assertEqual(status, 400)
+                decoded = json.loads(body)
+                self.assertEqual(set(decoded), {"error"})
+                self.assertEqual(decoded["error"]["code"], "invalid")
+                self.assertNotIn("Traceback", body.decode())
+                self.assertNotIn("sqlite", body.decode().lower())
+
+    def test_plan_index_navigation_accepts_largest_stored_rowid(self):
+        second = self.f.create(creation_id="largest-rowid-second").current_metadata.plan_id
+        third = self.f.create(creation_id="largest-rowid-third").current_metadata.plan_id
+        self.f.store.write(lambda db: db.execute(
+            "UPDATE plans SET rowid = ? WHERE plan_id = ?", (9223372036854775807, self.plan_id)))
+        status, _, body = self.request("/api/plan-index", query=b"limit=1")
+        self.assertEqual(status, 200)
+        page1 = json.loads(body)
+        self.assertEqual([p["plan_id"] for p in page1["plans"]], [self.plan_id])
+        next_cursor = page1["next_cursor"]
+        self.assertTrue(next_cursor)
+        status, _, body = self.request("/api/plan-index", query=urlencode({"after": next_cursor, "limit": 1}).encode())
+        self.assertEqual(status, 200)
+        page2 = json.loads(body)
+        self.assertEqual([p["plan_id"] for p in page2["plans"]], [third])
+        prev_cursor = page2["previous_cursor"]
+        self.assertTrue(prev_cursor)
+        status, _, body = self.request("/api/plan-index", query=urlencode({"before": prev_cursor, "limit": 1}).encode())
+        self.assertEqual(status, 200)
+        page_back = json.loads(body)
+        self.assertEqual([p["plan_id"] for p in page_back["plans"]], [self.plan_id])
+        import base64
+        payload = {
+            "c": page_back["collection_fence"]["count"],
+            "d": "before",
+            "e": page_back["epoch"],
+            "k": 9223372036854775807,
+            "m": page_back["collection_fence"]["max_rowid"],
+            "t": "plan-index",
+            "v": 1,
+        }
+        forged = base64.urlsafe_b64encode(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        status, _, body = self.request("/api/plan-index", query=urlencode({"before": forged, "limit": 1}).encode())
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["error"]["code"], "invalid")
+
+    def test_default_plan_index_navigation_carries_limit(self):
+        created = [self.f.create(creation_id=f"default-nav-{i}").current_metadata.plan_id for i in range(26)]
+        all_expected = list(reversed(created)) + [self.plan_id]
+        self.assertEqual(len(all_expected), 27)
+        first_25 = all_expected[:25]
+        last_2 = all_expected[25:]
+        self.assertEqual(len(first_25), 25)
+        self.assertEqual(len(last_2), 2)
+        status, _, body = self.request("/")
+        self.assertEqual(status, 200)
+        page1 = root_navigation(body.decode())
+        self.assertEqual(len(page1["plans"]), 25)
+        self.assertEqual(page1["plans"], first_25)
+        for key in ("after", "before", "first"):
+            for link in page1[key]:
+                self.assertEqual(parse_qs(link).get("limit"), ["25"])
+        self.assertEqual(len(page1["after"]), 1)
+        status, _, body = self.request("/", query=page1["after"][0].encode())
+        self.assertEqual(status, 200)
+        page2 = root_navigation(body.decode())
+        self.assertEqual(len(page2["plans"]), 2)
+        self.assertEqual(page2["plans"], last_2)
+        for key in ("after", "before", "first"):
+            for link in page2[key]:
+                self.assertEqual(parse_qs(link).get("limit"), ["25"])
+        self.assertEqual(len(page2["before"]), 1)
+        self.assertEqual(len(page2["first"]), 1)
+        status, _, body = self.request("/", query=page2["before"][0].encode())
+        self.assertEqual(status, 200)
+        newer_page = root_navigation(body.decode())
+        self.assertEqual(len(newer_page["plans"]), 25)
+        self.assertEqual(newer_page["plans"], first_25)
+        status, _, body = self.request("/", query=page2["first"][0].encode())
+        self.assertEqual(status, 200)
+        first_page = root_navigation(body.decode())
+        self.assertEqual(len(first_page["plans"]), 25)
+        self.assertEqual(first_page["plans"], first_25)
+
+    def test_conflicting_root_retains_failed_poll_cursor(self):
+        self.f.create(creation_id="conflict-poll-second")
+        status, _, body = self.request("/api/plan-index", query=b"limit=1")
+        self.assertEqual(status, 200)
+        cursor = json.loads(body)["next_cursor"]
+        self.assertTrue(cursor)
+        self.f.create(creation_id="conflict-poll-inserted")
+        status, _, body = self.request("/", query=urlencode({"after": cursor, "limit": 1}).encode())
+        self.assertEqual(status, 409)
+        html = body.decode()
+        nav = root_navigation(html)
+        self.assertIn("First", nav["text"])
+        firsts = [link for link in nav["first"] if parse_qs(link) == {"limit": ["1"]}]
+        self.assertEqual(len(firsts), 1)
+        page = Page(html)
+        body_attrs = next(attrs for tag, attrs in page.tags if tag == "body")
+        plans_url = body_attrs["data-plans-url"]
+        parts = urlsplit(plans_url)
+        self.assertEqual(parts.path, "/api/plan-index")
+        query = parse_qs(parts.query)
+        self.assertEqual(query.get("after"), [cursor])
+        self.assertEqual(query.get("limit"), ["1"])
+
+    def test_plan_index_cursors_enforce_direction_and_reject_blank_or_padded_values(self):
+        self.f.create(creation_id="direction-second")
+
+        def page(**query):
+            status, _, body = self.request("/api/plan-index", query=urlencode(query).encode())
+            self.assertNotEqual(status, 404, "/api/plan-index endpoint is missing")
+            return status, json.loads(body)
+
+        status, newest = page(limit=1)
+        self.assertEqual(status, 200)
+        status, oldest = page(after=newest["next_cursor"], limit=1)
+        self.assertEqual(status, 200)
+        forward, reverse = newest["next_cursor"], oldest["previous_cursor"]
+        self.assertTrue(forward and reverse)
+        rejected = [{"before": forward}, {"after": reverse}, {"after": ""}, {"before": ""}]
+        for name, cursor in (("after", forward), ("before", reverse)):
+            for variant in (" " + cursor, cursor + " ", cursor + "\n"):
+                rejected.append({name: variant})
+        stored = dump(self.f.store)
+        for query in rejected:
+            with self.subTest(query=repr(query)[:80]):
+                status, error = page(limit=1, **query)
+                self.assertEqual(status, 400)
+                self.assertEqual(error["error"]["code"], "invalid")
+        self.assertEqual(dump(self.f.store), stored)
+        status, value = page(after=forward, limit=1)
+        self.assertEqual((status, [item["plan_id"] for item in value["plans"]]), (200, [self.plan_id]))
+        status, value = page(before=reverse, limit=1)
+        self.assertEqual((status, [item["plan_id"] for item in value["plans"]]), (200, [newest["plans"][0]["plan_id"]]))
+
+    def test_compact_reads_stay_available_when_one_plan_exceeds_the_individual_response_cap(self):
+        # TEST-ONLY historical oversized-publication seed: an ordinary small plan plus one synthetic
+        # oversized event row. Not state accepted by a normal oversized-draft command; real caps stay.
+        plan_id = self.f.create(creation_id="oversized-individual-plan").current_metadata.plan_id
+        original = self.f.service.read_plan(plan_id)
+        objective, revision = original.draft.objective, original.metadata.revision
+        self.assertNotEqual(plan_id, self.plan_id)
+
+        def seed_oversized_history(db):
+            db.execute("INSERT INTO events (plan_id,plan_revision,kind,actor,published_at,payload) VALUES (?,?,?,?,?,?)",
+                       (plan_id, revision, "synthetic_oversized_history", "synthetic-fixture",
+                        self.f.clock().isoformat(), json.dumps({"summary": "x" * 11000000})))
+
+        self.f.store.write(seed_oversized_history)
+        status, _, body = self.request("/api/plans/" + plan_id)
+        self.assertEqual(status, 413)
+        self.assertEqual(json.loads(body)["error"]["code"], "limit_exceeded")
+        status, _, body = self.request("/api/plan-index", query=b"limit=1")
+        self.assertEqual(status, 200)
+        self.assertLess(len(body), 100_000)
+        self.assertNotIn(b"x" * 1000, body)
+        index = json.loads(body)
+        self.assertEqual([item["plan_id"] for item in index["plans"]], [plan_id])
+        item = index["plans"][0]
+        self.assertEqual(set(item), COMPACT_PLAN_KEYS)
+        self.assertEqual((item["objective"], item["status"]), (objective, "planning"))
+        status, _, html = self.request("/", query=b"limit=1")
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"x" * 1000, html)
+        self.assertEqual(root_navigation(html.decode())["plans"], [plan_id])
 
 
 if __name__ == "__main__":

@@ -283,6 +283,11 @@ is a no-op that creates no backup or manifest. The local
 `migrate_database(store, backup_directory)` wrapper consumes/closes its supplied
 Store even if a sibling owner subsequently blocks migration.
 
+Unsupported maintenance must not reassign plan rowids; do not run `VACUUM` or
+`DELETE` plans under the compact plan-index collection fence. Supported migration,
+backup, and restore operations must preserve rowid mapping or invalidate the
+installation epoch.
+
 Restore requires an admitted existing schema2 authority and a closed marked
 same-host backup (schema1 may upgrade inside the stage). A quiesced source can
 include committed WAL or a rollback journal: restore materializes the same
@@ -382,10 +387,11 @@ mounted read-only. Their concise JSON records actual runtime and domain checks;
 the synthetic private state file stays `0600` in `/data`. This exercise does not
 activate installed clients or accept/deploy an existing installation.
 
-## Three-client planning gate
+## Two-client planning gate <a id="three-client-planning-gate"></a>
 
-Configure the actual chosen surfaces using the [Codex](clients/codex.md),
-[Antigravity](clients/antigravity.md) and [Copilot](clients/copilot.md) guides.
+Configure the actual chosen surfaces using the [Codex](clients/codex.md) and
+[Antigravity](clients/antigravity.md) guides. The [Copilot](clients/copilot.md) guide
+is preserved for historical reference (superseded for the current gate by explicit user choice).
 Configuration and service activation require execution authorization and private
 credential provisioning. The example values belong only in documentation or an
 isolated synthetic installation. They must not be copied as credentials into real
@@ -430,10 +436,11 @@ planning-only sequence through the actual products:
    including the interval and `since_revision` initialized at creation; do not
    rebuild it from the blank creation draft. Use `authorization_change: null`
    and `retire_steps: []` because this gate changes only planning facts.
-4. A fresh third product resumes that same plan, reads the latest canonical draft,
-   and appends the third distinct fact through another revision using the same
-   rules. All clients must discover the same epoch, host ID, generation and plan
-   dashboard URL; the three successful commands have distinct committed revisions.
+4. A fresh reopened session of one of these two products resumes that same plan,
+   reads the latest canonical draft, and appends the third distinct fact through
+   another revision using the same rules. All clients must discover the same
+   epoch, host ID, generation and plan dashboard URL; the three successful
+   commands have distinct committed revisions.
 5. Compare `read_plan` and `read_events` with public GETs of
    `/api/plans/<plan_id>` and `/api/plans/<plan_id>/events` and the plan page at
    `/plans/<plan_id>`. Record all three events and facts, plus creator-close and
@@ -469,9 +476,9 @@ actual authorized observations; any missing client remains a release blocker.
 | --- | --- | --- | --- | --- | --- |
 | Codex | Pending: record CLI or Desktop and its actual credential method | Pending | Pending | Pending | Release blocker |
 | Antigravity | Pending: record actual AGY surface and private literal-header method | Pending | Pending | Pending | Release blocker |
-| Copilot | Pending: record CLI or VS Code; CLI additionally needs actual environment-expansion proof | Pending | Pending | Pending | Release blocker |
+| Copilot | Historical guide example; superseded by user choice | Unsupported for current release gate | N/A | N/A | Excluded from current gate |
 
-## Three-client worker checkpoint gate
+## Two-client worker checkpoint gate <a id="three-client-worker-checkpoint-gate"></a>
 
 Task 20 adds a source interoperability checkpoint to the earlier planning gate.
 `tests.test_service_interop.run_worker_interop(service: PlanningService) -> tuple[Event, ...]`
@@ -634,7 +641,7 @@ SDK results and connected status cannot fill these rows.
 | --- | --- | --- | --- | --- |
 | Codex: actual CLI/Desktop surface and version unobserved | NOT RUN — release blocker | NOT RUN | NOT RUN | NOT RUN |
 | Antigravity: actual surface and version unobserved | NOT RUN — release blocker | NOT RUN | NOT RUN | NOT RUN |
-| Copilot: actual CLI/VS Code surface and version unobserved | NOT RUN — release blocker | NOT RUN | NOT RUN | NOT RUN |
+| Copilot: historical guide example | Superseded by user choice; unsupported for current gate | Superseded | Superseded | Superseded |
 
 Each lifecycle row must compare before/after assignments, evidence, revisions,
 result identities and URLs while preserving accepted work without redispatch.
@@ -714,31 +721,39 @@ These are explicit mappings, not claims that absent method names ran:
 | `test_stale_checkpoint_and_fenced_late_evidence` | `test_recovery_checkpoint_is_event_only_and_confirmation_preserves_original_review`, replacement checkpoint fencing above, and `test_late_owner_evidence_only_appends_note_and_stop_report` |
 | `test_normal_restart_not_restore` | Exact `test_restart_preserves_epoch_and_events`, qualified Linux admin `verify_restart`, and fresh owned SDK/container lifecycle observations |
 
-The current acceptance matrix keeps automated evidence, bounded owned-fixture
-observations, historical reuse and genuine-client release gates separate. The
-52 approved test labels use the explicit seven mappings above where necessary.
+The historical acceptance matrix below records automated evidence, bounded
+owned-fixture observations, historical reuse and genuine-client release gates
+from prior tested snapshots. The 52 approved test labels use the explicit seven
+mappings above where necessary.
 
-| Design check / review focus | Current source evidence | Additional observation or remaining gate |
+All records in this section—including full discovery, Linux image, browser, and
+hash comparisons—are bound to those earlier verified snapshots (such as base
+`bfe4adfe27622231562729c3e25f672f8cc425eb`). Full suite qualification, Linux
+container image verification, and installed two-client acceptance for the current
+candidate remain pending post-closure gates; these prior results do not attest to
+subsequent source or asset changes.
+
+| Design check / review focus | Prior snapshot evidence | Additional observation or remaining gate |
 | --- | --- | --- |
-| 1: three-client tools/read/checkpoint | Full discovery passed current official SDK/protocol and synthetic worker-cycle tests; new matrix exercised all 29 actual handlers. | Genuine Codex/Antigravity/Copilot checkpoint and acceptance runs remain 0; all installed-client rows OPEN. |
-| 2: persistence/resume | Restart persistence test passed. | Fresh owned stop/start, restart and same-volume recreation results are recorded below. Actual installed-client close/reopen and the default Compose lifecycle gate remain OPEN. |
+| 1: two-client tools/read/checkpoint | Full discovery in prior snapshot passed official SDK/protocol and synthetic worker-cycle tests; matrix exercised all 29 actual handlers. | Fresh post-closure Codex/Antigravity acceptance remains pending; prior-candidate CLI proofs are recorded below. Copilot is excluded from the current gate. |
+| 2: persistence/resume | Restart persistence test passed in prior snapshot. | Prior owned stop/start, restart and same-volume recreation results are recorded below. Actual installed-client close/reopen and the default Compose lifecycle gate remain OPEN. |
 | 3: assignment/resources/availability | Full discovery passed barrier/concurrency, physical/path identity, overlapping repository/external-resource and checked-base tests. | These are scoped source-test fixtures; no additional user worktree or shared resource was activated. |
-| 4: idempotency/fencing | Full discovery passed lost-bootstrap-response, request replay/CAS, capability and takeover/fencing tests. New matrix confirms real parse/dispatch and read/error token boundaries. | Fresh outage replay uses the retained original key/body; it does not simulate an actually lost server response. |
+| 4: idempotency/fencing | Full discovery in prior snapshot passed lost-bootstrap-response, request replay/CAS, capability and takeover/fencing tests; matrix confirmed real parse/dispatch and read/error token boundaries. | Prior outage replay used the retained original key/body; it did not simulate an actually lost server response. |
 | 5: frozen definitions/adaptation/review | Full discovery passed frozen-definition, atomic material holds, review binding, corrective history, retirement and invalidation tests. | Qualified Linux admin restore/hold observations are described below. Synthetic reviewers establish API behavior, not independent human/AI review. |
-| 6: evidence/interleaving | Full discovery passed checkpoint and interleaving tests. | Current owned browser observations below retain two independent local workers' actual arithmetic outcomes, evidence and reassessment; failed work stays blocked. |
+| 6: evidence/interleaving | Full discovery in prior snapshot passed checkpoint and interleaving tests. | Prior owned browser observations below retain two independent local workers' actual arithmetic outcomes, evidence and reassessment; failed work stays blocked. |
 | 7: scope | Full discovery passed plan-only/global-latch/active-import tests. | No takeover, restart or import in this candidate grants additional task authorization. |
 | 8: stale/relay/resources | Full discovery passed injected-clock, replacement/fenced evidence and exclusive-workspace handoff tests. | The browser shows that host edits are uncontrolled. No actual host stop or elapsed-time heartbeat is invented. |
-| 9: dashboard | Full discovery passed dashboard freshness/projection tests; Node DOM script passed. | Current owned browser viewport/CSP/escaping/holds/reviews/reconnect observations are recorded below with explicit bounds. Historical Task8 evidence is qualified separately. |
-| 10: unavailable behavior | Both current instruction/unavailable and relay tests passed in full discovery. | Current owned fixture literally stops its service during assigned work and retains unpublished observations without creating a fallback server/plan. |
-| 11: legacy/import/restore | Full discovery passed legacy and current import/restore tests, including the mapped shorthand methods. | Accepted Linux core/admin backup/export/restore/newer-schema refusal is reused only for unchanged directly exercised source and runtime bindings. |
-| 12: container/auth | Full discovery passed Host/Origin/auth, logs/URLs and container-contract tests. | Current owned Linux inspect and authenticated protocol observations are recorded below. Known-token scans have stated coverage; they are not universal secret detection. |
+| 9: dashboard | Full discovery in prior snapshot passed dashboard freshness/projection tests; Node DOM script passed. | Prior owned browser viewport/CSP/escaping/holds/reviews/reconnect observations are recorded below with explicit bounds. Historical Task8 evidence is qualified separately. |
+| 10: unavailable behavior | Both instruction/unavailable and relay tests passed in prior full discovery. | Prior owned fixture literally stopped its service during assigned work and retained unpublished observations without creating a fallback server/plan. |
+| 11: legacy/import/restore | Full discovery in prior snapshot passed legacy and import/restore tests, including the mapped shorthand methods. | Accepted Linux core/admin backup/export/restore/newer-schema refusal is reused only for unchanged directly exercised source and runtime bindings. |
+| 12: container/auth | Full discovery passed Host/Origin/auth, logs/URLs and container-contract tests. | Prior owned Linux inspect and authenticated protocol observations are recorded below. Known-token scans have stated coverage; they are not universal secret detection. |
 | Review Focus 1: superseded private receipts/fencing | Lost-bootstrap and cached-mutation tests passed; new matrix preserves intentional private mutation receipts and rejects them on reads. | No restored/cached grant is treated as authority. |
 | Review Focus 2: physical/canonical resource identity | Alias/device/path/reconciliation tests passed. | Source-fixture attestations retain conservative matching and explicit case behavior. |
 | Review Focus 3: atomic checkpoint/holds | Concurrent atomic-hold tests passed. | Browser observation is additional committed-state evidence, not the atomicity proof. |
 | Review Focus 4: absent work after restore | Actual restored-invalidation and typed-inventory tests passed. | Qualified unchanged Linux admin exercise retains the whole-store hold until inventory reconciles absent host work. |
 | Review Focus 5: relay/outage honesty | Relay and unavailable tests passed. | Actual owned outage observations are bounded local checks with explicit origin; no fabricated host stop, heartbeat or AI-client checkpoint. |
 
-The fresh owned Linux/browser fixture ran once under each separately approved
+The prior owned Linux/browser fixture ran once under each separately approved
 producer version. Final exact command
 `uv run --frozen python -B .superpowers/native-linux-release-v5.py` exited0;
 `linux-release-04.txt` preserves all 989 child-output bytes, SHA256
@@ -746,13 +761,15 @@ producer version. Final exact command
 Public observations are in
 `native-linux-public-evidence-f5c8eeeeddf74cd88054ea8a107bd895.json`, SHA256
 `de21c9be874e7a235a68949976cb248ca796aae8af13b339422df33e3fdb57fa`.
-The current-byte 71-path snapshot SHA256 is
+The prior 71-path snapshot SHA256 was
 `0571695bc9c4fa3e6d99d0dc0a6fbb9f786293d5ef681a0da36a4f3183cfe766`;
-all bindings stayed identical during the run. The later operations append is
+all bindings stayed identical during that run. The later operations append was
 outside that built snapshot; product code/tests and all 22 installed
-production/asset byte hashes match the completed Python and runtime evidence.
+production/asset byte hashes matched that completed Python and runtime evidence.
+Verification of current candidate bytes and assets remains pending post-closure
+execution.
 
-The fresh uniquely owned image ID is
+The prior tested uniquely owned image ID was
 `sha256:8d48534cd7f44d8d42308a9d70b66a1e670767a04cf3d986d3a9f2eb21b50835`.
 Actual Docker context was `desktop-linux` through its Unix socket. Inspect
 confirmed Linux/arm64, UID/GID10001, read-only root, loopback-only
@@ -778,7 +795,7 @@ events. Its separately recorded review is explicitly a local simulated role.
 These owned CLI operations are bounded source/runtime evidence, not the actual
 installed-client or default `docker compose` lifecycle gate, nor real Mac sleep.
 
-The current browser was isolated headless Google Chrome153.0.8010.50, using
+In that tested run, the browser was isolated headless Google Chrome153.0.8010.50, using
 installed Playwright CLI0.1.22/Playwright1.64.0-alpha-1790635538000 with no new
 browser/dependency download or global profile/configuration change. At
 1440x1000 it observed two plans on the index with optional workflow omitted,
@@ -829,21 +846,79 @@ Exactly27 of its30 source bindings still match; transport, operations and import
 tests differ, so the old image establishes neither the new transport nor a
 whole-current-source PASS. The actual admin exercise source SHA256 remains
 `749ae4beffcaf18c8e82be57e59ffcab776bd0aea3c2363c938543b087d4ff75`;
-current fresh runtime independently confirms the same Linux Python/SQLite
+that tested runtime independently confirmed the same Linux Python/SQLite
 versions and loaded-library identity. Historical Task8 browser records retain
 14 passed/5 UNKNOWN at their original Chrome153.0.8010.50/Python3.14.3 runtime.
 Only index/style assets and the HTTP test still match that browser catalog;
 changed dashboard JavaScript/production/test sources prevent carrying those
-functional PASS claims into this candidate. Current browser claims rely on the
-fresh bounded observations above; historical unknowns are retained.
+functional PASS claims into this candidate. Prior browser observations rely on
+the bounded observations from that run; historical unknowns are retained, and
+current browser verification is recorded in the dated closure evidence below.
 
-Release acceptance remains OPEN with zero genuine three-client checkpoint runs.
-The existing planning and Task20 installed-client tables remain unfilled. Codex's
-full actual scenario is pending coordinator execution; Antigravity's genuine
-configuration boundary remains unresolved; Copilot has user-confirmed zero
-credits. An earlier selected Antigravity credit error does not prove that all
-Gemini quota is exhausted. SDK, HTTP, unit, synthetic role, Linux and browser
+Release acceptance remains OPEN: fresh post-closure two-client checkpoint runs are pending.
+The existing planning and Task20 installed-client tables remain unfilled. Dated prior-candidate evidence: Codex CLI 0.160.1 app-server negotiated MCP
+2025-06-18 in five fresh processes, discovering 29 tools and making 49 calls
+(eight mutations), with Compose stop/start/restart/down-up persistence. AGY
+1.3.3 Flash High exercised 14 unique tools through checkpoint, process exit,
+Compose restart, fresh owner takeover, actual 15-minute recovery, and a second
+checkpoint. This is bounded CLI evidence; it does not establish the full AGY
+29-tool catalogue, its wire protocol, or IDE/Desktop behavior. Installed AGY
+is now 1.3.4 without fresh genuine MCP proof. Copilot is excluded by user choice.
+Current code closure, full suite, Codex/Compose persistence and real browser focus are
+now verified in the dated closure evidence below. Current Antigravity acceptance,
+full final review, installed-skill activation and permanent deployment remain pending. SDK, HTTP, unit, synthetic role, Linux and browser
 observations cannot fill any genuine client row. Fresh task review and separate
 independent whole-change review are coordinator-owned gates; no implementer
 self-approval is recorded. A local commit does not complete Task26, the whole
 plan or release acceptance, or authorize default activation/deployment.
+
+
+## Current closure evidence, 2026-10-13
+
+These results cover the post-closure production source and replace pending
+labels for the named checks only. Release acceptance remains open until fresh
+Antigravity validation, final review and permanent activation complete.
+
+| Check | Verified result | Scope |
+| --- | --- | --- |
+| Full Python suite | 829 tests, exit 0, one platform skip | Host Python 3.13.15; expected negative startup-fixture diagnostics remain in the log. |
+| Actual-JS DOM suite | All 11 scenarios pass | Stable publication, compact pages, visible conflict/recovery notices, malformed-page atomic retention, attached navigation and one in-flight poll. |
+| Fresh Codex/Compose | Five installed Codex 0.160.1 processes, 29 tools, 49 calls, eight mutations; negotiated MCP 2025-06-18 | Close/reopen, stop/start, restart and same-volume container recreation preserve canonical state; no inference turn. This image preceded the equivalent Docker RUN-layer split below. |
+| Current image | `sha256:3d5a071b90dddef72d1c06e4a682afda8471b110e318c07911b9a2a8c14c1684` | Equivalent RUN-layer split retains every command and its order; shipped production/asset bytes are identical to the five-client image. UID 10001, Python 3.13.16 and SQLite 3.53.4. |
+| Current-image migration | Private existing-volume copy migrates schema 1 to 2 | Two plans, all five original events, authority tables, epoch, token and plan rowids retained; only one `schema_migrated` event added. `/data` 0700 and token 0600. Real volume unchanged. |
+| Real browser | Chromium retains 303 SSR index nodes, focus and a 12-character selection across polls | Hostile text stays literal. Older/Newer/First navigation covers 25 plus four plans with limit 25. Separate detail-page check retained 96 nodes while warning observation time advanced. |
+| Actual HTTP capacity | Two individually legal 6 MB plans return 200; full aggregate returns 413; compact JSON/root return 200 | Default compact page has 25 of 29 synthetic plans and a 7,752-byte JSON response. No production plans were created by this test. |
+
+Private receipts are retained under
+`/private/tmp/adaptive-closure-mk4rva0u/`: current full-suite result, current
+Compose/Codex acceptance, current migration proof, browser acceptance and scoped
+independent review reports. These are local verification artifacts, not public
+publishing or an OS sleep/reboot test. The installed shared skill and permanent
+client configuration are not yet activated.
+
+
+## Local activation evidence, 2026-10-13
+
+This dated record supersedes the pending activation labels in the preceding closure snapshot. The bounded final correction accepted canonical stopped plans, rejected empty compact cursors and enforced selected/default/maximum page bounds. Seven cases failed on unchanged production before implementation. The corrected checkout passed 829 Python tests with one platform skip and all 14 frontend scenarios. Expected negative startup-fixture diagnostics remain in the saved test logs. Fresh Gemini 4 Argon High independently approved spec compliance and code quality; its two optional UI polish findings were recorded for later work.
+
+The final image `sha256:a4f94ef59b2b14513d921ae841404d0c2e9ef2998dba814fd249a08afc2f79ff` contains the verified current assets and backend source. Real Chromium retained 304 captured nodes, selection, focus and links on a stopped plan and through rejection/recovery for an empty cursor and an oversized selected page. The default-25 and maximum-100 boundary cases were verified in Node; do not broaden the browser coverage claim.
+
+The permanent `adaptive-planning-live` Compose project is running on this Mac at `http://127.0.0.1:8790/`, using `adaptive-planning-data`, UID/GID 10001 and restart policy `unless-stopped`. The real volume was backed up while quiescent before its v1-to-v2 migration. Both original plans, all five original events, authority-table contents, plan rowids, installation epoch and credential were preserved; migration added the schema event. The current dashboard and static asset bytes were verified over HTTP. Mac sleep/reboot behavior remains outside the tested evidence.
+
+Private global entries named `adaptivePlanning` were provisioned for Codex and AGY, preserving the eight and five unrelated server entries respectively. Credential-bearing files use mode 0600 and their configuration parents use mode 0700. Config and installed-skill backups plus owned-key/file records were saved privately. All 15 refreshed shared-skill files match the source candidate; existing extra files and the skill lock were preserved.
+
+A fresh installed Codex 0.160.1 app-server read its permanent global entry, authenticated to the live server, discovered all 29 tools and completed actual `read_service_info` and `list_plans` calls. No model turn or mutation was submitted. The direct app-server status did not expose its negotiated downstream MCP protocol; no version is inferred from it. Earlier five-client lifecycle/protocol evidence remains bounded to its recorded image, identical backend bytes and tested flows.
+
+Fresh genuine AGY checkpoint/resume acceptance remains pending the explicit persistent `mcp(adaptivePlanning/*)` rule. That rule has not been added. Successful Argon access and code review do not prove AGY MCP planning mutations. Overall two-client worker acceptance remains open until the actual AGY gate is recorded.
+
+## Native client acceptance completed, 2026-10-13
+
+This later record supersedes the preceding pending AGY rule and checkpoint/resume labels for the approved local Codex/AGY CLI rollout. The user-approved persistent `mcp(adaptivePlanning/*)` rule is installed. The other 14 Allow entries, Ask/Deny lists and existing credit setting were preserved; the grant remains installed for future sessions.
+
+AGY CLI 1.3.4, using exact `gemini-3.8-flash-high` with explicit `--effort high`, made a native service-read qualification call, then created the labelled synthetic acceptance plan `97c76387-f8a9-408d-8661-f4e94f94e819` and accepted step A through 12 native MCP calls. That creator fully exited before a fresh conversation read its saved state, took ownership, swept only that plan, bound A's exact accepted observation to B's read-only context, and accepted B through 16 native MCP calls. The canonical plan is complete at revision 10 and ownership version 2. A's accepted result UUID remains unchanged. A separate installed Codex 0.160.1 app-server read that same AGY checkpoint through the permanent global entry, without a model turn or mutation.
+
+The coordinator independently checked canonical state and all 11 public plan events. Both checkpoints include actual observations and explicit reassessment. All 30 per-plan table digests for the two original plans match the baseline; only the labelled acceptance plan was added. The successful native client processes, their observed sidecars and owned terminals are settled. The permanent Compose service and named MCP rule remain running/installed independently of those sessions.
+
+The AGY launch retained `--mode accept-edits` and `--sandbox`; native initialization exposed permission mode `request-review`. Backend effort and the negotiated native AGY MCP protocol were not exposed and are not inferred. These are CLI checkpoint/continuation observations, not IDE/Desktop or Mac sleep/reboot tests. Earlier Codex/Compose lifecycle evidence remains bounded to its recorded image and identical backend bytes. Stopped monitor/fixture attempts are retained separately; they made no plan mutations or permission changes.
+
+The private final receipt and backups are retained under `/Users/aaat/.local/state/adaptive-planning/activation-20261013T190952Z/`. The verified production source, final image, 829-test Python result, 14 frontend scenarios, independent review and activation evidence above remain applicable. No code changed during this final native acceptance check. The development branch/worktree is retained for later integration.

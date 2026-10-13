@@ -6,7 +6,7 @@ from html import escape
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import BaseRoute, Route
@@ -37,6 +37,16 @@ def _plan_link(plan_id: str) -> str:
     return "/plans/" + quote(plan_id, safe="")
 
 
+def _plan_card(plan_id: str, objective: str, status: str, revision: int, published_at: str,
+               workflow: str = "", attributes: str = "") -> str:
+    return (
+        '<article class="plan-card"' + attributes + '><h2><a href="' + escape(_plan_link(plan_id), quote=True) + '">'
+        + escape(objective) + '</a></h2><p class="plan-card-meta">'
+        + escape(status) + " · Rev #" + str(revision) + '</p><p>Published: <time>'
+        + escape(published_at) + '</time></p><code class="task-id-code">' + escape(plan_id)
+        + "</code>" + workflow + "</article>")
+
+
 def render_plan_index(plans: tuple[PlanView, ...]) -> str:
     cards = []
     for view in plans:
@@ -44,26 +54,72 @@ def render_plan_index(plans: tuple[PlanView, ...]) -> str:
         if view.draft.workflow is not None:
             workflow = '<p class="workflow-info">Workflow: ' + escape(
                 "; ".join(f"{key}: {value}" for key, value in view.draft.workflow.items())) + "</p>"
-        cards.append(
-            '<article class="plan-card"><h2><a href="' + escape(_plan_link(view.plan_id), quote=True) + '">'
-            + escape(view.draft.objective) + '</a></h2><p class="plan-card-meta">'
-            + escape(view.status) + " · Rev #" + str(view.metadata.revision) + '</p><p>Published: <time>'
-            + escape(view.published_at) + '</time></p><code class="task-id-code">' + escape(view.plan_id)
-            + "</code>" + workflow + "</article>")
+        cards.append(_plan_card(
+            view.plan_id, view.draft.objective, view.status, view.metadata.revision, view.published_at, workflow))
     content = "".join(cards) or '<p class="empty-message">No committed plans.</p>'
+    return _index_document(content, "/api/plans")
+
+
+def _index_document(content: str, plans_url: str, navigation: str | None = None) -> str:
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
         '<title>Shared plans</title><link rel="stylesheet" href="/style.css"></head>'
-        '<body data-mode="service" data-plans-url="/api/plans"><div class="app-container">'
+        '<body data-mode="service" data-plans-url="' + escape(plans_url, quote=True)
+        + '"><div class="app-container">'
         '<header class="app-header"><div class="header-top"><h1>Shared plans</h1>'
         '<div id="conn-pill" class="status-pill status-pill--connecting" role="status">'
         '<span id="conn-label">Connecting…</span></div></div>'
         '<p>Read-only dashboard of committed publications. Host edits are not controlled by this service.</p>'
         '<div id="reconnect-banner" class="banner banner--warning" hidden role="alert">'
         '<span id="reconnect-text"></span></div></header>'
-        '<main id="plan-list" class="plan-list" aria-label="Committed plans">' + content + '</main></div>'
-        '<script src="/app.js"></script></body></html>')
+        '<main id="plan-list" class="plan-list" aria-label="Committed plans">' + content + '</main>'
+        + (navigation or "") + '</div><script src="/app.js"></script></body></html>')
+
+
+def _index_query(limit: int | None, cursor: tuple[str, str] | None = None) -> str:
+    pairs = ([cursor] if cursor is not None else []) + ([("limit", str(limit))] if limit is not None else [])
+    return urlencode(pairs)
+
+
+def _index_target(path: str, limit: int | None, cursor: tuple[str, str] | None = None) -> str:
+    query = _index_query(limit, cursor)
+    return path + "?" + query if query else path
+
+
+def _index_navigation(links: list[tuple[str, str, str]]) -> str:
+    anchors = "".join('<a id="plan-index-' + key + '" href="' + escape(href, quote=True) + '">' + label + "</a>"
+                      for key, label, href in links)
+    return '<nav id="plan-index-nav" class="plan-index-nav" aria-label="Plan pages">' + anchors + "</nav>"
+
+
+def render_compact_plan_index(page: dict, limit: int | None = None, cursor: tuple[str, str] | None = None) -> str:
+    """Root page over one compact index page; navigation sits outside the replaced plan-list region."""
+    cards = "".join(
+        _plan_card(item["plan_id"], item["objective"], item["status"], item["revision"], item["published_at"],
+                   attributes=' data-plan-id="' + escape(item["plan_id"], quote=True) + '"')
+        for item in page["plans"])
+    if not cards:
+        cards = ('<p class="empty-message">No committed plans.</p>' if page["collection_fence"]["count"] == 0
+                 else '<p class="empty-message">No plans on this page.</p>')
+    nav_limit = projections.PLAN_INDEX_DEFAULT if limit is None else limit
+    links = []
+    if page["previous_cursor"] is not None:
+        links.append(("first", "First", _index_target("/", nav_limit)))
+        links.append(("newer", "Newer", _index_target("/", nav_limit, ("before", page["previous_cursor"]))))
+    if page["next_cursor"] is not None:
+        links.append(("older", "Older", _index_target("/", nav_limit, ("after", page["next_cursor"]))))
+    return _index_document(cards, _index_target("/api/plan-index", limit, cursor), _index_navigation(links))
+
+
+def render_plan_index_restart(limit: int | None = None, cursor: tuple[str, str] | None = None) -> str:
+    """Readable root page for a continuation that no longer matches the plan collection."""
+    notice = ('<p class="index-notice" role="alert">The plan list changed since this page was opened. '
+              "Restart from the first page to continue.</p>")
+    plans_url = _index_target("/api/plan-index", limit, cursor)
+    limit = projections.PLAN_INDEX_DEFAULT if limit is None else limit
+    return _index_document(notice, plans_url,
+                           _index_navigation([("first", "First", _index_target("/", limit))]))
 
 
 def _bounded_json(value) -> JSONResponse:
@@ -108,12 +164,27 @@ def _integer(values: dict[str, str], name: str, default: int) -> int:
         raise DomainError("invalid", "Query integer is too large") from None
 
 
+def _plan_index_arguments(values: dict[str, str]) -> tuple[str | None, str | None, int]:
+    if "after" in values and "before" in values:
+        raise DomainError("invalid", "after and before are mutually exclusive")
+    return values.get("after"), values.get("before"), _integer(values, "limit", projections.PLAN_INDEX_DEFAULT)
+
+
 def dashboard_routes(service: PlanningService) -> list[BaseRoute]:
     def index(request):
         def read():
-            views = service.list_plans(include_terminal=True)
-            _bounded_json({"plans": views})  # Preserve the aggregate public limit before rendering any subset.
-            return HTMLResponse(render_plan_index(views), headers=HEADERS)
+            values = _query(request, {"limit", "after", "before"})
+            after, before, limit = _plan_index_arguments(values)
+            chosen = limit if "limit" in values else None
+            cursor = ("after", after) if after is not None else ("before", before) if before is not None else None
+            try:
+                page = service.read_plan_index(after=after, before=before, limit=limit)
+            except DomainError as error:
+                if error.code != "conflict":
+                    raise
+                return HTMLResponse(render_plan_index_restart(chosen, cursor), status_code=409, headers=HEADERS)
+            _bounded_json(page)  # Preserve the public response limit before rendering any subset.
+            return HTMLResponse(render_compact_plan_index(page, chosen, cursor), headers=HEADERS)
         return _public_read(read)
 
     def plan_page(request):
@@ -140,6 +211,12 @@ def dashboard_routes(service: PlanningService) -> list[BaseRoute]:
         def read():
             _query(request, set())
             return _bounded_json({"plans": service.list_plans(include_terminal=True)})
+        return _public_read(read)
+
+    def api_plan_index(request):
+        def read():
+            after, before, limit = _plan_index_arguments(_query(request, {"limit", "after", "before"}))
+            return _bounded_json(service.read_plan_index(after=after, before=before, limit=limit))
         return _public_read(read)
 
     def api_plan(request):
@@ -180,6 +257,7 @@ def dashboard_routes(service: PlanningService) -> list[BaseRoute]:
     return [Route("/", index, methods=["GET", "HEAD"]),
             Route("/plans/{plan_id}", plan_page, methods=["GET", "HEAD"]),
             Route("/api/plans", api_plans, methods=["GET", "HEAD"]),
+            Route("/api/plan-index", api_plan_index, methods=["GET", "HEAD"]),
             Route("/api/plans/{plan_id}", api_plan, methods=["GET", "HEAD"]),
             Route("/api/plans/{plan_id}/coordination", api_coordination, methods=["GET", "HEAD"]),
             Route("/api/plans/{plan_id}/events", api_events, methods=["GET", "HEAD"]),

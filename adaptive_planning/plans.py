@@ -12,11 +12,13 @@ import copy
 import dataclasses
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from contextvars import ContextVar
 from datetime import datetime
 from typing import Any, Callable, Iterator, Literal, Mapping
+from urllib.parse import quote
 
 from adaptive_planning.core import (
     MAX_FILE_BYTES,
@@ -66,6 +68,12 @@ COORDINATION_PAGE_MAX = 500
 MAX_PAGE_BYTES = MAX_FILE_BYTES
 EVENTS_LIMIT_DEFAULT = 100
 EVENTS_LIMIT_MAX = 1000
+PLAN_INDEX_DEFAULT = 25
+PLAN_INDEX_MAX = 100
+PLAN_INDEX_CURSOR_MAX = 1024
+_PLAN_INDEX_CURSOR_KIND = "plan-index"
+_PLAN_INDEX_CURSOR_VERSION = 1
+_CURSOR_TEXT = re.compile(r"[A-Za-z0-9_-]+")
 
 LIVE_ATTEMPT_STATES = ("assigned", "active", "submitted", "stale")
 _START_KEY = (-1, -1, -1)
@@ -714,6 +722,104 @@ def list_plans(connection: sqlite3.Connection, include_terminal: bool = False) -
         if include_terminal or view.status != "complete":
             views.append(view)
     return tuple(views)
+
+
+def _encode_plan_index_cursor(direction: str, epoch: str, count: int, max_rowid: int, key: int) -> str:
+    raw = json.dumps({"c": count, "d": direction, "e": epoch, "k": key, "m": max_rowid,
+                      "t": _PLAN_INDEX_CURSOR_KIND, "v": _PLAN_INDEX_CURSOR_VERSION},
+                     sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_plan_index_cursor(cursor: str, direction: str) -> dict[str, Any]:
+    """Accept only the exact canonical plan-index cursor for `direction`; every other shape is invalid."""
+    if not isinstance(cursor, str) or len(cursor) > PLAN_INDEX_CURSOR_MAX or not _CURSOR_TEXT.fullmatch(cursor):
+        raise DomainError("invalid", "Malformed plan index cursor")
+    try:
+        data = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode("utf-8"))
+    except (binascii.Error, ValueError, UnicodeError, RecursionError):
+        raise DomainError("invalid", "Malformed plan index cursor") from None
+    if (not isinstance(data, dict) or set(data) != {"c", "d", "e", "k", "m", "t", "v"}
+            or data["t"] != _PLAN_INDEX_CURSOR_KIND or type(data["v"]) is not int
+            or data["v"] != _PLAN_INDEX_CURSOR_VERSION or data["d"] != direction
+            or not isinstance(data["e"], str)
+            or any(type(data[name]) is not int or not 0 <= data[name] <= 9223372036854775807 for name in ("c", "k", "m"))
+            or data["k"] > data["m"]
+            or _encode_plan_index_cursor(direction, data["e"], data["c"], data["m"], data["k"]) != cursor):
+        raise DomainError("invalid", "Malformed plan index cursor")
+    return data
+
+
+def _plan_summary(connection: sqlite3.Connection, plan_id: PlanId) -> dict[str, Any]:
+    """Compact public summary from the canonical authority kernel; never builds a snapshot, history or page."""
+    plan = _load_plan(connection, plan_id)
+    status = _derive_status(plan, _aggregates(connection, plan_id))
+    objective = plan.draft_json.get("objective")
+    if not isinstance(objective, str) or type(plan.revision) is not int or not isinstance(plan.updated_at, str):
+        raise DomainError("invalid", "A plan summary requires a text objective, integer revision and publication time")
+    return {"plan_id": plan_id, "objective": objective, "status": status, "revision": plan.revision,
+            "published_at": plan.updated_at,
+            "dashboard_url": f"{_context().base_url}/plans/{quote(plan_id, safe='')}"}
+
+
+def read_plan_index(
+    connection: sqlite3.Connection, after: str | None, before: str | None, limit: int,
+) -> dict[str, Any]:
+    """One-snapshot, newest-first page of compact plan summaries.
+
+    Cursors carry the installation epoch and the plan collection fence (count and maximum rowid). Only a plan
+    insertion or an epoch change invalidates them; revisions, attempts and activity never do.
+    """
+    if type(limit) is not int or not 1 <= limit <= PLAN_INDEX_MAX:
+        raise DomainError("invalid", f"limit must be an integer between 1 and {PLAN_INDEX_MAX}")
+    if after is not None and before is not None:
+        raise DomainError("invalid", "after and before are mutually exclusive")
+    cursor = None
+    if after is not None:
+        cursor = _decode_plan_index_cursor(after, "after")
+    elif before is not None:
+        cursor = _decode_plan_index_cursor(before, "before")
+    direction = None if cursor is None else cursor["d"]
+    key = 0 if cursor is None else cursor["k"]
+    epoch = _installation_epoch(connection)
+    count, max_rowid = connection.execute("SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM plans").fetchone()
+    sequence = _store_sequence(connection)
+    if cursor is not None and (cursor["e"], cursor["c"], cursor["m"]) != (epoch, count, max_rowid):
+        raise DomainError("conflict", "The plan list changed; restart from the first page")
+    # Select at most limit + 1 identities first; only the selected page is ever loaded or summarized.
+    if direction == "before":
+        rows = connection.execute("SELECT rowid, plan_id FROM plans WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                                  (key, limit + 1)).fetchall()
+        page = rows[:limit][::-1]
+    elif direction == "after":
+        rows = connection.execute("SELECT rowid, plan_id FROM plans WHERE rowid < ? ORDER BY rowid DESC LIMIT ?",
+                                  (key, limit + 1)).fetchall()
+        page = rows[:limit]
+    else:
+        rows = connection.execute("SELECT rowid, plan_id FROM plans ORDER BY rowid DESC LIMIT ?",
+                                  (limit + 1,)).fetchall()
+        page = rows[:limit]
+    if cursor is not None and not rows:
+        raise DomainError("invalid", "Malformed plan index cursor")
+    more = len(rows) > limit
+    if page:
+        newest, oldest = page[0][0], page[-1][0]
+    else:
+        newest = oldest = 0
+
+    def exists(comparison: str, bound: int) -> bool:
+        return bool(connection.execute(
+            f"SELECT EXISTS(SELECT 1 FROM plans WHERE rowid {comparison} ?)", (bound,)).fetchone()[0])
+
+    has_previous = more if direction == "before" else direction == "after" and exists(">", newest)
+    has_next = exists("<", oldest) if direction == "before" else more
+    return {
+        "plans": [_plan_summary(connection, plan_id) for _, plan_id in page],
+        "next_cursor": _encode_plan_index_cursor("after", epoch, count, max_rowid, oldest) if has_next else None,
+        "previous_cursor": (_encode_plan_index_cursor("before", epoch, count, max_rowid, newest)
+                            if has_previous else None),
+        "epoch": epoch, "collection_fence": {"count": count, "max_rowid": max_rowid},
+        "store_sequence": sequence}
 
 
 def read_events(connection: sqlite3.Connection, plan_id: PlanId, after: int, limit: int) -> tuple[Event, ...]:

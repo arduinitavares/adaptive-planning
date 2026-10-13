@@ -42,7 +42,7 @@ does not establish a direct model-free MCP planning mutation command; that route
 remains unverified. Record a capability or allowance gap honestly if it prevents
 the actual installed client from completing the gate.
 
-Complete the [three-client planning gate](../operations.md#three-client-planning-gate)
+Complete the [two-client planning gate](../operations.md#two-client-planning-gate)
 through the actual installed Antigravity surface. It must freshly discover the
 planning tools, read installation info and the canonical shared plan, commit a
 planning-only revision with a distinct fact, and expose that event through the
@@ -123,7 +123,7 @@ Bind consumer availability to the actual accepted result UUID, full artifact and
 final checked base before start. Invalidation preserves accepted identities and
 holds each affected step until named remediation, including a post-invalidation
 review where required. Scope is not renewed by discovery, readiness or holds;
-`plan-only` still refuses execution. See the [worker gate](../operations.md#three-client-worker-checkpoint-gate)
+`plan-only` still refuses execution. See the [worker gate](../operations.md#two-client-worker-checkpoint-gate)
 for the current 29-tool source catalog (six reads and 23 mutations), with no
 disabled future kinds, and complete recording requirements. The catalog has
 synthetic SDK evidence; genuine installed Antigravity discovery and acceptance
@@ -138,3 +138,14 @@ version information do not fill these rows. Record actual surface/version,
 negotiation, shared plan, checkpoint sequence and acceptance/review IDs only
 from an authorized installed-client observation; preserve any allowance or call
 capability gap without retrying exhausted providers.
+
+
+## Global entry prepared, 2026-10-13
+
+The private global `adaptivePlanning` entry now points to the running local service, with the five unrelated server entries preserved and the credential kept in a mode-0600 file under a mode-0700 parent. AGY CLI 1.3.4 successfully completed ordinary read-only Gemini 4 Argon High access qualification and independent code review through Orca. These were source/evidence reviews, not MCP planning calls. Fresh genuine AGY checkpoint/resume acceptance remains pending explicit approval of the persistent `mcp(adaptivePlanning/*)` rule; AGY permission settings are unchanged. See the [dated local activation evidence](../operations.md#local-activation-evidence-2026-10-13).
+
+## Native CLI checkpoint and continuation, 2026-10-13
+
+The later [native client acceptance record](../operations.md#native-client-acceptance-completed-2026-10-13) supersedes the pending rule/checkpoint labels above. The explicitly approved named-server rule is now installed. Two fresh AGY 1.3.4 Flash High conversations used the permanent native MCP entry: the first accepted A and exited; the second read its saved checkpoint, acquired a fresh owner grant, bound the exact accepted observation and accepted dependent B. The labelled acceptance plan is complete at revision 10. The coordinator checked the actual native calls, public events, original-plan preservation and settled processes/terminals.
+
+This proves the recorded CLI checkpoint/continuation flow. It does not claim a fresh 29-operation AGY exercise, a negotiated protocol value that native output did not expose, or IDE/Desktop and OS sleep/reboot behavior. Prior restart/container-recreation observations retain their recorded client/image boundaries. The private installation bearer and owner/attempt grants remain outside public receipts.

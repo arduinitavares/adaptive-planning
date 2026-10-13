@@ -31,6 +31,9 @@ COPY pyproject.toml uv.lock /app/
 COPY adaptive_planning /app/adaptive_planning
 COPY assets/dashboard /app/assets/dashboard
 
+RUN find /app/adaptive_planning /app/assets/dashboard -type d -exec chmod 0755 {} + \
+    && find /app/adaptive_planning /app/assets/dashboard -type f -exec chmod 0644 {} +
+
 RUN uv sync --frozen --no-dev --no-editable \
     && install -d -m 0700 -o 10001 -g 10001 /data
 

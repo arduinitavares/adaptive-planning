@@ -716,14 +716,18 @@ def execution_uses(connection, plan_id, attempt_id):
     return namespace, owned
 
 
-def save_execution_uses(connection, plan_id, attempt_id, namespace):
-    """Merge role metadata without changing frozen history or worker counters."""
+def save_execution_uses(connection, plan_id, attempt_id, namespace, *, releasing_verification=False):
+    """Merge role metadata without changing frozen history or worker counters.
+
+    A validated stopped verifier release retains its full writer proof even when
+    historical metadata has filled the admission limit. Public pages remain bounded.
+    """
     row = connection.execute("SELECT payload FROM attempts WHERE plan_id=? AND attempt_id=?", (plan_id, attempt_id)).fetchone()
     if row is None:
         raise DomainError("invalid", "Execution-use owner is missing")
     data = _json_object(row[0], "execution-use attempt")
     data[_USE_NAMESPACE] = namespace
-    if len(plans.canonical_bytes(data)) > MAX_FILE_BYTES:
+    if not releasing_verification and len(plans.canonical_bytes(data)) > MAX_FILE_BYTES:
         raise DomainError("limit_exceeded", "Execution-use history exceeds the 10MB content limit")
     connection.execute("UPDATE attempts SET payload=? WHERE plan_id=? AND attempt_id=?",
                        (json.dumps(data, sort_keys=True, ensure_ascii=False), plan_id, attempt_id))

@@ -116,7 +116,7 @@ Superpowers sequence is required.
 
 4. **Checkpoint and reassess.**
    - Completing a named step and its verification requires publishing a structured checkpoint with evidence and reassessment.
-   - Publish a structured `checkpoint` with outcome (`passed`, `failed`,
+   - Use `record_checkpoint` to publish a structured checkpoint with outcome (`passed`, `failed`,
      or `blocked`), the executed check, full artifact references,
      verifiable evidence, and a comprehensive `reassessment`.
    - Reassess every pending step in the remaining horizon, including indirect
