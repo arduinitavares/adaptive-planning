@@ -1,8 +1,7 @@
 /**
  * Live Plan Dashboard Application Script
- * Local-only, zero dependencies. Connects exclusively to SSE endpoint /events
- * and renders reactive dependency DAG, verification evidence, retired steps,
- * and revision history.
+ * Local-only, zero dependencies. Legacy mode consumes SSE /events; service
+ * mode polls committed public projections without persisting browser progress.
  */
 
 (function (root, factory) {
@@ -137,8 +136,26 @@
     return { accept: false, plan, rawText, clearAvailability: true, consistencyWarning: true, reason: 'unknown_state' };
   }
 
+  // Service snapshots are renderer-compatible, even when multiple active attempts
+  // prevent a strict legacy publication. Coordination may change at the same revision.
+  function serviceSnapshot(view) {
+    if (!view || !view.metadata || !view.coordination || !view.draft ||
+        typeof view.plan_id !== 'string' || view.metadata.plan_id !== view.plan_id ||
+        typeof view.metadata.epoch !== 'string' || typeof view.metadata.generation !== 'string' ||
+        !Number.isSafeInteger(view.coordination.store_sequence) || view.coordination.store_sequence < 0 ||
+        !renderablePlan(view.legacy_snapshot) || view.legacy_snapshot.schemaVersion !== 2 ||
+        view.legacy_snapshot.taskId !== view.plan_id || view.legacy_snapshot.revision !== view.metadata.revision ||
+        view.legacy_snapshot.generation !== view.metadata.generation || view.legacy_snapshot.status !== view.status ||
+        view.legacy_snapshot.updatedAt !== view.published_at) {
+      throw new Error('Invalid public plan projection');
+    }
+    return view.legacy_snapshot;
+  }
+
   // If running in browser environment, initialize UI logic
   if (typeof document !== 'undefined') {
+    const bodyData = document.body ? document.body.dataset : {};
+    const serviceMode = bodyData.mode === 'service';
     // DOM Elements
     const connPill = document.getElementById('conn-pill');
     const connLabel = document.getElementById('conn-label');
@@ -176,6 +193,12 @@
     let transportStatus = 'connecting'; // 'connected' | 'connecting' | 'offline'
     let availabilityWarning = false;
     let consistencyWarning = false;
+    let renderedPublicationIdentity = null;
+    let renderedGraphContent = null;
+    let renderedDetailsContent = null;
+    let renderedHistoryContent = null;
+    let renderedRetiredContent = null;
+    const renderedBadges = new WeakMap();
 
     // Status visual configurations
     const STATUS_CONFIG = {
@@ -249,17 +272,23 @@
 
     function renderStatusBadge(container, statusKey, customLabel) {
       const conf = STATUS_CONFIG[statusKey] || STATUS_CONFIG.pending;
+      const label = customLabel || conf.label;
+      const content = JSON.stringify([conf.iconType, label]);
+      if (renderedBadges.get(container) === content) return container;
       container.textContent = '';
       const icon = createSvgIcon(conf.iconType);
       container.appendChild(icon);
       const labelSpan = document.createElement('span');
-      setText(labelSpan, customLabel || conf.label);
+      setText(labelSpan, label);
       container.appendChild(labelSpan);
+      renderedBadges.set(container, content);
       return container;
     }
 
     function setText(el, text) {
-      if (el) el.textContent = text != null ? String(text) : '';
+      if (!el) return;
+      const value = text != null ? String(text) : '';
+      if (el.textContent !== value) el.textContent = value;
     }
 
     function formatTimeAgo(isoString) {
@@ -606,6 +635,10 @@
 
     function renderRetired(retiredSteps) {
       if (!retiredSection || !retiredCount || !retiredList) return;
+      const content = JSON.stringify((retiredSteps || []).map(step =>
+        [step.id, step.title, step.retiredReason || '']));
+      if (renderedRetiredContent === content) return;
+      renderedRetiredContent = content;
 
       if (!retiredSteps || retiredSteps.length === 0) {
         retiredSection.hidden = true;
@@ -670,6 +703,9 @@
       if (activeSteps.length === 0 && retiredSteps.length === 0) {
         graphEmpty.hidden = false;
         graphViewport.hidden = true;
+        nodeElementsMap.forEach(node => node.remove());
+        nodeElementsMap.clear();
+        graphSvg.querySelectorAll('.edge-path').forEach(edge => edge.remove());
         renderRetired([]);
         return;
       }
@@ -719,6 +755,20 @@
     }
 
     function renderDetails() {
+      const steps = currentPlan && currentPlan.steps || [];
+      const step = steps.find(item => item.id === selectedStepId);
+      const content = JSON.stringify(step ? [
+        step.id, step.title, step.status,
+        step.status === 'retired' ? step.retiredReason || '' : '',
+        step.summary || '', step.details || '', step.check || 'None specified.',
+        step.evidence || [],
+        (step.dependsOn || []).map(id => {
+          const dependency = steps.find(item => item.id === id);
+          return [id, dependency ? dependency.status : 'pending'];
+        })
+      ] : [steps.length ? 'unselected' : 'empty']);
+      if (renderedDetailsContent === content) return;
+      renderedDetailsContent = content;
       detailsContainer.textContent = '';
 
       if (!currentPlan || !currentPlan.steps || currentPlan.steps.length === 0) {
@@ -729,7 +779,6 @@
         return;
       }
 
-      const step = currentPlan.steps.find(s => s.id === selectedStepId);
       if (!step) {
         const p = document.createElement('p');
         p.className = 'empty-message';
@@ -918,8 +967,14 @@
     }
 
     function renderHistory(plan) {
-      historyList.textContent = '';
       const history = plan.history || [];
+      const content = JSON.stringify(history.map(entry => [
+        entry.revision, entry.timestamp, entry.summary || 'Plan updated.',
+        entry.authorizationNote || '', entry.recoveryNote || ''
+      ]));
+      if (renderedHistoryContent === content) return;
+      renderedHistoryContent = content;
+      historyList.textContent = '';
 
       if (history.length === 0) {
         historyEmpty.hidden = false;
@@ -1000,11 +1055,21 @@
         return;
       }
 
-      // Accepted update
-      const identityChanged = currentPlan && (currentPlan.taskId !== decision.plan.taskId ||
-        (currentPlan.schemaVersion === 2 && decision.plan.generation !== currentPlan.generation));
-      if (identityChanged) selectedStepId = null;
-      currentPlan = decision.plan;
+      renderAcceptedPlan(decision.plan, rawText);
+    }
+
+    function renderAcceptedPlan(plan, rawText, publicationIdentity) {
+      const identityChanged = currentPlan && (currentPlan.taskId !== plan.taskId ||
+        (currentPlan.schemaVersion === 2 && plan.generation !== currentPlan.generation) ||
+        (publicationIdentity !== undefined && publicationIdentity !== renderedPublicationIdentity));
+      if (identityChanged) {
+        selectedStepId = null;
+        nodeElementsMap.forEach(node => node.remove());
+        nodeElementsMap.clear();
+        renderedGraphContent = renderedDetailsContent = renderedHistoryContent = renderedRetiredContent = null;
+      }
+      if (publicationIdentity !== undefined) renderedPublicationIdentity = publicationIdentity;
+      currentPlan = plan;
       lastRawText = rawText;
 
       renderHeader(currentPlan);
@@ -1027,9 +1092,593 @@
         }
       }
 
-      renderGraph(currentPlan);
+      const graphContent = JSON.stringify([
+        currentPlan.nextStepId,
+        steps.map(step => step.status === 'retired'
+          ? [step.id, step.title, step.status, step.retiredReason || '']
+          : [step.id, step.title, step.status, step.dependsOn || []])
+      ]);
+      if (renderedGraphContent !== graphContent) {
+        renderGraph(currentPlan);
+        renderedGraphContent = graphContent;
+      }
       renderDetails();
       renderHistory(currentPlan);
+    }
+
+    function textElement(tag, className, text) {
+      const node = document.createElement(tag);
+      node.className = className;
+      setText(node, text);
+      return node;
+    }
+
+    function renderServiceIndex(views) {
+      const list = document.getElementById('plan-list');
+      list.textContent = '';
+      for (const view of views) {
+        const card = textElement('article', 'plan-card', '');
+        card.dataset.planId = view.plan_id;
+        const heading = textElement('h2', '', '');
+        const link = textElement('a', '', view.draft.objective);
+        link.setAttribute('href', '/plans/' + encodeURIComponent(view.plan_id));
+        heading.appendChild(link);
+        card.appendChild(heading);
+        card.appendChild(textElement('p', 'plan-card-meta', `${view.status} · Rev #${view.metadata.revision}`));
+        const published = textElement('p', '', 'Published: ');
+        const time = textElement('time', '', view.published_at);
+        time.setAttribute('datetime', view.published_at);
+        published.appendChild(time);
+        card.appendChild(published);
+        card.appendChild(textElement('code', 'task-id-code', view.plan_id));
+        if (view.draft.workflow !== null && view.draft.workflow !== undefined) {
+          card.appendChild(textElement('p', 'workflow-info', 'Workflow: ' +
+            Object.entries(view.draft.workflow).map(([key, value]) => `${key}: ${value}`).join('; ')));
+        }
+        list.appendChild(card);
+      }
+      if (!views.length) list.appendChild(textElement('p', 'empty-message', 'No committed plans.'));
+    }
+
+    // Compact pages remain separate from the backward-compatible full-plan index.
+    const compactIndexUrl = !bodyData.planId && typeof bodyData.plansUrl === 'string' &&
+      bodyData.plansUrl.split(/[?#]/)[0] === '/api/plan-index' ? bodyData.plansUrl : null;
+    const compactIndexQuery = compactIndexUrl === null ? null :
+      new URLSearchParams((compactIndexUrl.split('?')[1] || '').split('#')[0]);
+    const compactIndexLimit = compactIndexQuery && compactIndexQuery.has('limit') ? compactIndexQuery.get('limit') : '25';
+    const compactIndexLimitQuery = 'limit=' + encodeURIComponent(compactIndexLimit);
+    const compactIndexFirstHref = '/?' + compactIndexLimitQuery;
+    const compactIndexContinuation = compactIndexQuery && (compactIndexQuery.has('after') || compactIndexQuery.has('before'));
+    let compactIndexNav = null;
+    let compactIndexNotice = null;
+    const compactIndexAnchors = new Map();
+
+    function compactIndexUnavailable() {
+      const error = new Error('Invalid or unavailable public plan index');
+      error.code = 'unavailable';
+      return error;
+    }
+
+    function prepareCompactIndex(value) {
+      const limit = Number(compactIndexLimit);
+      const object = item => item !== null && typeof item === 'object' && !Array.isArray(item);
+      const keys = (item, expected) => object(item) && Object.keys(item).length === expected.length &&
+        expected.every(key => Object.prototype.hasOwnProperty.call(item, key));
+      const nonempty = item => typeof item === 'string' && item.trim().length > 0;
+      const cursor = item => item === null || (typeof item === 'string' && item.length > 0 && item.length <= 1024);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100 || String(limit) !== compactIndexLimit ||
+          !keys(value, ['plans', 'next_cursor', 'previous_cursor', 'epoch', 'collection_fence', 'store_sequence']) ||
+          !Array.isArray(value.plans) || value.plans.length > limit || !nonempty(value.epoch) ||
+          !cursor(value.next_cursor) || !cursor(value.previous_cursor) ||
+          !keys(value.collection_fence, ['count', 'max_rowid']) ||
+          !Number.isInteger(value.collection_fence.count) || value.collection_fence.count < 0 ||
+          !Number.isInteger(value.collection_fence.max_rowid) || value.collection_fence.max_rowid < 0 ||
+          !Number.isSafeInteger(value.store_sequence) || value.store_sequence < 0) throw compactIndexUnavailable();
+      const seen = new Set();
+      for (const plan of value.plans) {
+        if (!keys(plan, ['plan_id', 'objective', 'status', 'revision', 'published_at', 'dashboard_url']) ||
+            !nonempty(plan.plan_id) || typeof plan.objective !== 'string' ||
+            !['planning', 'running', 'blocked', 'stopped', 'complete'].includes(plan.status) ||
+            !Number.isSafeInteger(plan.revision) || plan.revision < 1 ||
+            awareMicros(plan.published_at) === null || !nonempty(plan.dashboard_url) || seen.has(plan.plan_id)) {
+          throw compactIndexUnavailable();
+        }
+        seen.add(plan.plan_id);
+      }
+      // Prepare every relative href before any card, navigation or accepted content changes.
+      return {
+        plans: value.plans.map(plan => ({summary: plan, href: '/plans/' + encodeURIComponent(plan.plan_id)})),
+        navigation: [
+          ['first', 'First', compactIndexContinuation || value.previous_cursor !== null ? compactIndexFirstHref : null],
+          ['newer', 'Newer', value.previous_cursor === null ? null :
+            '/?before=' + encodeURIComponent(value.previous_cursor) + '&' + compactIndexLimitQuery],
+          ['older', 'Older', value.next_cursor === null ? null :
+            '/?after=' + encodeURIComponent(value.next_cursor) + '&' + compactIndexLimitQuery]
+        ],
+        emptyText: value.collection_fence.count === 0 ? 'No committed plans.' : 'No plans on this page.'
+      };
+    }
+
+    async function readCompactIndex() {
+      const response = await fetch(compactIndexUrl, {cache: 'no-store', credentials: 'same-origin'});
+      if (response.status === 409) {
+        const error = new Error('The plan list changed');
+        error.code = 'plan_index_conflict';
+        throw error;
+      }
+      if (!response.ok) throw compactIndexUnavailable();
+      return prepareCompactIndex(await response.json());
+    }
+
+    function compactIndexNavigation() {
+      if (!compactIndexNav) {
+        compactIndexNav = document.getElementById('plan-index-nav');
+        if (!compactIndexNav) {
+          compactIndexNav = textElement('nav', 'plan-index-nav', '');
+          compactIndexNav.id = 'plan-index-nav';
+          compactIndexNav.setAttribute('id', 'plan-index-nav');
+          compactIndexNav.setAttribute('aria-label', 'Plan pages');
+          const list = document.getElementById('plan-list');
+          (list.parentNode || document.body).appendChild(compactIndexNav);
+        }
+      }
+      return compactIndexNav;
+    }
+
+    function compactIndexAnchor(nav, key, label, href) {
+      const id = 'plan-index-' + key;
+      let anchor = compactIndexAnchors.get(key) || Array.from(nav.querySelectorAll('a')).find(node =>
+        (node.id || node.getAttribute('id')) === id);
+      if (!anchor) {
+        anchor = textElement('a', '', label);
+        anchor.id = id;
+        anchor.setAttribute('id', id);
+      }
+      compactIndexAnchors.set(key, anchor);
+      setText(anchor, label);
+      if (anchor.getAttribute('href') !== href) anchor.setAttribute('href', href);
+      return anchor;
+    }
+
+    function compactIndexCard(card, plan, href) {
+      let heading = card && card.querySelector('h2');
+      let link = heading && heading.querySelector('a');
+      let meta = card && card.querySelector('.plan-card-meta');
+      let time = card && card.querySelector('time');
+      let code = card && card.querySelector('.task-id-code');
+      let published = card && Array.from(card.children).find(node =>
+        node.tagName.toLowerCase() === 'p' && node.querySelector('time') === time);
+      if (!link || !meta || !time || !code || !published || published.textContent !== 'Published: ' + time.textContent) {
+        card = textElement('article', 'plan-card', '');
+        card.dataset.planId = plan.plan_id;
+        card.setAttribute('data-plan-id', plan.plan_id);
+        heading = textElement('h2', '', '');
+        link = textElement('a', '', '');
+        heading.appendChild(link);
+        meta = textElement('p', 'plan-card-meta', '');
+        published = textElement('p', '', 'Published: ');
+        time = textElement('time', '', '');
+        published.appendChild(time);
+        code = textElement('code', 'task-id-code', '');
+        card.appendChild(heading);
+        card.appendChild(meta);
+        card.appendChild(published);
+        card.appendChild(code);
+      }
+      // Equality checks preserve matching SSR descendants, including their text nodes.
+      setText(link, plan.objective);
+      if (link.getAttribute('href') !== href) link.setAttribute('href', href);
+      setText(meta, `${plan.status} · Rev #${plan.revision}`);
+      setText(time, plan.published_at);
+      if (time.getAttribute('datetime') !== plan.published_at) time.setAttribute('datetime', plan.published_at);
+      setText(code, plan.plan_id);
+      return card;
+    }
+
+    function renderCompactIndex(page) {
+      const list = document.getElementById('plan-list');
+      const cards = new Map();
+      for (const card of Array.from(list.children)) {
+        if (!card.classList.contains('plan-card')) continue;
+        const id = card.getAttribute('data-plan-id') || card.dataset.planId;
+        if (!cards.has(id)) cards.set(id, card);
+      }
+      const nodes = page.plans.map(item => compactIndexCard(cards.get(item.summary.plan_id), item.summary, item.href));
+      if (!nodes.length) {
+        const empty = list.querySelector('.empty-message') || textElement('p', 'empty-message', '');
+        setText(empty, page.emptyText);
+        nodes.push(empty);
+      }
+      syncServiceChildren(list, nodes);
+      const nav = compactIndexNavigation();
+      const anchors = page.navigation.filter(item => item[2] !== null).map(item => compactIndexAnchor(nav, ...item));
+      syncServiceChildren(nav, anchors);
+    }
+
+    function setCompactIndexNotice(message, restart) {
+      if (compactIndexNotice) {
+        compactIndexNotice.remove();
+        compactIndexNotice = null;
+      }
+      if (message === null) return;
+      compactIndexNotice = textElement('p', 'index-notice', '');
+      compactIndexNotice.setAttribute('role', 'alert');
+      compactIndexNotice.appendChild(textElement('span', '', message));
+      if (restart) {
+        const first = textElement('a', '', 'First');
+        first.setAttribute('href', compactIndexFirstHref);
+        compactIndexNotice.appendChild(textElement('span', '', ' '));
+        compactIndexNotice.appendChild(first);
+      }
+      const list = document.getElementById('plan-list');
+      (list.parentNode || document.body).appendChild(compactIndexNotice);
+    }
+
+    function coordinationLabel(item) {
+      const value = item.value;
+      if (item.kind === 'attempt') return `Step ${value.step_id} · ${value.state} · ${value.assignee} · ${value.attempt_id}`;
+      if (item.kind === 'reservation') return `Reservation ${value.use_id} · ${value.writer_active ? 'writer active' : 'writer inactive'} · ${value.unresolved ? 'unresolved' : 'resolved'}`;
+      if (item.kind === 'hold') return `Hold ${value.hold_id} · ${value.kind} · ${value.step_id || 'whole plan'}`;
+      if (item.kind === 'review') return `Review ${value.step_id} · ${value.review.verdict} · ${value.review.reviewer}`;
+      return `Invalidation ${value.invalidation_id} · producer ${value.producer_step_id}`;
+    }
+
+    function coordinationIdentity(item) {
+      const value = item.value;
+      if (item.kind === 'review') {
+        return [value.plan_id, value.step_id, value.attempt_id, value.definition_version, value.recorded_sequence];
+      }
+      return value[{attempt: 'attempt_id', reservation: 'use_id', hold: 'hold_id', invalidation: 'invalidation_id'}[item.kind]];
+    }
+
+    function serviceDetailsByIdentity(container) {
+      const records = new Map();
+      for (const details of container.querySelectorAll('details')) {
+        records.set(details.dataset.recordIdentity, details);
+      }
+      return records;
+    }
+
+    function serviceRecordDetails(records, identity, className, summary, content) {
+      const key = JSON.stringify(identity);
+      // Reuse only this durable record's node; its current open state belongs to the user.
+      let details = records.get(key);
+      if (!details) {
+        details = textElement('details', className, '');
+        details.dataset.recordIdentity = key;
+        details.appendChild(textElement('summary', '', summary));
+        details.appendChild(textElement('pre', '', content));
+        records.set(key, details);
+      } else {
+        setText(details.querySelector('summary'), summary);
+        setText(details.querySelector('pre'), content);
+      }
+      return details;
+    }
+
+    function syncServiceChildren(container, nodes) {
+      const desired = [...new Set(nodes)];
+      const retained = new Set(desired);
+      for (const child of Array.from(container.childNodes)) {
+        if (!retained.has(child)) container.removeChild(child);
+      }
+      // Keep the longest desired prefix already in DOM order; append only the remainder.
+      let prefix = 0;
+      for (const child of Array.from(container.children)) {
+        if (child === desired[prefix]) prefix++;
+      }
+      for (let index = prefix; index < desired.length; index++) {
+        container.appendChild(desired[index]);
+      }
+    }
+
+    function renderServiceState(view, items, events, sequence) {
+      document.getElementById('service-section').hidden = false;
+      document.getElementById('plan-index-link').hidden = false;
+      const published = document.getElementById('published-state');
+      published.hidden = false;
+      published.dataset.revision = String(view.metadata.revision);
+      published.dataset.storeSequence = String(view.coordination.store_sequence);
+      published.dataset.eventSequence = String(sequence);
+      setText(published, `Last published state: Rev #${view.metadata.revision} · ${view.published_at}`);
+      const coord = view.coordination;
+      setText(document.getElementById('coordination-summary'),
+        `Store sequence ${coord.store_sequence} · owner ${coord.ownership_actor} (version ${coord.ownership_version}). ` +
+        Object.entries(coord.total_counts).map(([kind, count]) => `${kind}: ${count}`).join(' · ') +
+        ` · Accepted result versions: ${JSON.stringify(coord.result_versions)}`);
+      const identity = [view.metadata.epoch, view.plan_id, view.metadata.generation];
+      const list = document.getElementById('coordination-list');
+      const coordinationDetails = serviceDetailsByIdentity(list);
+      const coordinationNodes = [];
+      for (const item of items) {
+        const details = serviceRecordDetails(coordinationDetails, [...identity, item.kind, coordinationIdentity(item)],
+          'coordination-item coordination-item--' + item.kind, coordinationLabel(item), JSON.stringify(item.value, null, 2));
+        coordinationNodes.push(details);
+      }
+      if (!items.length) {
+        coordinationNodes.push(list.querySelector('.empty-message') ||
+          textElement('p', 'empty-message', 'No coordination records.'));
+      }
+      syncServiceChildren(list, coordinationNodes);
+      const recovery = [coord.store_hold ? 'Store hold active.' : 'No store hold.'];
+      if (coord.restore_cutoff) recovery.push(`Restored backup cutoff: ${coord.restore_cutoff}.`);
+      if (items.some(item => item.kind === 'attempt' && (item.value.state === 'stale' ||
+          (['assigned', 'active', 'submitted'].includes(item.value.state) && item.value.recovery_required)))) {
+        recovery.push('Stale attempts require recovery.');
+      }
+      if (coord.has_unresolved_uses) recovery.push('Outstanding reservations require host work reconciliation.');
+      if (coord.has_plan_holds) recovery.push('Plan holds require explicit resolution.');
+      setText(document.getElementById('recovery-state'), recovery.join(' '));
+      setText(document.getElementById('events-summary'),
+        `${events.length} committed events · last plan event sequence ${sequence}. All pages consumed for this published state.`);
+      const eventList = document.getElementById('service-events');
+      const eventDetails = serviceDetailsByIdentity(eventList);
+      const eventRows = new Map();
+      for (const row of eventList.children) {
+        const details = row.querySelector('details');
+        if (details) eventRows.set(details.dataset.recordIdentity, row);
+      }
+      const eventNodes = [];
+      for (const event of events) {
+        const details = serviceRecordDetails(eventDetails, [...identity, event.sequence], '',
+          `#${event.sequence} ${event.kind} · ${event.published_at} · actor ${event.actor}` +
+          (event.origin_worker === null ? '' : ` · origin ${event.origin_worker}`) +
+          (event.relay === null ? '' : ` · relay ${event.relay}`),
+          JSON.stringify(event.payload, null, 2));
+        let li = eventRows.get(details.dataset.recordIdentity);
+        if (!li) {
+          li = textElement('li', 'event-item', '');
+          li.appendChild(details);
+          eventRows.set(details.dataset.recordIdentity, li);
+        }
+        eventNodes.push(li);
+      }
+      syncServiceChildren(eventList, eventNodes);
+    }
+
+    async function fetchPublic(url) {
+      const response = await fetch(url, {cache: 'no-store', credentials: 'same-origin'});
+      const value = await response.json();
+      if (!response.ok) {
+        const error = new Error('Public read unavailable');
+        error.code = value && value.error && value.error.code;
+        throw error;
+      }
+      return value;
+    }
+
+    function cursorConflict() {
+      const error = new Error('Committed publication changed during paging');
+      error.code = 'conflict';
+      return error;
+    }
+
+    function awareMicros(value) {
+      if (typeof value !== 'string') return null;
+      const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+      if (!match) return null;
+      const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+      const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+      const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+      const zone = match[8];
+      if (year < 1 || month < 1 || month > 12 || day < 1 || day > days[month - 1] ||
+          hour > 23 || minute > 59 || second > 59 ||
+          (zone !== 'Z' && (Number(zone.slice(1, 3)) > 23 || Number(zone.slice(4, 6)) > 59))) return null;
+      const millis = Date.parse(`${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}${zone}`);
+      if (!Number.isSafeInteger(millis)) return null;
+      return BigInt(millis) * 1000n + BigInt((match[7] || '').padEnd(6, '0'));
+    }
+
+    function renderServiceWarnings(value) {
+      const region = document.getElementById('recovery-warnings');
+      if (!region) return;
+      region.dataset.status = value === null ? 'unavailable' : 'current';
+      region.dataset.observedAt = value === null ? '' : value.observed_at;
+      if (value === null) {
+        setText(region, 'Recorded inactivity warnings unavailable.');
+        return;
+      }
+      const overdue = value.overdue;
+      const unable = value.unassessable_activity;
+      const text = overdue.length ? `${overdue.length} overdue recorded inactivity observations: ` +
+        overdue.map(item => `${item.attempt_id} (${item.state})`).join(', ') + '.' : 'No overdue recorded inactivity.';
+      setText(region, `${text} Observed at ${value.observed_at}; policy ${value.threshold_seconds} seconds.` +
+        (unable.length ? ` Unable to assess recorded activity: ${unable.map(item => item.attempt_id).join(', ')}.` : '') +
+        ' These observations require an owner decision and do not establish that host work failed or stopped.');
+    }
+
+    function validateServiceWarnings(value, view, items) {
+      const object = item => item !== null && typeof item === 'object' && !Array.isArray(item);
+      const keys = (item, expected) => object(item) && Object.keys(item).length === expected.length &&
+        expected.every(key => Object.prototype.hasOwnProperty.call(item, key));
+      const metadataKeys = ['epoch', 'plan_id', 'generation', 'revision', 'ownership_version', 'dashboard_url'];
+      if (!keys(value, ['metadata', 'store_sequence', 'observed_at', 'threshold_seconds', 'overdue', 'unassessable_activity']) ||
+          !keys(value.metadata, metadataKeys) || !Number.isSafeInteger(value.store_sequence) || value.store_sequence < 0 ||
+          !Number.isSafeInteger(value.threshold_seconds) || value.threshold_seconds < 1 ||
+          !Number.isSafeInteger(value.metadata.revision) || value.metadata.revision < 1 ||
+          !Number.isSafeInteger(value.metadata.ownership_version) || value.metadata.ownership_version < 1 ||
+          !['epoch', 'plan_id', 'generation', 'dashboard_url'].every(key => typeof value.metadata[key] === 'string' && value.metadata[key]) ||
+          !Array.isArray(value.overdue) || !Array.isArray(value.unassessable_activity)) throw new Error('Invalid recovery advisory');
+      const observed = awareMicros(value.observed_at);
+      if (observed === null) throw new Error('Invalid recovery observation time');
+      if (metadataKeys.some(key => value.metadata[key] !== view.metadata[key]) ||
+          value.store_sequence !== view.coordination.store_sequence) throw cursorConflict();
+      const attempts = new Map(), expected = {overdue: new Set(), unassessable_activity: new Set()};
+      for (const item of items.filter(item => item.kind === 'attempt')) {
+        const current = item.value;
+        if (typeof current.attempt_id !== 'string' || !current.attempt_id || attempts.has(current.attempt_id) ||
+            !Number.isSafeInteger(current.version) || current.version < 1) throw new Error('Invalid current attempt');
+        attempts.set(current.attempt_id, current);
+        if (!['assigned', 'active', 'submitted'].includes(current.state)) continue;
+        const activity = awareMicros(current.last_activity);
+        if (activity === null || activity > observed) expected.unassessable_activity.add(current.attempt_id);
+        else if (observed - activity >= BigInt(value.threshold_seconds) * 1000000n) expected.overdue.add(current.attempt_id);
+      }
+      const seen = new Set();
+      // The canonical DTO can display started_at for missing activity. Exact service-observed
+      // unassessable membership is authoritative; that display fallback never proves freshness.
+      for (const category of ['unassessable_activity', 'overdue']) {
+        for (const item of value[category]) {
+          if (!keys(item, ['attempt_id', 'version', 'state', 'last_activity']) ||
+              typeof item.attempt_id !== 'string' || !item.attempt_id ||
+              !Number.isSafeInteger(item.version) || item.version < 1 ||
+              !['assigned', 'active', 'submitted'].includes(item.state) ||
+              !(item.last_activity === null || typeof item.last_activity === 'string')) throw new Error('Invalid recovery attempt');
+          const current = attempts.get(item.attempt_id);
+          if (seen.has(item.attempt_id) || !current || item.version !== current.version || item.state !== current.state ||
+              item.last_activity !== current.last_activity) throw cursorConflict();
+          if (category === 'unassessable_activity') expected.overdue.delete(item.attempt_id);
+          else if (!expected.overdue.has(item.attempt_id)) throw cursorConflict();
+          seen.add(item.attempt_id);
+        }
+        if (category === 'unassessable_activity') {
+          if ([...expected.unassessable_activity].some(identity => !seen.has(identity))) throw cursorConflict();
+        } else if (value.overdue.length !== expected.overdue.size) throw cursorConflict();
+      }
+      return value;
+    }
+
+    async function readServiceWarnings(view, items) {
+      if (!bodyData.recoveryWarningsUrl) return null;
+      try {
+        return validateServiceWarnings(await fetchPublic(bodyData.recoveryWarningsUrl), view, items);
+      } catch (error) {
+        if (error.code === 'conflict') throw error;
+        return null;
+      }
+    }
+
+    let polling = false;
+    let serviceNeedsFullRead = true;
+    let serviceEvents = [];
+    let serviceSequence = 0;
+    let serviceIdentity = null;
+    let serviceWarningPublication = null;
+
+    async function readServicePublication() {
+      const view = await fetchPublic(bodyData.planUrl);
+      const plan = serviceSnapshot(view);
+      if (view.plan_id !== bodyData.planId) throw new Error('Unexpected public plan identity');
+      const identity = JSON.stringify([view.metadata.epoch, view.plan_id, view.metadata.generation]);
+      const warningPublication = JSON.stringify([view.metadata, view.coordination.store_sequence]);
+      if (warningPublication !== serviceWarningPublication) renderServiceWarnings(null);
+      const full = serviceNeedsFullRead || identity !== serviceIdentity || view.coordination.store_sequence < serviceSequence;
+      const items = [], cursors = new Set();
+      let cursor = null;
+      do {
+        const url = bodyData.coordinationUrl + '?' + (cursor === null ? '' : 'after=' + encodeURIComponent(cursor) + '&') + 'limit=100';
+        const page = await fetchPublic(url);
+        if (page.plan_id !== view.plan_id || page.revision !== view.metadata.revision ||
+            page.store_sequence !== view.coordination.store_sequence) throw cursorConflict();
+        if (!Array.isArray(page.items) || page.items.length > 100 ||
+            !page.items.every(item => item && ['attempt', 'reservation', 'hold', 'review', 'invalidation'].includes(item.kind) && item.value)) {
+          throw new Error('Invalid coordination page');
+        }
+        items.push(...page.items);
+        cursor = page.next_cursor;
+        if (cursor !== null && (typeof cursor !== 'string' || !cursor || cursors.has(cursor))) {
+          throw new Error('Coordination cursor made no progress');
+        }
+        if (cursor !== null) cursors.add(cursor);
+      } while (cursor !== null);
+
+      const events = full ? [] : serviceEvents.slice();
+      let sequence = full ? 0 : serviceSequence;
+      let page;
+      do {
+        page = await fetchPublic(bodyData.eventsUrl + '?after=' + sequence + '&limit=100');
+        if (!Array.isArray(page.events) || page.events.length > 100) throw new Error('Invalid event page');
+        for (const event of page.events) {
+          if (!event || !Number.isSafeInteger(event.sequence) || event.sequence <= sequence || event.plan_id !== view.plan_id) {
+            throw new Error('Event page made no progress');
+          }
+          if (event.sequence > view.coordination.store_sequence) throw cursorConflict();
+          events.push(event);
+          sequence = event.sequence;
+        }
+      } while (page.events.length === 100);
+
+      const warnings = await readServiceWarnings(view, items);
+
+      // A final public read fences the independently read pages. A write during
+      // the drain causes a restart rather than a mixed view or fabricated freshness.
+      const confirmed = await fetchPublic(bodyData.planUrl);
+      serviceSnapshot(confirmed);
+      if (confirmed.plan_id !== view.plan_id || confirmed.metadata.epoch !== view.metadata.epoch ||
+          confirmed.metadata.generation !== view.metadata.generation || confirmed.metadata.revision !== view.metadata.revision ||
+          confirmed.metadata.ownership_version !== view.metadata.ownership_version ||
+          confirmed.coordination.store_sequence !== view.coordination.store_sequence) throw cursorConflict();
+      return {view, plan, items, events, sequence, identity, warnings, warningPublication};
+    }
+
+    async function pollService() {
+      if (polling) return;
+      polling = true;
+      try {
+        if (compactIndexUrl !== null) {
+          try {
+            renderCompactIndex(await readCompactIndex());
+            availabilityWarning = false;
+            consistencyWarning = false;
+            setTransportStatus('connected');
+            setCompactIndexNotice(null);
+          } catch (error) {
+            const conflict = error && error.code === 'plan_index_conflict';
+            availabilityWarning = !conflict;
+            consistencyWarning = false;
+            setTransportStatus(conflict ? 'connected' : 'offline');
+            if (conflict) {
+              const nav = compactIndexNavigation();
+              const first = compactIndexAnchor(nav, 'first', 'First', compactIndexFirstHref);
+              syncServiceChildren(nav, [first, ...Array.from(nav.children).filter(node => node !== first)]);
+            }
+            // Apply the index notice after the generic status banner has updated.
+            setCompactIndexNotice(conflict
+              ? 'The plan list changed since this page was opened. Restart from the first page to continue.'
+              : 'Plan list unavailable. Retaining last confirmed page.', conflict);
+          }
+          return;
+        }
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            if (bodyData.planId) {
+              const state = await readServicePublication();
+              renderAcceptedPlan(state.plan, JSON.stringify(state.plan), state.identity);
+              renderServiceState(state.view, state.items, state.events, state.sequence);
+              renderServiceWarnings(state.warnings);
+              serviceWarningPublication = state.warningPublication;
+              serviceEvents = state.events;
+              serviceSequence = state.sequence;
+              serviceIdentity = state.identity;
+            } else {
+              const value = await fetchPublic(bodyData.plansUrl);
+              if (!value || !Array.isArray(value.plans)) throw new Error('Invalid public plan index');
+              value.plans.forEach(serviceSnapshot);
+              renderServiceIndex(value.plans);
+            }
+            serviceNeedsFullRead = false;
+            availabilityWarning = false;
+            consistencyWarning = false;
+            setTransportStatus('connected');
+            break;
+          } catch (error) {
+            renderServiceWarnings(null);
+            serviceNeedsFullRead = true;
+            if (error.code === 'conflict' && attempt === 0) continue;
+            availabilityWarning = true;
+            setTransportStatus('offline');
+            break;
+          }
+        }
+      } finally {
+        polling = false;
+      }
+    }
+
+    function initService() {
+      setTransportStatus('connecting');
+      pollService();
+      setInterval(pollService, 1000);
     }
 
     function initEvents() {
@@ -1070,10 +1719,11 @@
       new ResizeObserver(() => { if (currentPlan) renderGraph(currentPlan); }).observe(containerEl);
     }
 
+    const initialize = serviceMode ? initService : initEvents;
     if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', initEvents);
+      document.addEventListener('DOMContentLoaded', initialize);
     } else {
-      initEvents();
+      initialize();
     }
   }
 

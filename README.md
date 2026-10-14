@@ -64,9 +64,12 @@ Adaptive planning loads this companion for new plan and report text.
 It does not silently substitute another writing style if the companion
 is unavailable.
 
-Ordinary planning uses the two skills' Markdown instructions. The dashboard requires
-Python 3.10+ and a browser. It uses the Python standard library and local assets,
-with no package installation or hosted service.
+Ordinary planning uses the two skills' Markdown instructions. The shared planning
+service defaults to persistent MCP; see [docs/operations.md](docs/operations.md).
+For isolated legacy compatibility, the standalone local dashboard requires
+Python 3.10+ and a browser, using the Python standard library and local assets,
+with no package installation or hosted service; this standard-library claim
+applies only to the legacy local script, not to the shared MCP service.
 
 ## Use
 
@@ -87,9 +90,13 @@ Use $adaptive-planning to complete this task. Keep a live HTML dashboard
 updated as you execute and verify each step.
 ```
 
-You can also give the agent the path to [SKILL.md](SKILL.md). The dashboard is
-optional. Its [reference](references/live-dashboard.md) covers launch commands,
-proposal JSON, publishing, authorization intervals, migration, and recovery.
+You can also give the agent the path to [SKILL.md](SKILL.md). Shared persistent
+MCP is the default for agents, with stable dashboard URLs first, canonical
+MCP saved state, and no per-task server; see [docs/operations.md](docs/operations.md)
+and client guides for [Codex](docs/clients/codex.md) and
+[Antigravity](docs/clients/antigravity.md). The server owns saved state, not
+models, dispatch, or Superpowers methodology; the agent follows its chosen
+workflow and records checkpoints and feedback.
 
 Plans and reports use `simplified-technical-english` for new human-readable
 text. Instructions and explanations follow their respective language rules.
@@ -109,11 +116,21 @@ an Issue 9-oriented candidate. Full conformance is not verified.
 The initial plan includes a compact language verification note.
 Later updates report new unresolved items or changes in the evidence mode.
 
+Checkpoints use concise prose; ASCII dependency maps are provided only on
+explicit request.
+
 ## Dashboard boundaries
 
-The server binds to `127.0.0.1` and serves a read-only view. Keep its state in
-the current task's directory, outside the shared skill installation. Publish
-updates through `scripts/live_plan.py`; do not edit canonical state by hand.
+The default shared service uses persistent MCP with no per-task server and
+canonical MCP saved state and dashboard URLs; see [docs/operations.md](docs/operations.md)
+and current client docs ([Codex](docs/clients/codex.md), [Antigravity](docs/clients/antigravity.md)).
+
+### Isolated legacy compatibility
+
+For isolated legacy compatibility, the standalone server binds to `127.0.0.1` and
+serves a read-only view. Keep its state in the current task's directory, outside
+the shared skill installation. Publish updates through `scripts/live_plan.py`;
+do not edit canonical state by hand.
 
 Schema v2 checks dependency order, generation and revision conflicts,
 append-only evidence, retirement, and execution scope. A first-step interval
@@ -154,16 +171,40 @@ not been verified.
 ## Inspiration
 
 The original idea came from reinforcement learning: an action changes the
-state, so the next decision should use what was actually observed. The
-[University of Alberta's Reinforcement Learning Specialization](https://www.ualberta.ca/en/admissions-programs/online-courses/reinforcement-learning/index.html)
+situation, so the next decision must use what actually happened.
+[DeepMind's explanation of Acme](https://deepmind.google/blog/acme-a-new-framework-for-distributed-reinforcement-learning/)
+describes the interaction between actions, observations, rewards, and learning.
+The [University of Alberta's Reinforcement Learning Specialization](https://www.ualberta.ca/en/admissions-programs/online-courses/reinforcement-learning/index.html)
 and Sutton and Barto's
 [Reinforcement Learning: An Introduction](https://mitpress.ublish.com/book/reinforcement-learning-an-introduction-2)
 provide the background for that intuition.
 
-This skill implements closed-loop, receding-horizon replanning. It does not
-learn value functions across tasks, estimate rewards, or tune a discount
-factor. Keeping distant steps coarse is a planning choice. The university and
-authors are cited as inspiration, with no affiliation or endorsement implied.
+For this repository, the practical method is **closed-loop, receding-horizon
+planning**:
+
+1. Build a provisional plan toward the goal.
+2. Execute one meaningful step.
+3. Verify the result and update what you know.
+4. Reassess the remaining plan before continuing.
+
+"Closed-loop" means observed results feed back into decisions. "Receding
+horizon" means planning ahead, executing the next step, and planning again
+from the updated situation. Model predictive control uses a related principle:
+it calculates a sequence of actions, applies the first, and repeats using
+the current state.
+[MathWorks explains this control loop](https://www.mathworks.com/help/mpc/gs/what-is-mpc.html).
+
+For example, a provisional plan might be: inspect data, transform data,
+generate a report. If inspection finds missing fields, the next plan must
+resolve those fields before transformation.
+
+This skill uses feedback to revise a task plan. It does not train a policy,
+learn value functions across tasks, calculate rewards, or tune a discount
+factor. Keeping distant steps coarse is a planning choice. The cited sources
+provide inspiration, with no affiliation or endorsement implied.
+
+**The goal stays stable. The route remains provisional. Evidence determines
+the next step.**
 
 ## License
 

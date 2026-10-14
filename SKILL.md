@@ -26,6 +26,8 @@ Derive execution permission from the user's request:
 
 Skill invocation does not expand permissions. Preserve required
 approvals and applicable testing, debugging, and review workflows.
+Takeover of a plan changes coordination authority but is not scope
+renewal; execution boundaries remain strictly bound to user authorization.
 
 ## Plan language
 
@@ -79,57 +81,162 @@ Do not translate text solely to apply STE. Report non-English text as
 outside the STE language-review scope. Task deliverables retain their
 governing specifications and protected source wording.
 
-## Establish state
+## Authoritative state and coordination
 
-Record the objective, verifiable acceptance criteria, constraints,
-authorized actions, budgets, known facts, assumptions, and completed
-work.
+In configured environments, the shared adaptive-planning MCP service
+is the default authoritative coordination authority (dashboard at
+`http://127.0.0.1:8790/`). Shared service mode prohibits launching a separate per-task or per-session fallback server.
 
-Reuse one canonical plan in the existing task tracker,
-user-designated file, or conversation. Preserve completed work and
-evidence. Do not create competing plan records.
+
+Distinguish the authoritative MCP coordination state from other project
+artifacts:
+- **Authoritative MCP service**: Stores the canonical plan graph, step
+  lifecycle, assignments, resource obligations, audit events, and
+  verifiable evidence references.
+- **Detailed design and implementation docs**: Persisted repository
+  specifications, architectural decision records, and design documents
+  contain technical detail but are not canonical plan substitutes.
+- **Temporary workflow notes**: Scratch files, local logs, and working
+  notes remain private and transient; they carry no service authority.
+
+### Domain grants and working records
+
+Persist domain grants (orchestrator tokens, attempt tokens) only in
+explicitly private client or session working records outside public
+views and repository files. Do not assume automatic client-session
+persistence across restarts or new sessions. If a new session starts
+without a retained valid grant, use an explicit `takeover` command on the
+plan to re-establish orchestrator authority.
+
+### Worktree isolation and resource declarations
+
+Each assigned worker must operate in an isolated worktree or directory.
+Declare physical resource claims (repository, workspace, external)
+explicitly to prevent file collisions. Retain resource obligations
+until explicit stopped-use evidence is recorded.
+The service enforces declared coordination and capability fences; it does not enforce filesystem permissions or stop host processes.
+Workers and operators must honor the declared context, isolation, and stopped-use
+obligations in the actual execution environment.
+
+### Activity and stale thresholds
+
+Workers must report observable progress at least once every five minutes
+(`report_activity` or checkpoints). An attempt with no activity for
+15 minutes reaches the stale threshold, requiring explicit administrative
+sweep and recovery before new progress can occur.
 
 ## Execution loop
 
-1. **Plan.** Maintain a provisional ordered list. Make the next step
-   concrete with a completion check; keep distant steps coarse.
-   Note important dependencies and assumptions.
+The framework-neutral instruction contract follows six generic stages:
+`publish/resume -> assign/start -> act/verify -> checkpoint/reassess -> resolve/review/accept -> eligible next work`.
+Workflow document references and phase metadata are optional; no specific
+Superpowers sequence is required.
 
-2. **Choose.** Evaluate the next action's immediate benefit and
-   downstream consequences: usefulness, feasibility, risk, cost,
-   reversibility, and uncertainty reduced. Follow the user's outcome
-   preferences. Use qualitative comparisons unless an actual
-   scoring model is supplied; never fabricate reward estimates.
+1. **Publish or resume.**
+   - Initial plan: Publish the objective, acceptance criteria, constraints,
+     known facts, assumptions, and bounded steps. Keep stable step IDs, explicit
+     dependencies, and concrete next checks; keep distant steps coarse.
+   - Resume existing plan: Read canonical events, unfinished ownership,
+     holds, and reviews. Explicitly sweep stale attempts before dispatch
+     or recovery. Only an authorized owner invokes `sweep_stale`; a direct worker requests that owner sweep before recovery.
+     If an assigned worker discovers its attempt is overdue, obtain the owner
+     sweep first, then reread the latest attempt version. The owner confirms
+     ownership, or an unfenced current worker publishes a recovery checkpoint.
 
-3. **Execute one meaningful step.** Use a bounded unit of work with
-   a checkable outcome, including its necessary verification.
-   Do not batch subsequent dependent steps. If material evidence
-   invalidates the current approach mid-step, pause and reassess
-   before further dependent actions. Continue independent authorized
-   work even if another branch is blocked.
+2. **Assign and start.**
+   - Choose the next action by usefulness, feasibility, risk, cost,
+     reversibility, and uncertainty reduced, following the user's outcome
+     preferences. Use qualitative comparisons unless an actual scoring model
+     is supplied; never fabricate reward estimates.
+   - Assign the next ready step to a bounded worker with its declared
+     execution context and resource obligations.
+   - Worker begins with an explicit `start_step` call recording observed
+     activity.
+   - Missing-MCP worker relay: When a worker lacks direct MCP capabilities,
+     an authorized relay orchestrator submits `start_step` and
+     `report_activity` on its behalf, preserving the worker's identity
+     in `origin_worker` and the relay's identity in `relay`. Never invent
+     checks, heartbeats, or activity signals.
 
-4. **Observe.** Compare the actual result with the expected result.
-   Record evidence, failures, and remaining uncertainty.
-   A successful tool call is not proof of the intended outcome.
-   Failed verification means the step is not complete.
+3. **Act and verify.**
+   - Execute one bounded step with checkable verification.
+   - Run the specified completion check and collect concrete evidence.
+   - Do not batch subsequent dependent steps. If material evidence invalidates
+     the approach mid-step, pause and reassess before further dependent actions.
+   - A successful tool call is not proof of the intended outcome. Failed
+     verification means the step is not complete.
 
-5. **Reassess the entire remaining horizon.** Check every pending
-   step, including indirect dependencies, against the updated state.
-   Keep, reorder, revise, retire, or add steps as justified.
-   If later evidence invalidates an earlier result, preserve history,
-   reopen with corrective/recheck steps, and repoint unfinished
-   dependencies; never claim a disproven result is currently verified.
-   When nothing relevant changes, retain the plan and explicitly
-   record that outcome. Update the canonical plan before another
-   step begins.
+4. **Checkpoint and reassess.**
+   - Completing a named step and its verification requires publishing a structured checkpoint with evidence and reassessment.
+   - Use `record_checkpoint` to publish a structured checkpoint with outcome (`passed`, `failed`,
+     or `blocked`), the executed check, full artifact references,
+     verifiable evidence, and a comprehensive `reassessment`.
+   - Reassess every pending step in the remaining horizon, including indirect
+     dependencies, against updated facts. Note any
+     material downstream effects, reordering, additions, or retirements.
+     Preserve accepted history when later evidence invalidates a result; record
+     invalidation and explicit corrective/recheck work instead of presenting
+     the disproven result as currently verified. When nothing relevant changes,
+     retain the plan and explicitly record the unchanged reassessment.
+   - Safe pause relay: If work must pause, the relay records actual
+     state truthfully without fabricating completion.
 
-6. **Report and continue.** Publish the checkpoint below. Continue
-   only within the requested execution mode. Stop when acceptance
-   criteria are verified, authorization or budget is exhausted,
-   or no authorized unblocked work remains. Report blocked branches
-   separately while independent authorized work continues. Repeated failure without new
-   evidence or hypothesis requires reassessing the approach or
-   reporting a blocker.
+5. **Resolve, review, and accept.**
+   - The plan owner explicitly classifies and resolves any provisional
+     reassessment holds.
+   - Independent review: For steps with `review_required` or final gates,
+     an independent reviewer records a `Review` observation. The `Review`
+     DTO contains `reviewer`, findings, and evidence; it has no invented
+     relay field. Relayed reviews truthfully record the submitting actor
+     as orchestrator and the original reviewer in `Review.reviewer`.
+   - Owner acceptance: The owner accepts verified work via `accept_step`,
+     matching the exact submitted artifact, target attempt, and current
+     CAS metadata. Declare stopped resource IDs supported by actual
+     evidence; empty stop IDs retain obligations. A submitted checkpoint
+     is not accepted work until explicit owner acceptance.
+
+6. **Eligible next work.**
+   - Consult `list_ready` to discover newly unblocked steps.
+   - Continue only within the authorized execution mode (`first-step` stops
+     here; `complete-task` proceeds with the next eligible step).
+   - Stop when acceptance criteria are verified, authorization or budget is
+     exhausted, or no authorized unblocked work remains. Report blocked branches
+     separately while independent authorized work continues. Repeated failure
+     without new evidence or a changed hypothesis requires reassessment or a
+     blocker report.
+
+## Outage policy and unavailable behavior
+
+When the shared MCP service or dashboard is temporarily unavailable
+(e.g., host reboot, Docker maintenance, Mac sleep, or connection drop):
+
+During a service outage, an assigned bounded worker finishes verification and retains unpublished evidence locally while new assignments and dependent steps wait.
+
+1. **Assigned bounded worker finishes verification:**
+   An already assigned bounded worker may complete its active execution
+   and verification checks. It retains its unpublished evidence locally
+   in its private working record.
+
+2. **Dependents and new assignments wait:**
+   New step assignments and dependent work must wait for service
+   restoration. Do not attempt uncoordinated execution of downstream steps.
+
+3. **No spawned fallback server or competing plans:**
+   Shared service mode prohibits launching a separate per-task or per-session fallback server.
+   Do not launch a per-task fallback server or create competing canonical
+   plan files. Report the last published revision as **LAST KNOWN** and
+   offline/stale while the service is unavailable. It remains the
+   authoritative public reference. Legacy file mode is an explicit
+   compatibility mechanism for isolated environments, never an outage
+   fallback.
+
+4. **Recovery, same-key retry, and reconcile:**
+   When service resumes, reread service identity, canonical events, ownership, and coordination before publishing retained evidence.
+   Retain the original immutable command body and request key; retry the exact saved command without rebuilding its metadata or payload.
+   Reconcile the saved command against the current epoch, generation, ownership,
+   attempt version, and any holds. If it is fenced or stale, obtain explicit
+   owner recovery rather than altering a retry under the same key. Reread after
+   publication or exact replay to confirm what committed before dispatching work.
 
 ## Reporting
 
@@ -139,90 +246,21 @@ Do not use Caveman compression for this skill.
 
 If `pstack-plugin:unslop` is available, apply it only when its edits
 preserve STE requirements, technical meaning, and protected literals.
-It does not replace the required STE companion. Preserve the reports
-and ASCII maps required here.
+It does not replace the required STE companion. Preserve the checkpoint
+information required below.
 
-At each meaningful checkpoint, briefly cover the result and evidence,
-material downstream impact, plan changes or "unchanged after review",
-the next action and its completion check, and whether work continues,
-stops at the requested boundary, awaits input, or is complete.
-Combine these into natural prose or short bullets; fixed headings
-are unnecessary. Match detail to what changed.
+At each meaningful checkpoint, cover the result and evidence, material
+downstream impact, plan changes or "unchanged after review", the next
+action and its completion check, and whether work continues, stops at
+the requested boundary, awaits input, or is complete.
 
-Show the initial plan and subsequent changes. Keep the full current
-plan recoverable; avoid reprinting unchanged details.
+### Dashboard link and ASCII view
 
-## Optional live dashboard
-
-When the user requests a live HTML plan, read
-[references/live-dashboard.md](references/live-dashboard.md) for the
-publisher, local server, schema v2, and launch commands. Keep this mode
-optional; ordinary use needs no server.
-
-Use the task's published JSON as the canonical plan in this mode.
-Publish when a step starts, a result is verified, a blocker appears,
-or reassessment changes the plan. Include evidence and a short reason
-for each update. In plan-only mode, retain `planning`, or `blocked` if
-required information is missing. When the plan is ready, record
-"Plan ready; execution has not started" in `changeSummary`.
-In execution modes, publish `stopped` when the requested execution
-boundary is reached; use `complete` when acceptance criteria are
-verified, or `blocked` when no authorized unblocked work remains.
-The dashboard shows published state, not hidden agent activity,
-and does not authorize execution.
-
-Open the local URL and confirm a real update arrives before claiming
-the dashboard is live. Keep chat updates concise and link the view;
-use the ASCII view below when live mode is unavailable. A dashboard
-failure must not discard the plan, bypass the first-step stopping
-boundary, or prevent other authorized work.
-
-## ASCII plan view
-
-Use this view by default and as the fallback for live mode. Include a
-compact ASCII map with the initial plan and each meaningful checkpoint
-where structure or markers change. Derive it from the canonical plan;
-it is a view of that plan, not a separate record. Summarize distant work
-when needed to keep the big picture readable.
-
-Use plain ASCII in a fenced text block. Use the same step identifiers
-as the plan. Arrows show actual dependencies. Branch only where steps
-can proceed independently; a join means all incoming prerequisites
-must be satisfied. ASCII arrows are intentional here even if the
-writing style otherwise discourages arrows. Redraw only when structure
-or markers change; provide concise unchanged checkpoints otherwise.
-
-Use consistent markers:
-- `[x]` completed when verified
-- `[>]` in progress
-- `[ ]` pending
-- `[!]` blocked
-- `[-]` retired
-
-The publisher treats historical completed steps as trusted pending a
-future invalidation model; the marker does not override contrary evidence.
-
-Mark a pending step `(next)` when useful. Never mark planned work as
-in progress before it starts, or failed verification as complete.
-If execution has stopped, say why beside the map; a next-step marker
-does not grant permission to continue.
-
-Example while filtering is in progress:
-
-```text
-Goal: verified sales report
-
-[x] 1 Inspect inputs
-    |
-    +--> [>] 2 Filter sales --+
-    |                        |
-    +--> [ ] 3 Check lookup --+--> [ ] 4 Join --> [ ] 5 Produce and verify
-```
-
-Update markers and affected dependencies after reassessment. Keep
-unchanged maps compact; skip redraws for individual tool calls within
-the same meaningful step. Explain consequential changes briefly
-beside the map.
+- **Default dashboard link**: The live dashboard link (http://127.0.0.1:8790/) is the default for plan visualization and status reporting. By default, include the link to the live dashboard (`http://127.0.0.1:8790/`) in progress updates so users can inspect the real-time plan state.
+- **ASCII plan view on explicit request only**: ASCII plan visualization requires an explicit request and is never emitted by default. Render an ASCII plan map only upon explicit request from the user. Do not include ASCII maps by default. When explicitly requested, use plain ASCII in a fenced
+  block with standard markers (`[x]` complete, `[>]` in progress,
+  `[ ]` pending, `[!]` blocked, `[-]` retired) derived strictly from
+  the canonical plan.
 
 ## Guardrail
 

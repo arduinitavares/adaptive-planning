@@ -1,0 +1,20 @@
+services:
+  adaptive-planning:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: adaptive-planning:local
+    user: "10001:10001"
+    command: ["serve"]
+    environment:
+      ADAPTIVE_PLANNING_DATA_DIR: /data
+      ADAPTIVE_PLANNING_BASE_URL: http://127.0.0.1:8790
+    ports:
+      - "127.0.0.1:8790:8790"
+    volumes:
+      - adaptive-planning-data:/data
+    restart: unless-stopped
+
+volumes:
+  adaptive-planning-data:
+    name: adaptive-planning-data
