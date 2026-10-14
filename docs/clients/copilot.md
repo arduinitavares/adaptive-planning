@@ -1,26 +1,64 @@
 # Copilot client setup
 
-The service MCP endpoint is `http://127.0.0.1:8790/mcp`; the dashboard is
-`http://127.0.0.1:8790/`. **Copilot CLI** uses the user file
-`~/.copilot/mcp-config.json` with this schema:
+Copilot CLI uses the private user file `~/.copilot/mcp-config.json`.
+VS Code uses a separate schema and needs separate runtime verification.
 
-This setup material retains Task 10 preparation. Task 20 source tests do not
-refresh installed versions, activate configuration or verify current CLI/VS Code
-environment handling; each actual surface still needs its own runtime evidence.
-As of 2026-10-13, the user no longer uses Copilot. It is excluded from the current
-release gate. These setup examples and their unverified surface distinctions
-remain as historical reference.
+## Select and resume an instance
+
+The examples below use two distinct named connections. The loopback URL is
+a local example. `192.168.1.10` is a synthetic RFC1918 address, not a deployment
+requirement. Replace each example URL with the operator-supplied endpoint.
+Provision each installation's own bearer credential privately.
+
+Use the [instance selection and resume rules](../../SKILL.md#select-and-retain-one-instance).
+For a new plan, an explicit task choice precedes a private project preference,
+then a private user preference, then the single configured instance.
+Ask before creating a plan when several services remain eligible.
+If a selected or preferred entry is missing or unavailable, report the gap.
+Ask before selecting another instance for a new plan.
+Do not silently fall back. Report a missing configuration when none is available.
+
+For new and resumed plans, use `read_service_info` through the selected MCP entry.
+Use its `dashboard_url` and returned plan URLs.
+
+For an existing plan, retain its MCP entry, `host_id`, last observed `epoch`,
+and `plan_id` in a private task/session working record.
+Read the expected plan before resuming. Compare `(host_id, epoch)` for aliases
+through trusted connections; a URL or host ID alone is insufficient.
+Do not create duplicate canonical plans through different aliases.
+These checks do not provide cryptographic proof against copied databases.
+Follow restore/recovery on an epoch change with the same host ID.
+Stop plan mutations on an unexpected host ID. Obtain an explicit recovery
+or migration decision. A preference change does not move an existing plan.
+
+Independent instances do not automatically share plans, grants, events, or
+resource reservations. During an outage, retain the affected plan's authority.
+Its assigned bounded worker can retain unpublished local verification;
+new assignments and dependents wait. Other deliberately configured instances
+can serve other plans. Operators coordinate resources across instances.
 
 ```json
 {
   "mcpServers": {
-    "adaptivePlanning": {
+    "adaptivePlanningLocal": {
       "type": "http",
       "url": "http://127.0.0.1:8790/mcp",
       "headers": {
         "Authorization": "Bearer ${ADAPTIVE_PLANNING_TOKEN}"
       },
-      "tools": ["*"]
+      "tools": [
+        "*"
+      ]
+    },
+    "adaptivePlanningRemote": {
+      "type": "http",
+      "url": "http://192.168.1.10:8790/mcp",
+      "headers": {
+        "Authorization": "Bearer ${ADAPTIVE_PLANNING_REMOTE_TOKEN}"
+      },
+      "tools": [
+        "*"
+      ]
     }
   }
 }
@@ -42,7 +80,7 @@ With execution authorization, preserve existing user entries and provision the
 environment through a private local channel. Keep private configuration at mode
 `0600` under a private parent directory. Never install synthetic example tokens
 into a real user configuration or put token values in CLI arguments, repository
-files or reports. `/mcp show adaptivePlanning` is a documented session diagnostic;
+files or reports. `/mcp show adaptivePlanningLocal` is a documented session diagnostic;
 terminal configuration-management output alone is insufficient call evidence.
 The inspected documentation does not establish a direct model-free MCP planning
 mutation command. Verify an actual supported call surface before acceptance.
@@ -53,11 +91,18 @@ password-prompt `inputs`; Copilot CLI does not consume this shape:
 ```json
 {
   "servers": {
-    "adaptivePlanning": {
+    "adaptivePlanningLocal": {
       "type": "http",
       "url": "http://127.0.0.1:8790/mcp",
       "headers": {
         "Authorization": "Bearer ${input:adaptive-planning-token}"
+      }
+    },
+    "adaptivePlanningRemote": {
+      "type": "http",
+      "url": "http://192.168.1.10:8790/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:adaptive-planning-remote-token}"
       }
     }
   },
@@ -66,6 +111,12 @@ password-prompt `inputs`; Copilot CLI does not consume this shape:
       "type": "promptString",
       "id": "adaptive-planning-token",
       "description": "Installation token",
+      "password": true
+    },
+    {
+      "type": "promptString",
+      "id": "adaptive-planning-remote-token",
+      "description": "Remote installation token",
       "password": true
     }
   ]
@@ -134,10 +185,11 @@ progress.
 If the MCP service or dashboard becomes unavailable during execution:
 - An assigned bounded worker finishes verification locally and retains unpublished evidence in its private working record.
 - New assignments and dependents wait.
-- Do not spawn a fallback server or create a new canonical plan. Report the last published revision as **LAST KNOWN**, offline/stale while the service is unavailable.
+- Do not spawn a fallback server or create a competing authority for this plan.
+  Deliberately configured independent instances can serve other plans. Report the last published revision as **LAST KNOWN**, offline/stale while the service is unavailable.
 - On recovery, reread service identity, events, ownership, and coordination before publishing retained evidence. Retain the original immutable command body and request key and retry that exact saved command without rebuilding metadata or payload. Reconcile epoch, generation, ownership, attempt version, and holds; fenced or stale commands need explicit owner recovery. Reread after publication or replay before dispatching work.
 
-## Worker checkpoints and the remaining client gate
+## Worker checkpoints and client verification
 
 The installation bearer authorizes MCP transport access, while the private owner
 and attempt grants authorize domain commands. Direct worker start/activity/
@@ -165,12 +217,7 @@ records the current 29-tool source catalog (six reads and 23 mutations), with no
 disabled future kinds, and proof fields. The catalog has synthetic SDK evidence;
 genuine installed Copilot discovery and acceptance remain unverified.
 
-The Task 20 source checkpoint uses three synthetic official SDK clients per
-protocol, auto `2026-07-28` and legacy `2025-11-25`. `copilot-worker` is an actor
-label, not an installed Copilot or model run. Genuine Copilot finished-worker
-and close/reopen/service-restart/container-recreation rows remain **NOT RUN**;
-actual runs are **0**, and full Task 20 acceptance remains **false**. Task 10's
-planning evidence and historical versions do not satisfy those rows. Later
-authorized evidence must identify the exact CLI/VS Code surface and version,
-actual negotiation, shared plan, visible checkpoint sequence and owner
-acceptance/review IDs, retaining capability or allowance gaps honestly.
+Historical SDK fixtures use synthetic actor labels. They do not establish
+installed-client acceptance. See the [source and client coverage limits](../release-verification.md).
+Verify the actual surface, installed version, tool discovery and checkpoint
+flow without treating earlier evidence as a fresh installation check.

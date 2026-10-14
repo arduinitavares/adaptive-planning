@@ -815,10 +815,10 @@ class TestService(unittest.TestCase):
         self.assertTrue(path.is_file(), f"The {client} client schema documentation is missing")
         return re.findall(r"```" + language + r"\n(.*?)\n```", path.read_text(), re.DOTALL)
 
-    def _endpoint(self, url):
+    def _endpoint(self, url, host="127.0.0.1"):
         parsed = urlsplit(url)
         self.assertEqual((parsed.scheme, parsed.hostname, parsed.port, parsed.path),
-                         ("http", "127.0.0.1", 8790, "/mcp"))
+                         ("http", host, 8790, "/mcp"))
         self.assertIsNone(parsed.username)
         self.assertIsNone(parsed.password)
         self.assertEqual((parsed.query, parsed.fragment), ("", ""))
@@ -826,45 +826,61 @@ class TestService(unittest.TestCase):
     def test_codex_examples_use_cli_environment_or_private_toml_header(self):
         snippets = self._examples("codex", "toml")
         self.assertEqual(len(snippets), 2)
-        environment, private = [tomllib.loads(snippet)["mcp_servers"]["adaptivePlanning"]
-                                for snippet in snippets]
-        for entry in (environment, private):
-            self._endpoint(entry["url"])
-        self.assertEqual(set(environment), {"url", "bearer_token_env_var"})
-        self.assertEqual(environment["bearer_token_env_var"], "ADAPTIVE_PLANNING_TOKEN")
-        self.assertEqual(set(private), {"url", "http_headers"})
-        self.assertEqual(private["http_headers"], {"Authorization": "Bearer SYNTHETIC_ONLY"})
+        environment, private = [tomllib.loads(snippet)["mcp_servers"] for snippet in snippets]
+        for entries in (environment, private):
+            self.assertEqual(set(entries), {"adaptivePlanningLocal", "adaptivePlanningRemote"})
+        for name, host, variable, token in (
+            ("adaptivePlanningLocal", "127.0.0.1", "ADAPTIVE_PLANNING_TOKEN", "SYNTHETIC_ONLY"),
+            ("adaptivePlanningRemote", "192.168.1.10", "ADAPTIVE_PLANNING_REMOTE_TOKEN", "SYNTHETIC_REMOTE_ONLY"),
+        ):
+            self._endpoint(environment[name]["url"], host)
+            self._endpoint(private[name]["url"], host)
+            self.assertEqual(set(environment[name]), {"url", "bearer_token_env_var"})
+            self.assertEqual(environment[name]["bearer_token_env_var"], variable)
+            self.assertEqual(set(private[name]), {"url", "http_headers"})
+            self.assertEqual(private[name]["http_headers"], {"Authorization": "Bearer " + token})
         commands = self._examples("codex", "sh")
         self.assertEqual(shlex.split(commands[0]), [
-            "codex", "mcp", "add", "adaptivePlanning", "--url", "http://127.0.0.1:8790/mcp",
+            "codex", "mcp", "add", "adaptivePlanningLocal", "--url", "http://127.0.0.1:8790/mcp",
             "--bearer-token-env-var", "ADAPTIVE_PLANNING_TOKEN",
         ])
 
     def test_antigravity_example_uses_literal_private_authorization(self):
         snippets = self._examples("antigravity", "json")
         self.assertEqual(len(snippets), 1)
-        entry = json.loads(snippets[0])["mcpServers"]["adaptivePlanning"]
-        self.assertEqual(set(entry), {"serverUrl", "headers"})
-        self._endpoint(entry["serverUrl"])
-        self.assertEqual(entry["headers"], {"Authorization": "Bearer SYNTHETIC_ONLY"})
+        entries = json.loads(snippets[0])["mcpServers"]
+        self.assertEqual(set(entries), {"adaptivePlanningLocal", "adaptivePlanningRemote"})
+        for name, host, token in (("adaptivePlanningLocal", "127.0.0.1", "SYNTHETIC_ONLY"),
+                                  ("adaptivePlanningRemote", "192.168.1.10", "SYNTHETIC_REMOTE_ONLY")):
+            self.assertEqual(set(entries[name]), {"serverUrl", "headers"})
+            self._endpoint(entries[name]["serverUrl"], host)
+            self.assertEqual(entries[name]["headers"], {"Authorization": "Bearer " + token})
 
     def test_copilot_cli_and_vscode_examples_use_their_distinct_secret_schemas(self):
         snippets = self._examples("copilot", "json")
         self.assertEqual(len(snippets), 2)
         cli, vscode = [json.loads(snippet) for snippet in snippets]
-        entry = cli["mcpServers"]["adaptivePlanning"]
-        self.assertEqual(set(entry), {"type", "url", "headers", "tools"})
-        self.assertEqual(entry["type"], "http")
-        self._endpoint(entry["url"])
-        self.assertEqual(entry["headers"], {"Authorization": "Bearer ${ADAPTIVE_PLANNING_TOKEN}"})
-        self.assertEqual(entry["tools"], ["*"])
         self.assertEqual(set(vscode), {"servers", "inputs"})
-        extension = vscode["servers"]["adaptivePlanning"]
-        self.assertEqual(extension["type"], "http")
-        self._endpoint(extension["url"])
-        self.assertEqual(extension["headers"], {"Authorization": "Bearer ${input:adaptive-planning-token}"})
-        self.assertEqual(vscode["inputs"], [{"type": "promptString", "id": "adaptive-planning-token",
-                                             "description": "Installation token", "password": True}])
+        expected_inputs = []
+        for entries in (cli["mcpServers"], vscode["servers"]):
+            self.assertEqual(set(entries), {"adaptivePlanningLocal", "adaptivePlanningRemote"})
+        for name, host, variable, prompt, description in (
+            ("adaptivePlanningLocal", "127.0.0.1", "ADAPTIVE_PLANNING_TOKEN", "adaptive-planning-token", "Installation token"),
+            ("adaptivePlanningRemote", "192.168.1.10", "ADAPTIVE_PLANNING_REMOTE_TOKEN", "adaptive-planning-remote-token", "Remote installation token"),
+        ):
+            entry, extension = cli["mcpServers"][name], vscode["servers"][name]
+            self.assertEqual(set(entry), {"type", "url", "headers", "tools"})
+            self.assertEqual(entry["type"], "http")
+            self._endpoint(entry["url"], host)
+            self.assertEqual(entry["headers"], {"Authorization": "Bearer ${" + variable + "}"})
+            self.assertEqual(entry["tools"], ["*"])
+            self.assertEqual(set(extension), {"type", "url", "headers"})
+            self.assertEqual(extension["type"], "http")
+            self._endpoint(extension["url"], host)
+            self.assertEqual(extension["headers"], {"Authorization": "Bearer ${input:" + prompt + "}"})
+            expected_inputs.append({"type": "promptString", "id": prompt,
+                                    "description": description, "password": True})
+        self.assertEqual(vscode["inputs"], expected_inputs)
 
     def test_inherited_wire_scenario_keeps_private_grants_inside_memory_capture(self):
         grants = []

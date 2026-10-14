@@ -34,11 +34,21 @@ class TestService(unittest.TestCase):
             self.assertIn("explicit request", text)
 
             # Normative policy relationships:
-            # 1. Default dashboard link
+            # 1. Dashboard comes from the selected connection
             self.assertIn(
-                "The live dashboard link (http://127.0.0.1:8790/) is the default for plan visualization and status reporting.",
+                "Use `read_service_info` through the selected MCP connection.",
                 text,
             )
+            for literal in ("dashboard_url", "host_id", "epoch", "plan_id"):
+                self.assertIn(literal, text)
+            self.assertIn("private project preference", text)
+            self.assertIn("private user preference", text)
+            self.assertIn("Ask before creating a plan", text)
+            self.assertIn("Do not silently fall back", text)
+            self.assertIn("Stop plan mutations", text)
+            self.assertIn("Independent instances do not automatically share", text)
+            self.assertNotIn("All clients share the same canonical saved state.", text)
+            self.assertNotIn("Local installation default", text)
             # 2. ASCII requires explicit request, never default
             self.assertIn(
                 "ASCII plan visualization requires an explicit request and is never emitted by default.",

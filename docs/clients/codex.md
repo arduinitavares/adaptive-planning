@@ -1,24 +1,58 @@
 # Codex client setup
 
-The service MCP endpoint is `http://127.0.0.1:8790/mcp`; the dashboard is
-`http://127.0.0.1:8790/`. Configure the installation bearer credential separately
-from the URL. These are documentation examples, not an accepted client setup.
-The configuration instructions below retain Task 10 preparation. Task 20's
-source checkpoint does not refresh installed versions, activate configuration,
-or establish CLI/Desktop runtime compatibility.
+Configure installation bearer credentials separately from each endpoint.
+Codex CLI and Desktop require their own runtime verification.
+
+## Select and resume an instance
+
+The examples below use two distinct named connections. The loopback URL is
+a local example. `192.168.1.10` is a synthetic RFC1918 address, not a deployment
+requirement. Replace each example URL with the operator-supplied endpoint.
+Provision each installation's own bearer credential privately.
+
+Use the [instance selection and resume rules](../../SKILL.md#select-and-retain-one-instance).
+For a new plan, an explicit task choice precedes a private project preference,
+then a private user preference, then the single configured instance.
+Ask before creating a plan when several services remain eligible.
+If a selected or preferred entry is missing or unavailable, report the gap.
+Ask before selecting another instance for a new plan.
+Do not silently fall back. Report a missing configuration when none is available.
+
+For new and resumed plans, use `read_service_info` through the selected MCP entry.
+Use its `dashboard_url` and returned plan URLs.
+
+For an existing plan, retain its MCP entry, `host_id`, last observed `epoch`,
+and `plan_id` in a private task/session working record.
+Read the expected plan before resuming. Compare `(host_id, epoch)` for aliases
+through trusted connections; a URL or host ID alone is insufficient.
+Do not create duplicate canonical plans through different aliases.
+These checks do not provide cryptographic proof against copied databases.
+Follow restore/recovery on an epoch change with the same host ID.
+Stop plan mutations on an unexpected host ID. Obtain an explicit recovery
+or migration decision. A preference change does not move an existing plan.
+
+Independent instances do not automatically share plans, grants, events, or
+resource reservations. During an outage, retain the affected plan's authority.
+Its assigned bounded worker can retain unpublished local verification;
+new assignments and dependents wait. Other deliberately configured instances
+can serve other plans. Operators coordinate resources across instances.
 
 For **Codex CLI**, the supported environment-based registration is:
 
 ```sh
-codex mcp add adaptivePlanning --url http://127.0.0.1:8790/mcp --bearer-token-env-var ADAPTIVE_PLANNING_TOKEN
+codex mcp add adaptivePlanningLocal --url http://127.0.0.1:8790/mcp --bearer-token-env-var ADAPTIVE_PLANNING_TOKEN
 ```
 
 Its user TOML entry is:
 
 ```toml
-[mcp_servers.adaptivePlanning]
+[mcp_servers.adaptivePlanningLocal]
 url = "http://127.0.0.1:8790/mcp"
 bearer_token_env_var = "ADAPTIVE_PLANNING_TOKEN"
+
+[mcp_servers.adaptivePlanningRemote]
+url = "http://192.168.1.10:8790/mcp"
+bearer_token_env_var = "ADAPTIVE_PLANNING_REMOTE_TOKEN"
 ```
 
 Provision `ADAPTIVE_PLANNING_TOKEN` privately into the environment of the actual
@@ -31,9 +65,13 @@ variable. Desktop needs verified GUI environment provisioning, or a private user
 TOML entry using a literal Authorization header instead of `bearer_token_env_var`:
 
 ```toml
-[mcp_servers.adaptivePlanning]
+[mcp_servers.adaptivePlanningLocal]
 url = "http://127.0.0.1:8790/mcp"
 http_headers = { Authorization = "Bearer SYNTHETIC_ONLY" }
+
+[mcp_servers.adaptivePlanningRemote]
+url = "http://192.168.1.10:8790/mcp"
+http_headers = { Authorization = "Bearer SYNTHETIC_REMOTE_ONLY" }
 ```
 
 `SYNTHETIC_ONLY` is an example value. Never install that placeholder in real client
@@ -58,6 +96,35 @@ does not provide a negotiated `protocolVersion` field. The public
 [app-server API](https://learn.chatgpt.com/docs/app-server) advertises explicit MCP
 calls, but schema availability alone does not prove installed runtime dispatch,
 gating or inference-free behavior. Verify that route before using it for the gate.
+
+## Optional remote LAN connection
+
+After the operator enables the [LAN overlay](../operations.md#optional-trusted-lan-access),
+obtain that instance's base URL. The stock overlay uses port 8790. A customized
+deployment must advertise its configured port. Use the exact operator-supplied
+URL, without a trailing slash, in the selected remote entry. Keep the local
+entry intact when adding an independent remote instance.
+
+For a new Codex CLI entry, this PowerShell example uses a distinct name:
+
+```powershell
+$env:ADAPTIVE_PLANNING_SERVER_URL = Read-Host "Base server URL supplied by the operator"
+codex mcp add adaptivePlanningRemote --url "$env:ADAPTIVE_PLANNING_SERVER_URL/mcp" --bearer-token-env-var ADAPTIVE_PLANNING_REMOTE_TOKEN
+```
+
+In static TOML, enter the actual endpoint as a literal `url` in the selected
+entry. The server's `.env` does not populate client configuration.
+PowerShell expands the URL in this CLI command. Do not assume interpolation
+in a static TOML `url`. Provision that instance's bearer into
+`ADAPTIVE_PLANNING_REMOTE_TOKEN` privately in the actual CLI environment.
+Preserve unrelated entries and settings if the named remote entry already exists.
+Changing an entry's endpoint does not authorize resuming a plan on a different
+instance. Apply the selection and identity checks above before plan mutations.
+
+Freshly discover tools and call `read_service_info` through the selected entry.
+Use its advertised links. Desktop environment provisioning requires its own
+verification. Plain HTTP is a trusted-LAN mode. Dashboard reads are public on
+that network; MCP and mutations require the installation bearer.
 
 ## Instruction contract, domain grants, and session lifecycle
 
@@ -108,10 +175,11 @@ fabricating progress.
 If the MCP service or dashboard becomes unavailable during execution:
 - An assigned bounded worker finishes verification locally and retains unpublished evidence in its private working record.
 - New assignments and dependents wait.
-- Do not spawn a fallback server or create a new canonical plan. Report the last published revision as **LAST KNOWN**, offline/stale while the service is unavailable.
+- Do not spawn a fallback server or create a competing authority for this plan.
+  Deliberately configured independent instances can serve other plans. Report the last published revision as **LAST KNOWN**, offline/stale while the service is unavailable.
 - On recovery, reread service identity, events, ownership, and coordination before publishing retained evidence. Retain the original immutable command body and request key and retry that exact saved command without rebuilding metadata or payload. Reconcile epoch, generation, ownership, attempt version, and holds; fenced or stale commands need explicit owner recovery. Reread after publication or replay before dispatching work.
 
-## Worker checkpoints and the remaining client gate
+## Worker checkpoints and client verification
 
 The installation bearer authenticates MCP requests. A plan's private owner grant
 authorizes owner operations; assignment returns a separate private attempt grant.
@@ -142,26 +210,13 @@ disabled future kinds. At the historical Task 20 source-only checkpoint,
 that catalog had synthetic SDK evidence; genuine installed Codex discovery and
 worker acceptance were unverified.
 
-In the historical Task 20 source-only snapshot, three synthetic official SDK
-clients exercised each negotiated protocol: auto `2026-07-28` and legacy
-`2025-11-25`. `codex-worker` was an actor label, not a Codex run. The genuine
-Codex finished-worker and close/reopen/service-restart/container-recreation
-rows were **NOT RUN**; actual client runs were **0** and full Task 20 acceptance
-was **false**. Historical Task 10 planning probes do not satisfy this gate.
-Record the actual chosen surface/version, negotiated protocol, shared plan,
-visible checkpoint sequence and owner acceptance/review IDs only from a later
-authorized installed-client run.
+Historical SDK actor labels do not prove an installed Codex or model ran.
+See the [dated source and client coverage limits](../release-verification.md).
+Record the actual surface/version, tool discovery, checkpoint sequence and
+acceptance IDs from an authorized installed-client run.
 
-The later [dated closure evidence](../operations.md) records five genuine Codex
-processes against the image identified there. Those runs remain bounded to the
-recorded image and tested flows. Permanent installed-client activation and full
-Task 20 acceptance remain pending.
+## Historical client verification
 
-
-## Installed CLI activation, 2026-10-13
-
-A fresh installed Codex 0.160.1 app-server authenticated through the permanent private `adaptivePlanning` entry at `http://127.0.0.1:8790/mcp`, discovered 29 tools and completed actual installation and plan reads against schema v2. The eight unrelated server entries were preserved. No model turn or planning mutation was submitted during this activation check. Its direct status did not expose the downstream MCP protocol, so no protocol version is inferred. The [dated local activation evidence](../operations.md#local-activation-evidence-2026-10-13) records the source, migration and runtime boundaries. Overall two-client worker acceptance remains pending the fresh AGY checkpoint/resume gate. Desktop and Mac sleep/reboot behavior are not established by this CLI check.
-
-## Shared AGY checkpoint read, 2026-10-13
-
-A later fresh installed Codex 0.160.1 app-server used the same permanent global entry to discover 29 tools and make five native read calls. It read the labelled AGY plan `97c76387-f8a9-408d-8661-f4e94f94e819`, including A's exact accepted result UUID, public history and remaining eligible work. No model turn or mutation was submitted; the client exited and its owned terminal was closed. The subsequent genuine AGY continuation completed B. The [native client acceptance record](../operations.md#native-client-acceptance-completed-2026-10-13) supersedes the preceding pending AGY gate while preserving earlier protocol, lifecycle and client-surface boundaries.
+See the [dated release verification](../release-verification.md).
+These source and CLI observations apply only to their recorded versions and
+flows. Verify the selected installed client surface before accepting setup.

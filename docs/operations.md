@@ -2,9 +2,11 @@
 
 Run these commands from the directory containing `compose.yaml`, using Docker
 Engine 28 or newer and Docker Compose. The service listens on `0.0.0.0:8790`
-inside its container; Compose publishes only `127.0.0.1:8790` on the host.
-The dashboard is at `http://127.0.0.1:8790/` and the authenticated MCP endpoint
-is `http://127.0.0.1:8790/mcp`.
+inside its container; the default Compose file publishes only `127.0.0.1:8790` on the host.
+For this default local configuration, the dashboard example is
+`http://127.0.0.1:8790/` and the MCP endpoint is `http://127.0.0.1:8790/mcp`.
+Clients select a configured instance and discover its advertised URLs through
+`read_service_info`; see the [instance rules](../SKILL.md#select-and-retain-one-instance).
 
 ## Build and initialize
 
@@ -50,10 +52,133 @@ layers, Compose environment variables, or the URL. Configure trusted MCP clients
 with the existing credential through a private local channel; do not print it or
 put it in logs, shell history, source files, or shared client configuration.
 
+## Independent deployments
+
+Each instance owns a separate database and installation credential.
+Clients connected to one instance share that instance's plans and reservations.
+Independent instances do not synchronize saved state. Operators must coordinate
+physical resources that are used through different instances.
+
+On separate Docker hosts, installations can use the same default port.
+On the same host, configure distinct published ports and distinct data volumes
+before initialization. The explicit volume name `adaptive-planning-data` is
+used as written. A different Compose project name does not isolate it.
+See Docker's [volume name rules](https://docs.docker.com/reference/compose-file/volumes/#name).
+Review the merged Compose configuration for each instance. Verify its port
+bindings, volume identity and service URLs before starting it. Reuse a volume
+only for its existing installation. This guide adds no deployment abstraction.
+
+Actual endpoints and credentials belong in private deployment and client
+configuration. A private preference can name a configured MCP entry for new
+plans. An existing plan retains its selected instance until an explicit
+migration decision; this service provides no cross-instance migration or replication.
+
+## Optional trusted-LAN access
+
+LAN access is opt-in through `compose.lan.yaml` on any Docker host. Choose that
+host's actual RFC1918 private IPv4 address in a private `.env`; the overlay adds
+that exact address on port 8790 alongside the existing `127.0.0.1:8790:8790`
+mapping. Any device on that trusted LAN can read the dashboard at the chosen
+`http://<host-private-IP>:8790/` URL. MCP at the same base URL plus `/mcp` and
+mutations require the service bearer.
+Plain HTTP is a trusted-LAN-only mode, not internet exposure. Do not publish
+the port on a global host address or forward it from the internet. Clients
+connect directly over the LAN; Jump Desktop is not the transport.
+
+Before any build, update, or start, record the existing service's Compose project
+name (from its `com.docker.compose.project` container label) and confirm that
+its `/data` mount uses the installation's `adaptive-planning-data` volume.
+Preserve both identities. Do not start a second service or initialize another
+installation. From the existing checkout, copy the example only if no `.env`
+already exists:
+
+```sh
+if [ ! -e .env ]; then cp .env.example .env; fi
+```
+
+Edit the private `.env` to set `ADAPTIVE_PLANNING_LAN_IP` to the Docker host's
+actual address (`10/8`, `172.16/12`, or `192.168/16`). The example leaves it empty
+so LAN exposure requires an operator choice. If the existing deployment used a
+project override, uncomment `COMPOSE_PROJECT_NAME` and set it to that exact
+existing name. If it used the default project name, retain the same project
+directory and default identity. Keep installation values and credentials out of
+tracked files; `.env.example` contains only generic settings.
+
+Docker Compose loads `.env` for configuration interpolation. The commands here
+select it explicitly with `--env-file .env`; use `--env-file <private-file>` for
+another private file. Shell variables override file values, so clear stale
+exported LAN or project settings or align them deliberately. A `-p` option
+overrides `COMPOSE_PROJECT_NAME`; if used, it must name the existing project.
+See Docker's [interpolation rules](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/)
+and [project-name rules](https://docs.docker.com/compose/how-tos/project-name/).
+
+```sh
+docker compose --env-file .env -f compose.yaml -f compose.lan.yaml config
+```
+
+Before starting, inspect the merged configuration: its project name must match
+the existing deployment, and it must contain both exact host port mappings,
+the existing volume, the local base URL, and `ADAPTIVE_PLANNING_LAN_BASE_URL`
+equal to `http://<host-private-IP>:8790`. An absent or empty
+`ADAPTIVE_PLANNING_LAN_IP` fails overlay interpolation. `.env` is not passed
+wholesale into the container; the overlay's `environment` stanza explicitly
+maps the LAN base URL.
+
+Build the candidate image first using the existing
+[update and rollback procedure](#deployment-update-and-rollback), preserving the
+previous verified image and the same Compose project and volume. Record the new
+image ID before starting it. Only after that build, enable the overlay with:
+
+```sh
+docker compose --env-file .env -f compose.yaml -f compose.lan.yaml up -d --no-build --pull never adaptive-planning
+```
+
+Verify the running image ID and installation continuity as described in that
+procedure. Enabling LAN reuses the existing database and credential; it does
+not rotate or copy them.
+
+To stop the service while retaining its data:
+
+```sh
+docker compose --env-file .env -f compose.yaml -f compose.lan.yaml stop adaptive-planning
+```
+
+To disable LAN and resume the loopback-only configuration:
+
+```sh
+docker compose --env-file .env -f compose.yaml up -d --no-build --pull never --force-recreate adaptive-planning
+```
+
+Outside Compose, the Python service does not load `.env`; set
+`ADAPTIVE_PLANNING_LAN_BASE_URL` in its actual process environment to plain HTTP with one
+canonical RFC1918 IPv4 literal (`10/8`, `172.16/12`, or `192.168/16`) and an
+explicit port matching `ADAPTIVE_PLANNING_BASE_URL`. Paths, trailing slashes,
+credentials, queries, fragments, whitespace, DNS names, IPv6, wildcards, and
+other addresses are rejected. Leaving the LAN variable unset retains the
+default loopback-only boundary. The configured loopback URL remains accepted
+with LAN enabled, so existing local client entries need no changes. A supplied
+Origin must match the request's Host identity; forwarding headers and duplicate
+Host/Origin/Authorization values remain rejected, and no CORS grants are added.
+
+With LAN enabled, `read_service_info` and plan/dashboard links advertise the LAN
+URL to every client. Disabling LAN returns advertised links to the local URL;
+installation identity, plan IDs, and saved state remain shared. Provision the
+existing bearer privately on each client host using the [Codex](clients/codex.md#optional-remote-lan-connection)
+or [Antigravity CLI](clients/antigravity.md#optional-remote-lan-connection) examples.
+
+### LAN acceptance scope, 2026-10-13
+
+The LAN feature has automated coverage using a temporary database, synthetic
+credentials, and the official MCP SDK against a loopback listener carrying
+LAN Host/Origin headers. Actual Compose merge, deployment, cross-host
+network reachability, and installed CLI/IDE calls require separate coordinator
+verification. These instructions do not claim real Windows or IDE acceptance
+and do not extend earlier dated local-client results to LAN.
+
 ## Persistence and lifecycle
 
 All installation state, including `planning.sqlite` and `service-token`, stays in
-the named volume `adaptive-planning-data` mounted at `/data`. The service has no
+the named volume `adaptive-planning-data` mounted at `/data`. The default deployment has no
 checkout, home-directory, Docker socket, or credential bind mount and no host edit
 endpoint. Updating the image does not update or replace the volume.
 
@@ -81,7 +206,9 @@ During Mac sleep or temporary Docker downtime:
 2. Assigned bounded workers that are already executing may finish their local verification
    steps and retain unpublished evidence in their private client working records.
 3. Downstream dependent steps and new assignments must wait.
-4. Clients must not launch fallback servers or create competing local canonical plans.
+4. Clients must not launch fallback servers or create competing authorities for
+   the unavailable plan. Deliberately configured independent instances can serve
+   other plans.
    Report the last published revision as **LAST KNOWN**, offline/stale until canonical
    reads succeed again.
 5. Upon host wake, wait for Docker and the service to become available. An unexpectedly
@@ -577,7 +704,9 @@ it neither proves stopped use nor renews scope or the first-step latch.
 During an outage or service unavailability:
 - An assigned bounded worker finishes verification and retains unpublished evidence locally in its private working record.
 - New assignments and dependents wait.
-- Do not spawn a fallback server or create a new canonical plan. Report the last published revision as **LAST KNOWN**, offline/stale while the service is unavailable.
+- Do not spawn a fallback server or create a competing authority for this plan.
+  Deliberately configured independent instances can serve other plans.
+  Report the last published revision as **LAST KNOWN**, offline/stale while the service is unavailable.
 - On recovery, reread service identity, events, ownership, and coordination before publishing retained evidence. Retain the original immutable command body and request key and retry that exact saved command without rebuilding metadata or payload. Reconcile epoch, generation, ownership, attempt version, and holds; fenced or stale commands need explicit owner recovery. Reread after publication or replay before dispatching work.
 
 A finished checkpoint carries outcome/check, full `ArtifactRef`, meaningful
@@ -653,6 +782,10 @@ private; complete captures can contain diagnostic data and are not universally
 secret free.
 
 ## Task 26 source contracts and release evidence
+
+The following source evidence is historical. Its dates, versions and limits
+apply to the recorded candidate. Later results are summarized in
+[release verification](release-verification.md); they do not activate a reader's deployment.
 
 This source candidate preserves the 29-tool catalog: six reads and 23 semantic
 mutations. `registered_handlers(service)` issues one mapping consumed once by
@@ -855,70 +988,20 @@ functional PASS claims into this candidate. Prior browser observations rely on
 the bounded observations from that run; historical unknowns are retained, and
 current browser verification is recorded in the dated closure evidence below.
 
-Release acceptance remains OPEN: fresh post-closure two-client checkpoint runs are pending.
-The existing planning and Task20 installed-client tables remain unfilled. Dated prior-candidate evidence: Codex CLI 0.160.1 app-server negotiated MCP
-2025-06-18 in five fresh processes, discovering 29 tools and making 49 calls
-(eight mutations), with Compose stop/start/restart/down-up persistence. AGY
-1.3.3 Flash High exercised 14 unique tools through checkpoint, process exit,
-Compose restart, fresh owner takeover, actual 15-minute recovery, and a second
-checkpoint. This is bounded CLI evidence; it does not establish the full AGY
-29-tool catalogue, its wire protocol, or IDE/Desktop behavior. Installed AGY
-is now 1.3.4 without fresh genuine MCP proof. Copilot is excluded by user choice.
-Current code closure, full suite, Codex/Compose persistence and real browser focus are
-now verified in the dated closure evidence below. Current Antigravity acceptance,
-full final review, installed-skill activation and permanent deployment remain pending. SDK, HTTP, unit, synthetic role, Linux and browser
-observations cannot fill any genuine client row. Fresh task review and separate
-independent whole-change review are coordinator-owned gates; no implementer
-self-approval is recorded. A local commit does not complete Task26, the whole
-plan or release acceptance, or authorize default activation/deployment.
-
+See the [dated release verification](release-verification.md) for the later
+source and CLI observations and their scope limits.
 
 ## Current closure evidence, 2026-10-13
 
-These results cover the post-closure production source and replace pending
-labels for the named checks only. Release acceptance remains open until fresh
-Antigravity validation, final review and permanent activation complete.
-
-| Check | Verified result | Scope |
-| --- | --- | --- |
-| Full Python suite | 829 tests, exit 0, one platform skip | Host Python 3.13.15; expected negative startup-fixture diagnostics remain in the log. |
-| Actual-JS DOM suite | All 11 scenarios pass | Stable publication, compact pages, visible conflict/recovery notices, malformed-page atomic retention, attached navigation and one in-flight poll. |
-| Fresh Codex/Compose | Five installed Codex 0.160.1 processes, 29 tools, 49 calls, eight mutations; negotiated MCP 2025-06-18 | Close/reopen, stop/start, restart and same-volume container recreation preserve canonical state; no inference turn. This image preceded the equivalent Docker RUN-layer split below. |
-| Current image | `sha256:3d5a071b90dddef72d1c06e4a682afda8471b110e318c07911b9a2a8c14c1684` | Equivalent RUN-layer split retains every command and its order; shipped production/asset bytes are identical to the five-client image. UID 10001, Python 3.13.16 and SQLite 3.53.4. |
-| Current-image migration | Private existing-volume copy migrates schema 1 to 2 | Two plans, all five original events, authority tables, epoch, token and plan rowids retained; only one `schema_migrated` event added. `/data` 0700 and token 0600. Real volume unchanged. |
-| Real browser | Chromium retains 303 SSR index nodes, focus and a 12-character selection across polls | Hostile text stays literal. Older/Newer/First navigation covers 25 plus four plans with limit 25. Separate detail-page check retained 96 nodes while warning observation time advanced. |
-| Actual HTTP capacity | Two individually legal 6 MB plans return 200; full aggregate returns 413; compact JSON/root return 200 | Default compact page has 25 of 29 synthetic plans and a 7,752-byte JSON response. No production plans were created by this test. |
-
-Private receipts are retained under
-`/private/tmp/adaptive-closure-mk4rva0u/`: current full-suite result, current
-Compose/Codex acceptance, current migration proof, browser acceptance and scoped
-independent review reports. These are local verification artifacts, not public
-publishing or an OS sleep/reboot test. The installed shared skill and permanent
-client configuration are not yet activated.
-
+See the [dated release verification](release-verification.md). These historical
+results do not establish activation or runtime acceptance for another installation.
 
 ## Local activation evidence, 2026-10-13
 
-This dated record supersedes the pending activation labels in the preceding closure snapshot. The bounded final correction accepted canonical stopped plans, rejected empty compact cursors and enforced selected/default/maximum page bounds. Seven cases failed on unchanged production before implementation. The corrected checkout passed 829 Python tests with one platform skip and all 14 frontend scenarios. Expected negative startup-fixture diagnostics remain in the saved test logs. Fresh Gemini 4 Argon High independently approved spec compliance and code quality; its two optional UI polish findings were recorded for later work.
-
-The final image `sha256:a4f94ef59b2b14513d921ae841404d0c2e9ef2998dba814fd249a08afc2f79ff` contains the verified current assets and backend source. Real Chromium retained 304 captured nodes, selection, focus and links on a stopped plan and through rejection/recovery for an empty cursor and an oversized selected page. The default-25 and maximum-100 boundary cases were verified in Node; do not broaden the browser coverage claim.
-
-The permanent `adaptive-planning-live` Compose project is running on this Mac at `http://127.0.0.1:8790/`, using `adaptive-planning-data`, UID/GID 10001 and restart policy `unless-stopped`. The real volume was backed up while quiescent before its v1-to-v2 migration. Both original plans, all five original events, authority-table contents, plan rowids, installation epoch and credential were preserved; migration added the schema event. The current dashboard and static asset bytes were verified over HTTP. Mac sleep/reboot behavior remains outside the tested evidence.
-
-Private global entries named `adaptivePlanning` were provisioned for Codex and AGY, preserving the eight and five unrelated server entries respectively. Credential-bearing files use mode 0600 and their configuration parents use mode 0700. Config and installed-skill backups plus owned-key/file records were saved privately. All 15 refreshed shared-skill files match the source candidate; existing extra files and the skill lock were preserved.
-
-A fresh installed Codex 0.160.1 app-server read its permanent global entry, authenticated to the live server, discovered all 29 tools and completed actual `read_service_info` and `list_plans` calls. No model turn or mutation was submitted. The direct app-server status did not expose its negotiated downstream MCP protocol; no version is inferred from it. Earlier five-client lifecycle/protocol evidence remains bounded to its recorded image, identical backend bytes and tested flows.
-
-Fresh genuine AGY checkpoint/resume acceptance remains pending the explicit persistent `mcp(adaptivePlanning/*)` rule. That rule has not been added. Successful Argon access and code review do not prove AGY MCP planning mutations. Overall two-client worker acceptance remains open until the actual AGY gate is recorded.
+See the [dated release verification](release-verification.md). These historical
+results do not establish activation or runtime acceptance for another installation.
 
 ## Native client acceptance completed, 2026-10-13
 
-This later record supersedes the preceding pending AGY rule and checkpoint/resume labels for the approved local Codex/AGY CLI rollout. The user-approved persistent `mcp(adaptivePlanning/*)` rule is installed. The other 14 Allow entries, Ask/Deny lists and existing credit setting were preserved; the grant remains installed for future sessions.
-
-AGY CLI 1.3.4, using exact `gemini-3.8-flash-high` with explicit `--effort high`, made a native service-read qualification call, then created the labelled synthetic acceptance plan `97c76387-f8a9-408d-8661-f4e94f94e819` and accepted step A through 12 native MCP calls. That creator fully exited before a fresh conversation read its saved state, took ownership, swept only that plan, bound A's exact accepted observation to B's read-only context, and accepted B through 16 native MCP calls. The canonical plan is complete at revision 10 and ownership version 2. A's accepted result UUID remains unchanged. A separate installed Codex 0.160.1 app-server read that same AGY checkpoint through the permanent global entry, without a model turn or mutation.
-
-The coordinator independently checked canonical state and all 11 public plan events. Both checkpoints include actual observations and explicit reassessment. All 30 per-plan table digests for the two original plans match the baseline; only the labelled acceptance plan was added. The successful native client processes, their observed sidecars and owned terminals are settled. The permanent Compose service and named MCP rule remain running/installed independently of those sessions.
-
-The AGY launch retained `--mode accept-edits` and `--sandbox`; native initialization exposed permission mode `request-review`. Backend effort and the negotiated native AGY MCP protocol were not exposed and are not inferred. These are CLI checkpoint/continuation observations, not IDE/Desktop or Mac sleep/reboot tests. Earlier Codex/Compose lifecycle evidence remains bounded to its recorded image and identical backend bytes. Stopped monitor/fixture attempts are retained separately; they made no plan mutations or permission changes.
-
-The private final receipt and backups are retained under `/Users/aaat/.local/state/adaptive-planning/activation-20261013T190952Z/`. The verified production source, final image, 829-test Python result, 14 frontend scenarios, independent review and activation evidence above remain applicable. No code changed during this final native acceptance check. The development branch/worktree is retained for later integration.
+See the [dated release verification](release-verification.md). These historical
+results do not establish activation or runtime acceptance for another installation.

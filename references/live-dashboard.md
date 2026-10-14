@@ -1,8 +1,8 @@
 # Live dashboard
 
 The live dashboard provides real-time visualization of the canonical adaptive plan.
-In configured environments, the shared adaptive-planning MCP service provides the
-authoritative dashboard at `http://127.0.0.1:8790/`.
+The selected adaptive-planning MCP instance provides the authoritative
+dashboard for its plans. Discover its URLs through that connection.
 Apply the Plan language policy in [SKILL.md](../SKILL.md#plan-language).
 
 Review new authored text with `simplified-technical-english` before publishing.
@@ -24,10 +24,61 @@ or authorize work.
 
 ## Service mode default and per-task server policy
 
-In shared service mode, the central service is the single coordination authority.
-The live dashboard link (http://127.0.0.1:8790/) is the default for plan visualization and status reporting.
+### Select and retain one instance
+
+Each plan has one selected service instance. Clients of that instance share
+its canonical saved state. Independent instances do not automatically share
+plans, grants, events, or resource reservations. Operators must coordinate
+physical resources that are used through different instances.
+
+For a new plan, apply this selection order:
+
+1. Use the configured MCP entry explicitly selected for the task.
+2. Otherwise, use an applicable private project preference.
+3. Otherwise, use an applicable private user preference.
+4. Otherwise, use the single configured service, whether local or remote.
+5. If several services remain eligible, ask the user to select an entry.
+   Ask before creating a plan.
+6. If no service is configured, report the configuration gap.
+
+If the selected or preferred entry is missing or unavailable, report the gap.
+Ask before selecting another instance for a new plan. Do not silently fall back.
 Shared service mode prohibits launching a separate per-task or per-session fallback server.
-Provide the dashboard link (`http://127.0.0.1:8790/`) in status updates by default.
+
+Use `read_service_info` through the selected MCP connection.
+Use its `dashboard_url` for service links and its returned plan URLs for plan links.
+The URL `http://127.0.0.1:8790/` is a local example. Deployment configuration
+owns the actual addresses. Shared instructions state the selection rule.
+Private project or user instructions, or memory, can name a preferred
+configured entry for new plans. Do not put credentials in those instructions.
+
+Retain the configured MCP entry, `host_id`, last observed `epoch`, and
+`plan_id` in private task/session working records. These are working-record
+fields, not new service schema fields. Retain an existing plan's binding
+when a preference changes. An explicit move needs a separate migration
+decision. This workflow does not provide migration or replication.
+
+Before resuming, read service identity through the bound connection and read
+the expected `plan_id`. For aliases of one service, compare `(host_id, epoch)`
+through trusted configured connections. A URL or `host_id` alone does not
+establish identity. These checks do not provide cryptographic proof against
+an unauthorized copied database. Do not create duplicate canonical plans
+through different aliases.
+
+If the bound service retains its `host_id` but changes its `epoch`, reread
+ownership, holds, and events. Follow the existing restore/recovery rules
+before publishing. An epoch change does not authorize a move.
+If the bound endpoint returns an unexpected `host_id`, stop publication.
+Stop plan mutations. Report the identity mismatch. Obtain an explicit
+recovery or migration decision before continuing.
+
+During an outage, retain that plan's binding and last-known state.
+Do not create a competing authority for that plan. Deliberately configured
+independent instances can still serve other plans. An already assigned
+bounded worker can finish local verification and retain unpublished evidence.
+New assignments and dependents of the unavailable plan wait.
+
+Provide the advertised dashboard or plan link in status updates by default.
 ASCII plan visualization requires an explicit request and is never emitted by default.
 Do not emit ASCII maps unless the user explicitly requests them.
 
@@ -51,7 +102,7 @@ and supported stopped-use evidence.
 ## Outage policy and unavailable behavior
 
 When the shared service or Docker daemon is temporarily unavailable (e.g., host reboot,
-maintenance, Mac sleep, or network interruption):
+maintenance, host sleep, or network interruption):
 
 During a service outage, an assigned bounded worker finishes verification and retains unpublished evidence locally while new assignments and dependent steps wait.
 Completing a named step and its verification requires publishing a structured checkpoint with evidence and reassessment.
@@ -63,7 +114,8 @@ Completing a named step and its verification requires publishing a structured ch
    Downstream dependent steps and new assignments must wait for service restoration.
 3. **No spawned fallback server or competing plans:**
    Shared service mode prohibits launching a separate per-task or per-session fallback server.
-   Do not launch a temporary fallback server or write competing local canonical plans.
+   Do not launch a temporary fallback server or write competing local canonical plans
+   for that plan. Deliberately configured independent instances can serve other plans.
    Report the last published revision as **LAST KNOWN**, offline/stale while the
    service is unavailable; it remains the authoritative public reference.
 4. **Reconnection, same-key retry, and reconcile:**

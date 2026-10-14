@@ -83,10 +83,59 @@ governing specifications and protected source wording.
 
 ## Authoritative state and coordination
 
-In configured environments, the shared adaptive-planning MCP service
-is the default authoritative coordination authority (dashboard at
-`http://127.0.0.1:8790/`). Shared service mode prohibits launching a separate per-task or per-session fallback server.
+### Select and retain one instance
 
+Each plan has one selected service instance. Clients of that instance share
+its canonical saved state. Independent instances do not automatically share
+plans, grants, events, or resource reservations. Operators must coordinate
+physical resources that are used through different instances.
+
+For a new plan, apply this selection order:
+
+1. Use the configured MCP entry explicitly selected for the task.
+2. Otherwise, use an applicable private project preference.
+3. Otherwise, use an applicable private user preference.
+4. Otherwise, use the single configured service, whether local or remote.
+5. If several services remain eligible, ask the user to select an entry.
+   Ask before creating a plan.
+6. If no service is configured, report the configuration gap.
+
+If the selected or preferred entry is missing or unavailable, report the gap.
+Ask before selecting another instance for a new plan. Do not silently fall back.
+Shared service mode prohibits launching a separate per-task or per-session fallback server.
+
+Use `read_service_info` through the selected MCP connection.
+Use its `dashboard_url` for service links and its returned plan URLs for plan links.
+The URL `http://127.0.0.1:8790/` is a local example. Deployment configuration
+owns the actual addresses. Shared instructions state the selection rule.
+Private project or user instructions, or memory, can name a preferred
+configured entry for new plans. Do not put credentials in those instructions.
+
+Retain the configured MCP entry, `host_id`, last observed `epoch`, and
+`plan_id` in private task/session working records. These are working-record
+fields, not new service schema fields. Retain an existing plan's binding
+when a preference changes. An explicit move needs a separate migration
+decision. This workflow does not provide migration or replication.
+
+Before resuming, read service identity through the bound connection and read
+the expected `plan_id`. For aliases of one service, compare `(host_id, epoch)`
+through trusted configured connections. A URL or `host_id` alone does not
+establish identity. These checks do not provide cryptographic proof against
+an unauthorized copied database. Do not create duplicate canonical plans
+through different aliases.
+
+If the bound service retains its `host_id` but changes its `epoch`, reread
+ownership, holds, and events. Follow the existing restore/recovery rules
+before publishing. An epoch change does not authorize a move.
+If the bound endpoint returns an unexpected `host_id`, stop publication.
+Stop plan mutations. Report the identity mismatch. Obtain an explicit
+recovery or migration decision before continuing.
+
+During an outage, retain that plan's binding and last-known state.
+Do not create a competing authority for that plan. Deliberately configured
+independent instances can still serve other plans. An already assigned
+bounded worker can finish local verification and retain unpublished evidence.
+New assignments and dependents of the unavailable plan wait.
 
 Distinguish the authoritative MCP coordination state from other project
 artifacts:
@@ -208,7 +257,7 @@ Superpowers sequence is required.
 ## Outage policy and unavailable behavior
 
 When the shared MCP service or dashboard is temporarily unavailable
-(e.g., host reboot, Docker maintenance, Mac sleep, or connection drop):
+(e.g., host reboot, Docker maintenance, host sleep, or connection drop):
 
 During a service outage, an assigned bounded worker finishes verification and retains unpublished evidence locally while new assignments and dependent steps wait.
 
@@ -224,7 +273,8 @@ During a service outage, an assigned bounded worker finishes verification and re
 3. **No spawned fallback server or competing plans:**
    Shared service mode prohibits launching a separate per-task or per-session fallback server.
    Do not launch a per-task fallback server or create competing canonical
-   plan files. Report the last published revision as **LAST KNOWN** and
+   plan files for that plan. Independent instances can serve other plans.
+   Report the last published revision as **LAST KNOWN** and
    offline/stale while the service is unavailable. It remains the
    authoritative public reference. Legacy file mode is an explicit
    compatibility mechanism for isolated environments, never an outage
@@ -256,7 +306,7 @@ the requested boundary, awaits input, or is complete.
 
 ### Dashboard link and ASCII view
 
-- **Default dashboard link**: The live dashboard link (http://127.0.0.1:8790/) is the default for plan visualization and status reporting. By default, include the link to the live dashboard (`http://127.0.0.1:8790/`) in progress updates so users can inspect the real-time plan state.
+- **Default dashboard link**: Use the connected service's `dashboard_url` from `read_service_info` for plan visualization and status reporting, and its returned plan URLs for plan-specific links. Include the advertised live dashboard link in progress updates so users can inspect the real-time canonical plan state. Do not force a localhost URL on a remote client or start a session-hosted fallback server.
 - **ASCII plan view on explicit request only**: ASCII plan visualization requires an explicit request and is never emitted by default. Render an ASCII plan map only upon explicit request from the user. Do not include ASCII maps by default. When explicitly requested, use plain ASCII in a fenced
   block with standard markers (`[x]` complete, `[>]` in progress,
   `[ ]` pending, `[!]` blocked, `[-]` retired) derived strictly from

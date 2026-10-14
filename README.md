@@ -93,8 +93,8 @@ updated as you execute and verify each step.
 You can also give the agent the path to [SKILL.md](SKILL.md). Shared persistent
 MCP is the default for agents, with stable dashboard URLs first, canonical
 MCP saved state, and no per-task server; see [docs/operations.md](docs/operations.md)
-and client guides for [Codex](docs/clients/codex.md) and
-[Antigravity](docs/clients/antigravity.md). The server owns saved state, not
+and client guides for [Codex](docs/clients/codex.md),
+[Antigravity](docs/clients/antigravity.md), and [Copilot](docs/clients/copilot.md). The server owns saved state, not
 models, dispatch, or Superpowers methodology; the agent follows its chosen
 workflow and records checkpoints and feedback.
 
@@ -115,9 +115,38 @@ Without the official dictionary and governed terminology, the output is
 an Issue 9-oriented candidate. Full conformance is not verified.
 The initial plan includes a compact language verification note.
 Later updates report new unresolved items or changes in the evidence mode.
+For clients on a trusted local network, see [optional LAN access](docs/operations.md#optional-trusted-lan-access).
+Choose the Docker host's private address in a private `.env` using [.env.example](.env.example),
+preserve the existing deployment's Compose project, and give clients the resulting server URL.
 
 Checkpoints use concise prose; ASCII dependency maps are provided only on
 explicit request.
+
+## Select a service instance
+
+Configure each service with a distinct MCP entry in the client's private
+configuration. A plan retains its selected instance across sessions.
+For a new plan, selection follows the explicit task choice, private project
+preference, private user preference, then the single configured service.
+Ask when several services remain eligible. Report a missing or unavailable
+selection before choosing another instance. Discover links with
+`read_service_info` and `dashboard_url` through that selected connection.
+See the [selection and resume rules](SKILL.md#select-and-retain-one-instance).
+
+Clients of one instance share its saved state. Independent instances have
+separate databases and credentials. They do not synchronize plans, grants,
+events, or resource reservations. Operators must coordinate resources that
+are used through more than one instance.
+
+Instances on separate Docker hosts can use the same default port.
+On one host, use distinct published ports and data volumes. The explicit
+default volume name `adaptive-planning-data` is not isolated by a different
+Compose project name. See [independent deployments](docs/operations.md#independent-deployments)
+before initializing another instance.
+
+Actual addresses belong in private deployment/client configuration.
+Generic agent instructions can state the selection rule. A private preference
+can name a configured entry for new plans; it does not move an existing plan.
 
 ## Dashboard boundaries
 

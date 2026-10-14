@@ -1,27 +1,62 @@
 # Antigravity client setup
 
-The service MCP endpoint is `http://127.0.0.1:8790/mcp`; the dashboard is
-`http://127.0.0.1:8790/`. Antigravity's documented remote entry uses `serverUrl`
-and a literal header in its user MCP configuration:
+Antigravity's documented remote entries use `serverUrl` and literal headers
+in its private user MCP configuration. CLI and IDE are separate test surfaces.
 
-These setup instructions retain Task 10 preparation; Task 20 source verification
-does not refresh installed versions, activate configuration or prove the actual
-Antigravity call surface. The example below remains synthetic.
+## Select and resume an instance
+
+The examples below use two distinct named connections. The loopback URL is
+a local example. `192.168.1.10` is a synthetic RFC1918 address, not a deployment
+requirement. Replace each example URL with the operator-supplied endpoint.
+Provision each installation's own bearer credential privately.
+
+Use the [instance selection and resume rules](../../SKILL.md#select-and-retain-one-instance).
+For a new plan, an explicit task choice precedes a private project preference,
+then a private user preference, then the single configured instance.
+Ask before creating a plan when several services remain eligible.
+If a selected or preferred entry is missing or unavailable, report the gap.
+Ask before selecting another instance for a new plan.
+Do not silently fall back. Report a missing configuration when none is available.
+
+For new and resumed plans, use `read_service_info` through the selected MCP entry.
+Use its `dashboard_url` and returned plan URLs.
+
+For an existing plan, retain its MCP entry, `host_id`, last observed `epoch`,
+and `plan_id` in a private task/session working record.
+Read the expected plan before resuming. Compare `(host_id, epoch)` for aliases
+through trusted connections; a URL or host ID alone is insufficient.
+Do not create duplicate canonical plans through different aliases.
+These checks do not provide cryptographic proof against copied databases.
+Follow restore/recovery on an epoch change with the same host ID.
+Stop plan mutations on an unexpected host ID. Obtain an explicit recovery
+or migration decision. A preference change does not move an existing plan.
+
+Independent instances do not automatically share plans, grants, events, or
+resource reservations. During an outage, retain the affected plan's authority.
+Its assigned bounded worker can retain unpublished local verification;
+new assignments and dependents wait. Other deliberately configured instances
+can serve other plans. Operators coordinate resources across instances.
 
 ```json
 {
   "mcpServers": {
-    "adaptivePlanning": {
+    "adaptivePlanningLocal": {
       "serverUrl": "http://127.0.0.1:8790/mcp",
       "headers": {
         "Authorization": "Bearer SYNTHETIC_ONLY"
+      }
+    },
+    "adaptivePlanningRemote": {
+      "serverUrl": "http://192.168.1.10:8790/mcp",
+      "headers": {
+        "Authorization": "Bearer SYNTHETIC_REMOTE_ONLY"
       }
     }
   }
 }
 ```
 
-This is a synthetic documentation example. Never install `SYNTHETIC_ONLY` in real
+This is a synthetic documentation example. Never install synthetic placeholders in real
 client configuration. The [official MCP documentation](https://antigravity.google/docs/mcp?tab=cli)
 does not give a remote-header environment interpolation guarantee. Do not assume
 that `${ADAPTIVE_PLANNING_TOKEN}` expands, or infer that interpolation is impossible
@@ -48,6 +83,25 @@ planning tools, read installation info and the canonical shared plan, commit a
 planning-only revision with a distinct fact, and expose that event through the
 same dashboard. Record the negotiated MCP protocol rather than assuming a
 version. An SDK session does not establish Antigravity acceptance.
+
+## Optional remote LAN connection
+
+After the operator enables the [LAN overlay](../operations.md#optional-trusted-lan-access),
+obtain the instance's exact endpoint. The stock overlay uses port 8790.
+Set `serverUrl` in the selected remote entry to that base URL followed by `/mcp`.
+Keep a separate local entry intact. The server's `.env` does not populate client
+configuration. Do not assume interpolation in a static JSON `serverUrl` or
+the literal `headers` value.
+
+Provision the remote instance's bearer privately in its selected header.
+Preserve unrelated entries and settings. Keep the configuration private using
+the host's access controls. Changing an endpoint does not move existing plans.
+Apply the selection and identity rules above before plan mutations.
+
+Freshly discover tools and call `read_service_info` through that entry.
+Use its advertised dashboard and plan URLs. Plain HTTP is a trusted-LAN mode.
+Dashboard reads are public on that network; MCP and mutations require bearer
+authentication. These examples do not prove installed CLI or IDE acceptance.
 
 ## Instruction contract, domain grants, and session lifecycle
 
@@ -97,10 +151,11 @@ Safe pause relays truthfully record state without fabricating completion.
 If the MCP service or dashboard becomes unavailable during execution:
 - An assigned bounded worker finishes verification locally and retains unpublished evidence in its private working record.
 - New assignments and dependents wait.
-- Do not spawn a fallback server or create a new canonical plan. Report the last published revision as **LAST KNOWN**, offline/stale while the service is unavailable.
+- Do not spawn a fallback server or create a competing authority for this plan.
+  Deliberately configured independent instances can serve other plans. Report the last published revision as **LAST KNOWN**, offline/stale while the service is unavailable.
 - On recovery, reread service identity, events, ownership, and coordination before publishing retained evidence. Retain the original immutable command body and request key and retry that exact saved command without rebuilding metadata or payload. Reconcile epoch, generation, ownership, attempt version, and holds; fenced or stale commands need explicit owner recovery. Reread after publication or replay before dispatching work.
 
-## Worker checkpoints and the remaining client gate
+## Worker checkpoints and client verification
 
 Keep the installation bearer separate from the private owner and attempt grants.
 Assignment returns the worker's attempt grant. A direct start/activity/checkpoint
@@ -126,26 +181,15 @@ review where required. Scope is not renewed by discovery, readiness or holds;
 `plan-only` still refuses execution. See the [worker gate](../operations.md#two-client-worker-checkpoint-gate)
 for the current 29-tool source catalog (six reads and 23 mutations), with no
 disabled future kinds, and complete recording requirements. The catalog has
-synthetic SDK evidence; genuine installed Antigravity discovery and acceptance
-remain unverified.
+synthetic SDK evidence; installed-client observations have the [dated coverage limits](../release-verification.md).
 
-The Task 20 source test uses three synthetic official SDK clients in each of auto
-`2026-07-28` and legacy `2025-11-25`; `agy-worker` does not show AGY or a Google
-model ran. Genuine Antigravity finished-worker and close/reopen/service-restart/
-container-recreation checks remain **NOT RUN**, with **0** actual client runs
-and full Task 20 acceptance **false**. Task 10 planning evidence and historical
-version information do not fill these rows. Record actual surface/version,
-negotiation, shared plan, checkpoint sequence and acceptance/review IDs only
-from an authorized installed-client observation; preserve any allowance or call
-capability gap without retrying exhausted providers.
+Historical SDK fixtures use synthetic actor labels. They do not establish
+installed-client acceptance. See the [source and client coverage limits](../release-verification.md).
+Verify the actual surface, installed version, tool discovery and checkpoint
+flow without treating earlier evidence as a fresh installation check.
 
+## Historical client verification
 
-## Global entry prepared, 2026-10-13
-
-The private global `adaptivePlanning` entry now points to the running local service, with the five unrelated server entries preserved and the credential kept in a mode-0600 file under a mode-0700 parent. AGY CLI 1.3.4 successfully completed ordinary read-only Gemini 4 Argon High access qualification and independent code review through Orca. These were source/evidence reviews, not MCP planning calls. Fresh genuine AGY checkpoint/resume acceptance remains pending explicit approval of the persistent `mcp(adaptivePlanning/*)` rule; AGY permission settings are unchanged. See the [dated local activation evidence](../operations.md#local-activation-evidence-2026-10-13).
-
-## Native CLI checkpoint and continuation, 2026-10-13
-
-The later [native client acceptance record](../operations.md#native-client-acceptance-completed-2026-10-13) supersedes the pending rule/checkpoint labels above. The explicitly approved named-server rule is now installed. Two fresh AGY 1.3.4 Flash High conversations used the permanent native MCP entry: the first accepted A and exited; the second read its saved checkpoint, acquired a fresh owner grant, bound the exact accepted observation and accepted dependent B. The labelled acceptance plan is complete at revision 10. The coordinator checked the actual native calls, public events, original-plan preservation and settled processes/terminals.
-
-This proves the recorded CLI checkpoint/continuation flow. It does not claim a fresh 29-operation AGY exercise, a negotiated protocol value that native output did not expose, or IDE/Desktop and OS sleep/reboot behavior. Prior restart/container-recreation observations retain their recorded client/image boundaries. The private installation bearer and owner/attempt grants remain outside public receipts.
+See the [dated release verification](../release-verification.md).
+These source and CLI observations apply only to their recorded versions and
+flows. Verify the selected installed client surface before accepting setup.
