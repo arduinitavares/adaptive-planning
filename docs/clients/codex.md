@@ -59,6 +59,41 @@ does not provide a negotiated `protocolVersion` field. The public
 calls, but schema availability alone does not prove installed runtime dispatch,
 gating or inference-free behavior. Verify that route before using it for the gate.
 
+## Optional Windows LAN connection
+
+After the Docker host's [LAN overlay](../operations.md#optional-trusted-lan-access)
+is enabled, obtain its base server URL from the operator. It must use the actual
+private host address configured in the server's `.env`, port 8790, and no
+trailing slash. Existing local loopback entries keep working. For a new Windows
+Codex CLI entry, enter that supplied URL in PowerShell:
+
+```powershell
+$env:ADAPTIVE_PLANNING_SERVER_URL = Read-Host "Base server URL supplied by the operator"
+codex mcp add adaptivePlanning --url "$env:ADAPTIVE_PLANNING_SERVER_URL/mcp" --bearer-token-env-var ADAPTIVE_PLANNING_TOKEN
+```
+
+To use the user TOML example above on Windows, set `url` to the actual supplied
+base URL followed by `/mcp`, as a literal string, and retain
+`bearer_token_env_var = "ADAPTIVE_PLANNING_TOKEN"` in `[mcp_servers.adaptivePlanning]`.
+The server's `.env` does not populate client configuration. PowerShell expands
+the URL in the CLI command; do not assume `.env` or environment interpolation
+in a static TOML `url` field.
+
+If the entry already exists, update its URL while preserving unrelated entries
+and settings. Privately provision the existing service bearer into
+`ADAPTIVE_PLANNING_TOKEN` in the actual Windows CLI process environment before
+launch. Do not put the bearer in command arguments or repository files. Desktop
+and IDE environment provisioning require their own verification, as described
+above. Once connected, freshly discover tools and call `read_service_info`;
+compare the installation identity with the operator's existing deployment and
+use its advertised dashboard URL.
+
+Any device on the trusted LAN can read that dashboard. MCP and mutations require
+the service bearer. Plain HTTP is trusted-LAN-only, not internet exposure.
+These are connection examples dated 2026-10-13; they do not establish real
+Windows CLI, Desktop, or IDE acceptance. Preserve the existing dated local
+acceptance scope below.
+
 ## Instruction contract, domain grants, and session lifecycle
 
 Codex operates under the generic framework-neutral instruction contract:

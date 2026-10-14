@@ -1,0 +1,6 @@
+services:
+  adaptive-planning:
+    environment:
+      ADAPTIVE_PLANNING_LAN_BASE_URL: "http://${ADAPTIVE_PLANNING_LAN_IP:?Set ADAPTIVE_PLANNING_LAN_IP to the host RFC1918 IPv4 address}:8790"
+    ports:
+      - "${ADAPTIVE_PLANNING_LAN_IP:?Set ADAPTIVE_PLANNING_LAN_IP to the host RFC1918 IPv4 address}:8790:8790"

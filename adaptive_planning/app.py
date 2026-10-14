@@ -13,7 +13,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Mount
 
 from adaptive_planning.admin import load_service_token,resolve_store_hold
-from adaptive_planning.config import Config, DEFAULT_STALE_SECONDS, RequestBoundary, http_allowlist
+from adaptive_planning.config import Config, DEFAULT_STALE_SECONDS, RequestBoundary, http_allowlists
 
 from adaptive_planning import attempts, checkpoints, imports, plans, recovery, resources, reviews
 from adaptive_planning.ownership import command_relay, require_kind_capabilities, require_orchestrator
@@ -172,17 +172,18 @@ def build_app(config: Config) -> Starlette:
 
 
 def _compose_app(config, token, clock, store):
-    service = PlanningService(store, base_url=config.base_url, clock=clock,
+    service = PlanningService(store, base_url=config.lan_base_url or config.base_url, clock=clock,
                               stale_seconds=config.stale_seconds)
     from adaptive_planning.transport import MCPHttpErrors, MCPServerDiagnostics, build_mcp, mcp_server_diagnostics
     from adaptive_planning.dashboard import dashboard_routes
     server = build_mcp(service)
-    allowed_host, allowed_origin = http_allowlist(config)
+    allowed_pairs = http_allowlists(config)
     mcp_app = server.streamable_http_app(
         streamable_http_path="/mcp", json_response=True, stateless_http=True,
         max_request_body_size=12 * 1024 * 1024,
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True,
-                                                    allowed_hosts=[allowed_host], allowed_origins=[allowed_origin]),
+                                                    allowed_hosts=[host for host, _ in allowed_pairs],
+                                                    allowed_origins=[origin for _, origin in allowed_pairs]),
         host="0.0.0.0",
     )
 

@@ -49,6 +49,41 @@ planning-only revision with a distinct fact, and expose that event through the
 same dashboard. Record the negotiated MCP protocol rather than assuming a
 version. An SDK session does not establish Antigravity acceptance.
 
+## Optional Windows LAN connection
+
+After the Docker host's [LAN overlay](../operations.md#optional-trusted-lan-access)
+is enabled, obtain its base server URL from the operator. It must use the actual
+private host address configured in the server's `.env`, port 8790, and no
+trailing slash. In PowerShell, enter that supplied URL and derive the MCP URL:
+
+```powershell
+$env:ADAPTIVE_PLANNING_SERVER_URL = Read-Host "Base server URL supplied by the operator"
+$mcpUrl = "$env:ADAPTIVE_PLANNING_SERVER_URL/mcp"
+```
+
+Configure the Windows Antigravity CLI's user MCP entry using the JSON example
+above. In `mcpServers.adaptivePlanning`, set `serverUrl` to the actual evaluated
+`$mcpUrl` value as a literal string and retain the `headers` shape
+`{"Authorization": "Bearer SYNTHETIC_ONLY"}` until privately provisioning the
+service bearer. PowerShell does not update the JSON automatically; the server's
+`.env` does not populate client configuration. Do not assume `.env` or
+environment interpolation in a static JSON `serverUrl` field.
+
+Privately replace the placeholder with the existing service bearer in the actual
+Windows CLI user configuration. Preserve unrelated entries and keep that file
+private using the host's access controls. Do not use a real-token CLI command
+or assume environment interpolation in `headers`. If switching an existing
+entry, retain its other settings. Existing local loopback entries need no changes.
+
+Freshly discover tools and call `read_service_info` through the installed CLI;
+compare its installation identity with the operator's existing deployment and
+use the advertised dashboard URL. Any device on the trusted LAN can read the
+dashboard. MCP and mutations require the service bearer. Plain HTTP is a
+trusted-LAN-only mode, not internet exposure; Jump Desktop is not the transport.
+
+These are connection examples dated 2026-10-13, not evidence of real Windows
+CLI or IDE acceptance. The dated local results below retain their existing scope.
+
 ## Instruction contract, domain grants, and session lifecycle
 
 Antigravity executes under the generic framework-neutral instruction contract:

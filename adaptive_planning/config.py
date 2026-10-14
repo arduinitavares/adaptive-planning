@@ -7,6 +7,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from ipaddress import IPv4Address, IPv4Network
 from pathlib import Path
 from typing import Mapping
 
@@ -20,6 +21,7 @@ DEFAULT_STALE_SECONDS = 900
 
 ENV_DATA_DIR = "ADAPTIVE_PLANNING_DATA_DIR"
 ENV_BASE_URL = "ADAPTIVE_PLANNING_BASE_URL"
+ENV_LAN_BASE_URL = "ADAPTIVE_PLANNING_LAN_BASE_URL"
 ENV_STALE_SECONDS = "ADAPTIVE_PLANNING_STALE_SECONDS"
 
 _LOG = logging.getLogger("adaptive_planning.http")
@@ -33,6 +35,8 @@ _PUBLIC_MESSAGES = {
     "internal_error": "The request could not be completed.",
 }
 _BASE_URL = re.compile(r"http://(127\.0\.0\.1|localhost):([1-9][0-9]{0,4})")
+_LAN_BASE_URL = re.compile(r"http://([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([1-9][0-9]{0,4})")
+_LAN_NETWORKS = tuple(IPv4Network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
 _POSITIVE_INTEGER = re.compile(r"[1-9][0-9]*")
 
 
@@ -46,11 +50,14 @@ class Config:
     data_dir: Path
     base_url: str = DEFAULT_BASE_URL
     stale_seconds: int = DEFAULT_STALE_SECONDS
+    lan_base_url: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.data_dir, Path):
             raise _invalid_config("data_dir must be a path.")
-        _parse_base_url(self.base_url)
+        _, local_port = _parse_base_url(self.base_url)
+        if self.lan_base_url is not None:
+            _parse_lan_base_url(self.lan_base_url, local_port)
         if isinstance(self.stale_seconds, bool) or not isinstance(self.stale_seconds, int) or self.stale_seconds < 1:
             raise _invalid_config("stale_seconds must be a positive integer.")
 
@@ -76,13 +83,41 @@ def load_config(environment: Mapping[str, str]) -> Config:
         Path(data_dir),
         environment.get(ENV_BASE_URL, DEFAULT_BASE_URL),
         DEFAULT_STALE_SECONDS if stale is None else int(stale),
+        environment.get(ENV_LAN_BASE_URL),
     )
 
 
 def http_allowlist(config: Config) -> tuple[str, str]:
-    """Return the only accepted Host header value and the only accepted Origin."""
+    """Return the configured loopback Host/Origin pair (the single-pair API)."""
     hostname, port = _parse_base_url(config.base_url)
     return f"{hostname}:{port}", f"http://{hostname}:{port}"
+
+
+def _parse_lan_base_url(base_url: object, local_port: int) -> tuple[str, int]:
+    message = (
+        "lan_base_url must be plain HTTP with a canonical RFC1918 IPv4 address and the local port, "
+        "with no userinfo, path, query or fragment."
+    )
+    match = _LAN_BASE_URL.fullmatch(base_url) if isinstance(base_url, str) else None
+    if match is None or int(match.group(2)) > 65535 or int(match.group(2)) != local_port:
+        raise _invalid_config(message)
+    try:
+        address = IPv4Address(match.group(1))
+    except ValueError:
+        raise _invalid_config(message) from None
+    if not any(address in network for network in _LAN_NETWORKS):
+        raise _invalid_config(message)
+    return str(address), int(match.group(2))
+
+
+def http_allowlists(config: Config) -> tuple[tuple[str, str], ...]:
+    """Return exact matched Host/Origin pairs for local and optional LAN access."""
+    local = http_allowlist(config)
+    if config.lan_base_url is None:
+        return (local,)
+    _, local_port = _parse_base_url(config.base_url)
+    hostname, port = _parse_lan_base_url(config.lan_base_url, local_port)
+    return local, (f"{hostname}:{port}", f"http://{hostname}:{port}")
 
 
 def _digest(value: bytes) -> bytes:
@@ -116,7 +151,7 @@ class RequestBoundary:
         if not isinstance(token, str) or not token:
             raise _invalid_config("A service credential is required.")
         self._app = app
-        self._host, self._origin = http_allowlist(config)
+        self._origins_by_host = dict(http_allowlists(config))
         self._token_digest = _digest(token.encode("utf-8"))
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -175,7 +210,8 @@ class RequestBoundary:
         if any(name in _FORWARDING_HEADERS or name.startswith(b"x-forwarded-") for name in headers):
             return 403, "forwarded_rejected"
         origins = headers.get(b"origin", [])
-        if origins and (len(origins) != 1 or origins[0] != self._origin.encode()):
+        expected_origin = self._origins_by_host[hosts[0].decode("ascii").lower()]
+        if origins and (len(origins) != 1 or origins[0] != expected_origin.encode()):
             return 403, "invalid_origin"
         if self._needs_bearer(scope, method, kind) and not self._is_authorized(headers.get(b"authorization", [])):
             return 401, "unauthorized"
@@ -183,7 +219,7 @@ class RequestBoundary:
 
     def _is_host(self, value: bytes) -> bool:
         try:
-            return value.decode("ascii").lower() == self._host
+            return value.decode("ascii").lower() in self._origins_by_host
         except UnicodeDecodeError:
             return False
 

@@ -2,7 +2,7 @@
 
 Run these commands from the directory containing `compose.yaml`, using Docker
 Engine 28 or newer and Docker Compose. The service listens on `0.0.0.0:8790`
-inside its container; Compose publishes only `127.0.0.1:8790` on the host.
+inside its container; the default Compose file publishes only `127.0.0.1:8790` on the host.
 The dashboard is at `http://127.0.0.1:8790/` and the authenticated MCP endpoint
 is `http://127.0.0.1:8790/mcp`.
 
@@ -49,6 +49,108 @@ never generates a credential. The credential is not passed through build argumen
 layers, Compose environment variables, or the URL. Configure trusted MCP clients
 with the existing credential through a private local channel; do not print it or
 put it in logs, shell history, source files, or shared client configuration.
+
+## Optional trusted-LAN access
+
+LAN access is opt-in through `compose.lan.yaml` on any Docker host. Choose that
+host's actual RFC1918 private IPv4 address in a private `.env`; the overlay adds
+that exact address on port 8790 alongside the existing `127.0.0.1:8790:8790`
+mapping. Any device on that trusted LAN can read the dashboard at the chosen
+`http://<host-private-IP>:8790/` URL. MCP at the same base URL plus `/mcp` and
+mutations require the service bearer.
+Plain HTTP is a trusted-LAN-only mode, not internet exposure. Do not publish
+the port on a global host address or forward it from the internet. Clients
+connect directly over the LAN; Jump Desktop is not the transport.
+
+Before any build, update, or start, record the existing service's Compose project
+name (from its `com.docker.compose.project` container label) and confirm that
+its `/data` mount uses the installation's `adaptive-planning-data` volume.
+Preserve both identities. Do not start a second service or initialize another
+installation. From the existing checkout, copy the example only if no `.env`
+already exists:
+
+```sh
+if [ ! -e .env ]; then cp .env.example .env; fi
+```
+
+Edit the private `.env` to set `ADAPTIVE_PLANNING_LAN_IP` to the Docker host's
+actual address (`10/8`, `172.16/12`, or `192.168/16`). The example leaves it empty
+so LAN exposure requires an operator choice. If the existing deployment used a
+project override, uncomment `COMPOSE_PROJECT_NAME` and set it to that exact
+existing name. If it used the default project name, retain the same project
+directory and default identity. Keep installation values and credentials out of
+tracked files; `.env.example` contains only generic settings.
+
+Docker Compose loads `.env` for configuration interpolation. The commands here
+select it explicitly with `--env-file .env`; use `--env-file <private-file>` for
+another private file. Shell variables override file values, so clear stale
+exported LAN or project settings or align them deliberately. A `-p` option
+overrides `COMPOSE_PROJECT_NAME`; if used, it must name the existing project.
+See Docker's [interpolation rules](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/)
+and [project-name rules](https://docs.docker.com/compose/how-tos/project-name/).
+
+```sh
+docker compose --env-file .env -f compose.yaml -f compose.lan.yaml config
+```
+
+Before starting, inspect the merged configuration: its project name must match
+the existing deployment, and it must contain both exact host port mappings,
+the existing volume, the local base URL, and `ADAPTIVE_PLANNING_LAN_BASE_URL`
+equal to `http://<host-private-IP>:8790`. An absent or empty
+`ADAPTIVE_PLANNING_LAN_IP` fails overlay interpolation. `.env` is not passed
+wholesale into the container; the overlay's `environment` stanza explicitly
+maps the LAN base URL.
+
+Build the candidate image first using the existing
+[update and rollback procedure](#deployment-update-and-rollback), preserving the
+previous verified image and the same Compose project and volume. Record the new
+image ID before starting it. Only after that build, enable the overlay with:
+
+```sh
+docker compose --env-file .env -f compose.yaml -f compose.lan.yaml up -d --no-build --pull never adaptive-planning
+```
+
+Verify the running image ID and installation continuity as described in that
+procedure. Enabling LAN reuses the existing database and credential; it does
+not rotate or copy them.
+
+To stop the service while retaining its data:
+
+```sh
+docker compose --env-file .env -f compose.yaml -f compose.lan.yaml stop adaptive-planning
+```
+
+To disable LAN and resume the loopback-only configuration:
+
+```sh
+docker compose --env-file .env -f compose.yaml up -d --no-build --pull never --force-recreate adaptive-planning
+```
+
+Outside Compose, the Python service does not load `.env`; set
+`ADAPTIVE_PLANNING_LAN_BASE_URL` in its actual process environment to plain HTTP with one
+canonical RFC1918 IPv4 literal (`10/8`, `172.16/12`, or `192.168/16`) and an
+explicit port matching `ADAPTIVE_PLANNING_BASE_URL`. Paths, trailing slashes,
+credentials, queries, fragments, whitespace, DNS names, IPv6, wildcards, and
+other addresses are rejected. Leaving the LAN variable unset retains the
+default loopback-only boundary. The configured loopback URL remains accepted
+with LAN enabled, so existing local client entries need no changes. A supplied
+Origin must match the request's Host identity; forwarding headers and duplicate
+Host/Origin/Authorization values remain rejected, and no CORS grants are added.
+
+With LAN enabled, `read_service_info` and plan/dashboard links advertise the LAN
+URL to every client. Disabling LAN returns advertised links to the local URL;
+installation identity, plan IDs, and saved state remain shared. Provision the
+existing bearer privately on Windows using the [Codex](clients/codex.md#optional-windows-lan-connection)
+or [Antigravity CLI](clients/antigravity.md#optional-windows-lan-connection) examples.
+
+### LAN acceptance scope, 2026-10-13
+
+The LAN feature has automated coverage using a temporary database, synthetic
+credentials, and the official MCP SDK against a loopback listener carrying
+LAN Host/Origin headers. Actual Compose merge, deployment, Mac-to-Windows
+network reachability, and Windows CLI/IDE calls require separate coordinator
+verification. These instructions do not claim real Windows or IDE acceptance
+and do not extend earlier dated local-client results to LAN.
 
 ## Persistence and lifecycle
 

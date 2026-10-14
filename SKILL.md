@@ -31,9 +31,13 @@ renewal; execution boundaries remain strictly bound to user authorization.
 
 ## Authoritative state and coordination
 
-In configured environments, the shared adaptive-planning MCP service
-is the default authoritative coordination authority (dashboard at
-`http://127.0.0.1:8790/`). Shared service mode prohibits launching a separate per-task or per-session fallback server.
+In configured environments, the connected shared adaptive-planning MCP service
+is the default authoritative coordination authority. Read `read_service_info`
+and use its advertised `dashboard_url`; a local installation normally advertises
+`http://127.0.0.1:8790/`, while an installation with optional LAN access advertises
+its configured LAN URL. Remote clients must use that advertised URL rather than
+substitute their own localhost. All clients share the same canonical saved state.
+Shared service mode prohibits launching a separate per-task or per-session fallback server.
 
 
 Distinguish the authoritative MCP coordination state from other project
@@ -204,7 +208,8 @@ the requested boundary, awaits input, or is complete.
 
 ### Dashboard link and ASCII view
 
-- **Default dashboard link**: The live dashboard link (http://127.0.0.1:8790/) is the default for plan visualization and status reporting. By default, include the link to the live dashboard (`http://127.0.0.1:8790/`) in progress updates so users can inspect the real-time plan state.
+- **Default dashboard link**: Use the connected service's `dashboard_url` from `read_service_info` for plan visualization and status reporting, and its returned plan URLs for plan-specific links. Include the advertised live dashboard link in progress updates so users can inspect the real-time canonical plan state. Do not force a localhost URL on a remote client or start a session-hosted fallback server.
+- **Local installation default**: Only when the connected service advertises `http://127.0.0.1:8790/`, apply this local default: The live dashboard link (http://127.0.0.1:8790/) is the default for plan visualization and status reporting. For LAN installations, use the advertised LAN URL instead.
 - **ASCII plan view on explicit request only**: ASCII plan visualization requires an explicit request and is never emitted by default. Render an ASCII plan map only upon explicit request from the user. Do not include ASCII maps by default. When explicitly requested, use plain ASCII in a fenced
   block with standard markers (`[x]` complete, `[>]` in progress,
   `[ ]` pending, `[!]` blocked, `[-]` retired) derived strictly from

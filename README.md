@@ -92,6 +92,10 @@ and client guides for [Codex](docs/clients/codex.md) and
 models, dispatch, or Superpowers methodology; the agent follows its chosen
 workflow and records checkpoints and feedback.
 
+For clients on a trusted local network, see [optional LAN access](docs/operations.md#optional-trusted-lan-access).
+Choose the Docker host's private address in a private `.env` using [.env.example](.env.example),
+preserve the existing deployment's Compose project, and give clients the resulting server URL.
+
 Checkpoints use concise prose; ASCII dependency maps are provided only on
 explicit request. If the optional
 `caveman` and `pstack-plugin:unslop` writing skills are installed, the skill uses
