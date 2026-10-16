@@ -112,6 +112,12 @@ def _validate_checkpoint(value: Checkpoint, snapshot: dict[str, JSONValue], prio
     return [*prior_evidence, *formatted]
 
 
+def _require_consistent_checkpoint_reassessment(value: Reassessment) -> None:
+    """Reject contradictory NEW publication without reinterpreting durable historical sources."""
+    if value.disposition == "unchanged" and value.proposed_draft is not None:
+        raise DomainError("invalid", "Unchanged reassessment cannot propose a revised plan")
+
+
 def _active_target(connection: sqlite3.Connection, command: Command):
     """NEW-only currentness, without the assignment/start guards that would suppress held observations."""
     attempts.require_attempt(connection, command)
@@ -231,6 +237,7 @@ def record_checkpoint(connection: sqlite3.Connection, command: Command) -> Mutat
     value = _to_checkpoint(command.payload["checkpoint"])
     evidence = _validate_checkpoint(value, previous.legacy_snapshot, step.evidence)
     _require_new_artifact_version(connection, plan.plan_id, row[0], value.artifact)
+    _require_consistent_checkpoint_reassessment(value.reassessment)
     version, revision = row[4] + 1, plan.revision + 1
     activity_ts, ts = plans._timestamp(data["last_activity"]), plans._timestamp(plan.updated_at)
     checkpoint_json = plans.to_jsonable(value)
@@ -282,6 +289,7 @@ def _recovery_checkpoint(connection, command):
              "epoch": data["epoch"], "generation": data["generation"], "stale_source": marker,
              "source_graph": _graph(plan), "checkpoint": plans.to_jsonable(value)}
     _event_limits(event)
+    _require_consistent_checkpoint_reassessment(value.reassessment)
     cursor = connection.execute(
         "INSERT INTO events(plan_id,plan_revision,kind,actor,origin_worker,relay,published_at,payload) VALUES(?,?,?,?,?,?,?,?)",
         (plan.plan_id, revision, "recovery_checkpoint", command.actor, value.origin_worker, value.relay, ts,

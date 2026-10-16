@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+from adaptive_planning import checkpoints
 from adaptive_planning.app import PlanningService
 from adaptive_planning.types import DomainError, Evidence, ResourceClaim, Review
 from tests.service_fixtures import checkpoint, context, make_service, step, workspace
@@ -240,6 +241,45 @@ class TestService(unittest.TestCase):
         self.f.service.execute(command)
         self.assertFalse(self.view().coordination.holds)
         self.assertEqual(self.view().coordination.attempts[0].state, "active")
+
+    def test_recovery_unchanged_proposed_draft_is_rejected_atomically(self):
+        attempts = (("active", self.live()), ("assigned", self.f.assign(self.p, "b")))
+        self.f.clock.advance(901)
+        self.sweep()
+        for prior_state, active in attempts:
+            with self.subTest(prior_state=prior_state):
+                current = self.view().draft
+                for variant, proposed in (("identical", current), ("changed", replace(current, facts=("Revised recovery fact",)))):
+                    with self.subTest(variant=variant):
+                        value = checkpoint()
+                        value = replace(value, reassessment=replace(value.reassessment, proposed_draft=proposed))
+                        command = self.command("record_checkpoint", {"checkpoint": value}, attempt=active)
+                        self.refused(replace(command, attempt_version=1), "stale")
+                        relay = self.command("record_checkpoint", {"checkpoint": replace(value, relay="synthetic-orchestrator")},
+                                             attempt=active)
+                        self.refused(replace(relay, expected_revision=1), "conflict")
+                        self.refused(command, "invalid")
+
+    def test_legacy_recovery_unchanged_proposal_replays_and_resolves(self):
+        active = self.stale()
+        value = checkpoint()
+        value = replace(value, reassessment=replace(value.reassessment, proposed_draft=self.view().draft))
+        command = self.command("record_checkpoint", {"checkpoint": value}, attempt=active)
+        with patch.object(checkpoints, "_require_consistent_checkpoint_reassessment", return_value=None, create=True):
+            submitted = self.f.service.execute(command)
+        before = self.state()
+        self.assertTrue(self.f.service.execute(command).replayed)
+        self.assertEqual(self.state(), before)
+        for decision in ("reject", "apply"):
+            with self.subTest(decision=decision):
+                resolved = self.f.service.execute(self.command("resolve_reassessment", {
+                    "checkpoint_id": submitted.committed["recovery_event_id"], "decision": decision,
+                    "reason": "Owner explicitly classifies the previously recorded contradictory recovery proposal",
+                    "draft": self.view().draft if decision == "apply" else None,
+                    "affected_steps": (), "unbounded": False,
+                }))
+                self.assertEqual(resolved.committed["decision"], decision)
+                self.assertEqual({hold.kind for hold in self.view().coordination.holds}, {"stale"})
 
     def test_recovery_relay_has_original_attribution_and_no_fabricated_activity(self):
         active = self.stale()
