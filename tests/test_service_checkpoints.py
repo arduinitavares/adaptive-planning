@@ -251,6 +251,57 @@ class TestService(unittest.TestCase):
         self.assertEqual(self.rows("holds"), ())
         self.assertTrue(next(r for r in self.f.service.list_ready(self.plan_id) if r.step_id == "b").ready)
 
+    def test_unchanged_proposed_draft_is_rejected_atomically(self):
+        current = self.f.service.read_plan(self.plan_id).draft
+        for step_id, proposed in (("a", current), ("b", replace(current, facts=("A revised plan fact",)))):
+            with self.subTest(step_id=step_id):
+                active = self.active(step_id)
+                value = checkpoint()
+                value = replace(value, reassessment=replace(value.reassessment, proposed_draft=proposed))
+                self.denied(self.command(active, value))
+
+    def test_legacy_unchanged_proposal_replays_and_resolves(self):
+        active = self.active()
+        value = checkpoint()
+        value = replace(value, reassessment=replace(value.reassessment,
+                        proposed_draft=self.f.service.read_plan(self.plan_id).draft))
+        command = self.command(active, value)
+        # Simulate publication by the old server; replay and resolution remain real.
+        with patch.object(self.checkpoint_module(), "_require_consistent_checkpoint_reassessment",
+                          return_value=None, create=True):
+            submitted = self.execute(command)
+        before = self.snapshot()
+        self.assertTrue(self.execute(command).replayed)
+        self.assertTrue(self.snapshot() == before, "Legacy replay changed persisted state")
+        for decision in ("reject", "apply"):
+            with self.subTest(decision=decision):
+                resolved = self.execute(self.f.command("resolve_reassessment", {
+                    "checkpoint_id": submitted.committed["checkpoint_id"], "decision": decision,
+                    "reason": "Owner explicitly classifies the previously recorded contradictory proposal",
+                    "draft": self.f.service.read_plan(self.plan_id).draft if decision == "apply" else None,
+                    "affected_steps": (), "unbounded": False,
+                }, receipt=self.p))
+                self.assertEqual(resolved.committed["decision"], decision)
+                self.assertEqual(self.rows("holds"), ())
+
+    def test_contradictory_proposal_preserves_earlier_errors(self):
+        active = self.active()
+        value = checkpoint()
+        value = replace(value, reassessment=replace(value.reassessment,
+                        proposed_draft=self.f.service.read_plan(self.plan_id).draft))
+        command = self.command(active, value)
+        relay = self.command(active, replace(value, relay="synthetic-orchestrator"))
+        self.start(self.assign("b"))
+        self.denied(relay, "conflict")
+        self.edit_payload(active, lambda data: data.update(recovery_required=True))
+        self.denied(command, "held")
+        self.edit_payload(active, lambda data: data.pop("recovery_required"))
+        self.f.clock.advance(901)
+        self.denied(command, "stale")
+        self.f.store.write(lambda db: db.execute("UPDATE capabilities SET revoked=1 WHERE role='attempt' AND plan_id=?",
+                                                 (self.plan_id,)))
+        self.denied(command, "fenced")
+
     def test_material_scope_and_unchanged_consistency_fail_atomically(self):
         active = self.active()
         value = checkpoint()

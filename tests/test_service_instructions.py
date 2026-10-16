@@ -25,6 +25,23 @@ class TestService(unittest.TestCase):
         self.f = make_service()
         self.addCleanup(self.f.cleanup)
 
+    def test_material_specification_changes_require_canonical_synchronization(self):
+        # These are shared normative contracts, not incidental prose or formatting.
+        requirements = (
+            'Specification, architecture, ADR, or contract changes that alter downstream dependencies, ordering, scope, deliverables, completion checks, or tracked document references require `disposition="material"`.',
+            'A passing producing-step check does not imply an unchanged reassessment.',
+            'An unchanged reassessment must have `proposed_draft=None`.',
+            'When accepted specification changes affect downstream definitions or tracked references, synchronize the canonical graph, step definitions, and document metadata before stopping at a `first-step` boundary or consulting `list_ready` for further dispatch.',
+            'Calling `revise_plan` changes the graph but does not clear reassessment holds; resolve those holds explicitly through `resolve_reassessment`.',
+            'An apply decision can retain residual holds;',
+            'Edits that leave downstream definitions and tracked references unchanged do not by themselves require material reassessment.',
+        )
+        for path in ("SKILL.md", "references/live-dashboard.md"):
+            with self.subTest(path=path):
+                text = " ".join(Path(path).read_text().split())
+                for requirement in requirements:
+                    self.assertIn(requirement, text)
+
     def test_instruction_contract_and_unavailable_behavior(self):
         for path in ("SKILL.md", "references/live-dashboard.md"):
             text = Path(path).read_text()

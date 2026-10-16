@@ -89,6 +89,27 @@ Distinguish authoritative MCP coordination from other documents:
   specifications contain deep technical reasoning but are not plan records.
 - **Temporary workflow notes**: Scratch notes and logs remain private working records.
 
+Specification, architecture, ADR, or contract changes that alter downstream dependencies, ordering, scope, deliverables, completion checks, or tracked document references require `disposition="material"`.
+A passing producing-step check does not imply an unchanged reassessment.
+Identify affected steps or declare unbounded effects; include the actual proposed
+revision when available. Tracked references include their recorded path, branch,
+commit, and version. Edits that leave downstream definitions and tracked references
+unchanged do not by themselves require material reassessment.
+An unchanged reassessment must have `proposed_draft=None`.
+
+When accepted specification changes affect downstream definitions or tracked references, synchronize the canonical graph, step definitions, and document metadata before stopping at a `first-step` boundary or consulting `list_ready` for further dispatch.
+Apply the accepted specification changes with `resolve_reassessment(decision="apply", draft=...)`,
+or use an authorized `revise_plan` followed by explicit reassessment-hold resolution.
+Calling `revise_plan` changes the graph but does not clear reassessment holds; resolve those holds explicitly through `resolve_reassessment`.
+When a separate revision has already implemented the proposal, an explicit
+`decision="reject"` can record that the proposal is superseded by that revision.
+Cite the revision in the reason and declare any residual affected steps or
+unbounded effects instead of clearing still-needed holds.
+An apply decision can retain residual holds; only advance work that the service
+reports eligible, preserving permitted unaffected sibling work. If synchronization
+is blocked or exceeds authorization, retain the holds and report the blocker
+rather than claim synchronization or dispatch affected work.
+
 Resume reads canonical events, unfinished ownership, holds, and reviews before
 dispatch or recovery. Only an authorized owner invokes `sweep_stale`; a direct worker requests that owner sweep before recovery.
 After the sweep, reread the latest attempt version before owner confirmation or an
