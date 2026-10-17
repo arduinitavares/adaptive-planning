@@ -1,6 +1,6 @@
 # Measurement collection implementation plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Collect missing measurements and version metadata on the existing Mac service.
 
@@ -29,17 +29,17 @@
 ## Tasks
 
 ### Task 1: ledger and KPI calculation
-- [ ] Add decisive unit tests; run them and retain the missing-feature failure.
-- [ ] Implement strict observations, append-only/idempotent SQLite storage and bounded reporting.
-- [ ] Prove unknown/zero, causal rework, unit separation and overlapping interval behaviour.
+- [x] Add decisive unit tests; run them and retain the missing-feature failure.
+- [x] Implement strict observations, append-only/idempotent SQLite storage and bounded reporting.
+- [x] Prove unknown/zero, causal rework, unit separation and overlapping interval behaviour.
 
 ### Task 2: service, MCP and report
-- [ ] Add integration tests for capabilities, epoch/reference checks, strict registry and canonical invariance; observe failure.
-- [ ] Add service adapters, automatic sanitized MCP traces and GET/HEAD report routes.
-- [ ] Run focused and full Linux tests. Preserve runtime/dependency pins.
+- [x] Add integration tests for capabilities, epoch/reference checks, strict registry and canonical invariance; observe failure.
+- [x] Add service adapters, automatic sanitized MCP traces and GET/HEAD report routes.
+- [x] Run focused and full Linux tests. Preserve runtime/dependency pins.
 
 ### Task 3: review and rollout
-- [ ] Obtain fresh independent cross-family review; resolve material findings in one fix pass with decisive checks.
-- [ ] Build the image and smoke test it with disposable data before production replacement.
-- [ ] Roll out to the same Compose service, retain old image rollback, verify live identity/data/MCP/report/persistence.
-- [ ] Record audit, verification receipts, rollout identity and collection instructions.
+- [x] Obtain fresh independent cross-family review; resolve material findings in one fix pass with decisive checks.
+- [x] Build the image and smoke test it with disposable data before production replacement.
+- [x] Roll out to the same Compose service, retain old image rollback, verify live identity/data/MCP/report/persistence.
+- [x] Record audit, verification receipts, rollout identity and collection instructions.
