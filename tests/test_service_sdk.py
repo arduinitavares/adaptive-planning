@@ -496,7 +496,7 @@ class TestService(unittest.TestCase):
         from adaptive_planning.transport import build_mcp
         names = asyncio.run(list_tool_names(build_mcp(self.f.service)))
         self.assertEqual(set(names), {"read_service_info", "list_plans", "read_plan", "read_events",
-                                      "list_ready", "read_coordination", *HANDLERS})
+                                  "list_ready", "read_coordination", "read_measurements", "record_measurement", *HANDLERS})
         self.assertIn("assign_step", names)
         planning = self.f.create("plan-only", creation_id="planning-only")
         before = self.snapshot()

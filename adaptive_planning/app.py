@@ -157,6 +157,18 @@ class PlanningService:
         return self._run_read(  # type: ignore[return-value]
             lambda db: recovery.recovery_warnings(db, plan_id, self._clock(), self._stale_seconds))
 
+    def record_measurement(self, observation, orchestrator_token=None, attempt_token=None):
+        from adaptive_planning.measurement_service import record
+        return record(self, observation, orchestrator_token, attempt_token)
+
+    def read_measurements(self, plan_id=None, after=0, limit=100):
+        from adaptive_planning.measurement_service import read
+        return read(self, plan_id, after, limit)
+
+    def trace_measurement_call(self, tool, duration_ms, outcome):
+        from adaptive_planning.measurement_service import trace
+        trace(self, tool, duration_ms, outcome)
+
 
 def build_app(config: Config) -> Starlette:
     """Compose one service authority, its read-only dashboard and the official MCP app."""
