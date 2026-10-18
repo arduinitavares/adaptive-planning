@@ -171,6 +171,22 @@ def _plan_index_arguments(values: dict[str, str]) -> tuple[str | None, str | Non
 
 
 def dashboard_routes(service: PlanningService) -> list[BaseRoute]:
+    def measurements_page(request):
+        def read():
+            from adaptive_planning.measurement_dashboard import COHORTS, render_measurements
+            is_api = request.url.path == "/api/measurements"
+            allowed = {"plan_id", "after", "limit"} | (set() if is_api else {"cohort"})
+            values = _query(request, allowed)
+            cohort = values.get("cohort", "all" if values.get("plan_id") else "operational")
+            if cohort not in COHORTS:
+                raise DomainError("invalid", "Unsupported measurement cohort")
+            data = service.read_measurements(values.get("plan_id"), _integer(values, "after", 0), _integer(values, "limit", 100))
+            response = _bounded_json(data)  # Bound the full report before cohort filtering.
+            if is_api:
+                return response
+            return HTMLResponse(render_measurements(data, cohort, values), headers=HEADERS)
+        return _public_read(read)
+
     def index(request):
         def read():
             values = _query(request, {"limit", "after", "before"})
@@ -254,7 +270,12 @@ def dashboard_routes(service: PlanningService) -> list[BaseRoute]:
     def stylesheet(request):
         return Response(_asset("style.css"), media_type="text/css", headers=HEADERS)
 
+    def measurements_stylesheet(request):
+        return Response(_asset("measurements.css"), media_type="text/css", headers=HEADERS)
+
     return [Route("/", index, methods=["GET", "HEAD"]),
+            Route("/measurements", measurements_page, methods=["GET", "HEAD"]),
+            Route("/api/measurements", measurements_page, methods=["GET", "HEAD"]),
             Route("/plans/{plan_id}", plan_page, methods=["GET", "HEAD"]),
             Route("/api/plans", api_plans, methods=["GET", "HEAD"]),
             Route("/api/plan-index", api_plan_index, methods=["GET", "HEAD"]),
@@ -263,4 +284,5 @@ def dashboard_routes(service: PlanningService) -> list[BaseRoute]:
             Route("/api/plans/{plan_id}/events", api_events, methods=["GET", "HEAD"]),
             Route("/api/plans/{plan_id}/recovery-warnings", api_recovery_warnings, methods=["GET", "HEAD"]),
             Route("/app.js", script, methods=["GET", "HEAD"]),
+            Route("/measurements.css", measurements_stylesheet, methods=["GET", "HEAD"]),
             Route("/style.css", stylesheet, methods=["GET", "HEAD"])]

@@ -14,3 +14,4 @@ assets/dashboard/**
 !assets/dashboard/index.html
 !assets/dashboard/app.js
 !assets/dashboard/style.css
+!assets/dashboard/measurements.css

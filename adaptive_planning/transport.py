@@ -8,6 +8,7 @@ from dataclasses import is_dataclass
 import json
 import logging
 import math
+import time
 from threading import RLock
 from types import FunctionType
 from typing import Annotated, Any, Literal, TYPE_CHECKING
@@ -28,8 +29,11 @@ if TYPE_CHECKING:
     from adaptive_planning.app import PlanningService
 
 _LOG = logging.getLogger("adaptive_planning.transport")
-_READ_NAMES = frozenset({"read_service_info", "list_plans", "read_plan", "read_events", "list_ready", "read_coordination"})
+_READ_NAMES = frozenset({"read_service_info", "list_plans", "read_plan", "read_events", "list_ready", "read_coordination", "read_measurements"})
+_OBSERVATION_WRITES = frozenset({"record_measurement"})
 _ARGUMENTS = {
+    "read_measurements": frozenset({"plan_id", "after", "limit"}),
+    "record_measurement": frozenset({"observation"}),
     "read_service_info": frozenset(), "list_plans": frozenset({"include_terminal"}),
     "read_plan": frozenset({"plan_id"}), "read_events": frozenset({"plan_id", "after", "limit"}),
     "list_ready": frozenset({"plan_id"}), "read_coordination": frozenset({"plan_id", "after", "limit"}),
@@ -595,7 +599,8 @@ _PUBLIC_FIELDS = frozenset({"command", "kind", "payload", *_Envelope.model_field
                            *_SweepStalePayload.model_fields, *_ResolveAttemptPayload.model_fields,
                            *_AppendLateEvidencePayload.model_fields,
                            *_HostWorkInput.model_fields, *_ResourceResolutionInput.model_fields, *_ResolveStoreHoldPayload.model_fields,
-                           "plan_id", "include_terminal", "after", "limit", *_ARGUMENTS})
+                           "plan_id", "include_terminal", "after", "limit", *_ARGUMENTS,
+                           "observation", "source_record_id", "observed_at", "checkpoint_sequence", "data"})
 
 
 # Explicit public shapes: adding a DTO or field requires a public-contract decision.
@@ -705,6 +710,19 @@ class _ServiceToolError(ToolError):
 
 class _PlanningMCPServer(MCPServer):
     async def call_tool(self, name: str, arguments: dict[str, Any], context: Any = None) -> CallToolResult:
+        started = time.perf_counter()
+        outcome = "internal_error"
+        try:
+            result = await self._dispatch_tool(name, arguments, context)
+            outcome = "tool_error" if result.is_error else "ok"
+            return result
+        finally:
+            sink = getattr(self, "measurement_sink", None)
+            if sink is not None:
+                sink(name if isinstance(name, str) and name in _ARGUMENTS else "unknown",
+                     (time.perf_counter() - started) * 1000, outcome)
+
+    async def _dispatch_tool(self, name: str, arguments: dict[str, Any], context: Any = None) -> CallToolResult:
         # The SDK's public dispatch method owns schema validation. Returning an official
         # error result here keeps its wire wrapper from logging exception causes or raw locs.
         public_name = name if isinstance(name, str) and name in _ARGUMENTS else "unknown"
@@ -772,7 +790,7 @@ def _validate_registered_handlers(tool_handlers: Mapping[str, Callable]) -> dict
     except Exception:
         reject()
     mutations = domain.BOOTSTRAP_KINDS | domain.ORCHESTRATOR_KINDS | domain.WORKER_KINDS
-    expected = mutations | _READ_NAMES
+    expected = mutations | _READ_NAMES | _OBSERVATION_WRITES
     if (set(handlers) != expected or set(_ARGUMENTS) != expected
             or set(_MUTATION_DESCRIPTIONS) != mutations
             or any(_ARGUMENTS[name] != frozenset({"command"}) for name in mutations)):
@@ -788,7 +806,7 @@ def _validate_registered_handlers(tool_handlers: Mapping[str, Callable]) -> dict
             reference, issued_name, role, issued_batch = issued
             referent = reference()  # One dereference yields a strong local reference.
             if (referent is not handler or issued_name != name or handler.__name__ != name
-                    or role != ("read" if name in _READ_NAMES else "mutation")):
+                    or role != ("read" if name in _READ_NAMES else "observation" if name in _OBSERVATION_WRITES else "mutation")):
                 reject()
             if batch is None:
                 batch = issued_batch
@@ -851,6 +869,21 @@ def _mutation_handler(service: PlanningService, kind: str) -> Callable:
     return handler
 
 
+class MeasurementInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    source_record_id: str = Field(min_length=1, max_length=160)
+    epoch: str = Field(min_length=1, max_length=160)
+    plan_id: str = Field(min_length=1, max_length=160)
+    kind: Literal["context", "outcome", "defect", "effort", "coverage"]
+    observed_at: str
+    step_id: str | None = None
+    attempt_id: str | None = None
+    checkpoint_sequence: StrictInt | None = None
+    data: dict[str, Any] = Field(description="Kind-specific receipt data. Call read_measurements and read receipt_contract for required fields, exact scope, idempotency and examples. Missing usage stays unknown.")
+    orchestrator_token: str | None = None
+    attempt_token: str | None = None
+
+
 def registered_handlers(service: PlanningService) -> Mapping[str, Callable]:
     """Issue one complete batch of actual read and centrally gated mutation handlers."""
     def read_value(operation):
@@ -862,6 +895,16 @@ def registered_handlers(service: PlanningService) -> Mapping[str, Callable]:
     def read_service_info() -> dict[str, Any]:
         """Read the public installation identity and dashboard URL."""
         return read_value(service.read_service_info)
+
+    def read_measurements(plan_id: str | None = None, after: StrictInt = 0, limit: StrictInt = 100) -> dict[str, Any]:
+        """Read automatic canonical lifecycle KPIs, semantic receipts, versions and bounded traces. Includes receipt_contract with the complete remote-readable record_measurement contract. Missing values are unknown."""
+        return read_value(lambda: service.read_measurements(plan_id, after, limit))
+
+    def record_measurement(observation: MeasurementInput) -> dict[str, Any]:
+        """Append an idempotent receipt without changing planning state. First read read_measurements.receipt_contract for fields, authentication and examples. Reuse the same source_record_id and immutable body for retries; submit usage deltas once."""
+        value = observation.model_dump(mode="python")
+        owner, worker = value.pop("orchestrator_token"), value.pop("attempt_token")
+        return read_value(lambda: service.record_measurement(value, owner, worker))
 
     def list_plans(include_terminal: StrictBool = False) -> dict[str, Any]:
         """List complete public plan views within the public response limit."""
@@ -887,17 +930,19 @@ def registered_handlers(service: PlanningService) -> Mapping[str, Callable]:
         "read_service_info": read_service_info, "list_plans": list_plans,
         "read_plan": read_plan, "read_events": read_events,
         "list_ready": list_ready, "read_coordination": read_coordination,
+        "read_measurements": read_measurements, "record_measurement": record_measurement,
     }
     handlers.update((kind, _mutation_handler(service, kind)) for kind in _MUTATION_DESCRIPTIONS)
     batch = object()  # Standalone identity; does not retain service, handlers or SDK server.
     for name, handler in handlers.items():
-        _issue_handler(handler, name, "read" if name in _READ_NAMES else "mutation", batch)
+        _issue_handler(handler, name, "read" if name in _READ_NAMES else "observation" if name in _OBSERVATION_WRITES else "mutation", batch)
     return handlers
 
 
 def build_mcp(service: PlanningService) -> MCPServer:
     handlers = _validate_registered_handlers(registered_handlers(service))
     server = _PlanningMCPServer("adaptive-planning", middleware=[_safe_protocol_errors])
+    server.measurement_sink = service.trace_measurement_call
     read = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
     write = ToolAnnotations(read_only_hint=False, idempotent_hint=True, open_world_hint=False)
     for name, handler in handlers.items():

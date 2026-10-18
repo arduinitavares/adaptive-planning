@@ -235,6 +235,16 @@ provide inspiration, with no affiliation or endorsement implied.
 **The goal stays stable. The route remains provisional. Evidence determines
 the next step.**
 
+## Measurements
+
+The shared service can retain optional outcome, regression, corrective-rework,
+time and resource observations in its existing container volume. Open
+`/measurements` on that service. Missing data stays unknown. MCP call traces
+are automatic; client model usage, human effort and billing need explicit
+receipts. See [measurement collection](references/measurements.md) for the
+two MCP tools, version metadata, coverage and interpretation. This does not
+change the adaptive planning loop or the skill instructions.
+
 ## License
 
 [MIT](LICENSE).

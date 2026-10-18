@@ -1,6 +1,8 @@
 ---
 name: adaptive-planning
 description: Use when a multi-step task has uncertain dependencies or outcomes, new observations could invalidate later steps, or the user requests iterative replanning, a rolling plan, or a receding planning horizon.
+metadata:
+  version: "2026-10-18-receipts-1"
 ---
 
 # Adaptive Planning
@@ -273,6 +275,23 @@ Superpowers sequence is required.
      separately while independent authorized work continues. Repeated failure
      without new evidence or a changed hypothesis requires reassessment or a
      blocker report.
+
+## Measurement receipts
+
+Submit receipts as part of normal work. Do not ask the user to fill reports.
+On plan creation or resume, read `read_measurements.receipt_contract`.
+Use `record_measurement` to report the plan classification, the SHA-256 hash
+of the loaded `SKILL.md` as `skill_version`, client name/OS, and exposed
+client version and workflow/model settings.
+Reuse unchanged context. Report changed settings with a new observation.
+
+At existing checkpoints, submit observed defects, corrective rework and
+available client usage deltas. Read [measurements.md](references/measurements.md)
+for receipt fields, attribution and client limits. Retain each immutable body
+and source ID privately; retry that same body and ID. Omit unavailable measures.
+Mark coverage complete only after reconciliation. A failed exploratory check
+alone is not corrective rework. The server derives lifecycle counts from
+canonical calls; additional outcome receipts are unnecessary for those counts.
 
 ## Outage policy and unavailable behavior
 

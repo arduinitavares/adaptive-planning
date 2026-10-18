@@ -66,7 +66,7 @@ class TestService(unittest.TestCase):
         handlers = transport.registered_handlers(self.f.service)
         view = self.f.service.read_plan(self.plan_id)
         validator(handlers, view)
-        self.assertEqual(set(handlers), {*(name for name, _, _ in READS), *MUTATIONS})
+        self.assertEqual(set(handlers), {*(name for name, _, _ in READS), *MUTATIONS, "read_measurements", "record_measurement"})
         self.assertEqual(set(MUTATIONS), BOOTSTRAP_KINDS | ORCHESTRATOR_KINDS | WORKER_KINDS)
         validator(dict(handlers), view)
         with self.assertRaises(DomainError):
@@ -148,12 +148,18 @@ class TestService(unittest.TestCase):
     def test_actual_sdk_catalog_preserves_all_schemas_annotations_defaults_and_descriptions(self):
         server = transport.build_mcp(self.f.service)
         tools = asyncio.run(server.list_tools())
-        catalog = [tool.model_dump(mode="json", by_alias=True) for tool in sorted(tools, key=lambda tool: tool.name)]
+        # Preserve the original 29-tool contract byte for byte; additions have separate behavioural tests.
+        catalog = [tool.model_dump(mode="json", by_alias=True) for tool in sorted(tools, key=lambda tool: tool.name)
+                   if tool.name not in {"read_measurements", "record_measurement"}]
         encoded = json.dumps(catalog, sort_keys=True, separators=(",", ":")).encode()
         # Captured from accepted Task25 with MCP2.3.0/Pydantic2.13.5 before this refactor.
         self.assertEqual(hashlib.sha256(encoded).hexdigest(),
                          "8a6f4dbc21d35917326cea812670d52804fc617dcbe3df10bd4dcfd60f90ce9f")
-        self.assertEqual({tool.name for tool in tools}, {*(name for name, _, _ in READS), *MUTATIONS})
+        self.assertEqual({tool.name for tool in tools}, {*(name for name, _, _ in READS), *MUTATIONS, "read_measurements", "record_measurement"})
+        added = {tool.name: tool for tool in tools if tool.name in {"read_measurements", "record_measurement"}}
+        self.assertTrue(added["read_measurements"].annotations.read_only_hint)
+        self.assertFalse(added["record_measurement"].annotations.read_only_hint)
+        self.assertTrue(added["record_measurement"].annotations.idempotent_hint)
 
     def mutation_commands(self, attempt):
         cp = checkpoint()
