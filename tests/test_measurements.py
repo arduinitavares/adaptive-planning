@@ -72,6 +72,35 @@ class Measurements(unittest.TestCase):
         self.assertEqual(union_seconds([("2026-10-18T00:00:00Z", "2026-10-18T00:01:00Z"),
                                         ("2026-10-18T00:00:30Z", "2026-10-18T00:01:30Z")]), 90)
 
+    def test_unclassified_usage_does_not_assert_zero_rework(self):
+        self.record(observation(kind="effort", data={"activity_kind": "implement", "corrective_rework": None,
+                    "metrics": {"input_tokens": 10}, "source": "client_measured", "evidence": "native usage; allocation to rework unknown"}))
+        self.record(observation("coverage", "coverage", {"metrics": ["input_tokens"], "evidence": "all token deltas reconciled"}))
+        case = {"plan_id": "p1", "status": "running", "created_at": "2026-10-17T00:00:00Z", "steps": []}
+        result = report([case], self.ledger.rows("epoch-test", "p1"), {})["plans"][0]
+        self.assertEqual(result["resources"]["input_tokens"]["known_sum"], 10)
+        self.assertEqual(result["resources"]["input_tokens"]["coverage"], "client_attested_complete")
+        self.assertIsNone(result["rework"]["input_tokens"]["known_sum"])
+        self.assertEqual(result["rework"]["input_tokens"]["coverage"], "none")
+
+    def test_partial_noncorrective_and_mixed_usage_cannot_establish_zero_rework(self):
+        data = {"activity_kind": "implement", "corrective_rework": False,
+                "metrics": {"worker_seconds": 10}, "source": "client_measured", "evidence": "observed normal work"}
+        self.record(observation("ordinary", "effort", data))
+        case = {"plan_id": "p1", "status": "running", "created_at": "2026-10-17T00:00:00Z", "steps": []}
+        result = lambda: report([case], self.ledger.rows("epoch-test", "p1"), {})["plans"][0]
+        self.assertIsNone(result()["rework"]["worker_seconds"]["known_sum"])
+        self.record(observation("complete", "coverage", {"metrics": ["worker_seconds"], "evidence": "all measured work reconciled"}))
+        self.assertEqual(result()["rework"]["worker_seconds"]["known_sum"], 0)
+        self.record(observation("unknown", "effort", {**data, "corrective_rework": None}))
+        self.record(observation("reconcile", "coverage", {"metrics": ["worker_seconds"], "evidence": "all usage reconciled; classification unknown"}))
+        self.assertIsNone(result()["rework"]["worker_seconds"]["known_sum"])
+        self.assertEqual(result()["resources"]["worker_seconds"]["known_sum"], 20)
+
+    def test_case_classification_requires_plan_scope(self):
+        with self.assertRaises(DomainError):
+            self.record(observation("wrong-classification", "context", {"case_kind": "fixture"}, step_id="a"))
+
     def test_fixtures_and_unknown_are_not_operational(self):
         cases = [{"plan_id": "p1", "status": "running", "created_at": "2026-10-17T00:00:00Z", "steps": []}]
         self.assertEqual(report(cases, [], {})["cohort"]["operational_plans"], 0)

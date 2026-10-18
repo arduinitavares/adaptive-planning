@@ -101,7 +101,10 @@ def read(service, plan_id=None, after=0, limit=100):
                 result = db.execute("SELECT created_at FROM result_versions WHERE plan_id=? AND result_version=?", (pid, version)).fetchone() if version else None
                 steps.append({"step_id": sid, "state": state, "attempt_id": current[0] if current else None,
                               "result_version": version, "accepted_at": result[0] if result else None})
-            cases.append({"plan_id": pid, "title": title, "status": status, "created_at": created_at, "steps": steps})
+            case = {"plan_id": pid, "title": title, "status": status, "created_at": created_at, "steps": steps}
+            from adaptive_planning.measurement_lifecycle import derive
+            case["lifecycle"] = derive(db, case)
+            cases.append(case)
         return epoch, cases, db.execute("SELECT COALESCE(max(sequence),0) FROM events").fetchone()[0]
 
     epoch, cases, sequence = service._run_read(canonical)
@@ -109,10 +112,15 @@ def read(service, plan_id=None, after=0, limit=100):
         store = ledger(service)
         rows = store.rows(epoch, plan_id)
         result = measurements.report(cases, rows, service._measurement_version)
+        for case, item in zip(cases, result["plans"]):
+            item["lifecycle"] = case["lifecycle"]
+        from adaptive_planning.measurement_contract import contract
+        result["receipt_contract"] = contract()
         page = [r for r in rows if r["sequence"] > after][:limit + 1]
         result.update(epoch=epoch, canonical_store_sequence=sequence, observations=page[:limit],
                       next_after=page[limit - 1]["sequence"] if len(page) > limit else None,
-                      mcp_calls=store.calls(), collection_health={"dropped_call_traces_since_process_start": getattr(service, "_measurement_drops", 0)})
+                      mcp_calls=store.calls(), collection_health={"dropped_call_traces_since_process_start": getattr(service, "_measurement_drops", 0),
+                          "lifecycle_source": "canonical_committed_records", "client_receipts": "instruction_driven; native usage availability varies"})
         return result
     except sqlite3.OperationalError:
         raise DomainError("busy", "Measurement ledger unavailable") from None

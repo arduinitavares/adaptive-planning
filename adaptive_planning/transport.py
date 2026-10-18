@@ -879,7 +879,7 @@ class MeasurementInput(BaseModel):
     step_id: str | None = None
     attempt_id: str | None = None
     checkpoint_sequence: StrictInt | None = None
-    data: dict[str, Any]
+    data: dict[str, Any] = Field(description="Kind-specific receipt data. Call read_measurements and read receipt_contract for required fields, exact scope, idempotency and examples. Missing usage stays unknown.")
     orchestrator_token: str | None = None
     attempt_token: str | None = None
 
@@ -897,11 +897,11 @@ def registered_handlers(service: PlanningService) -> Mapping[str, Callable]:
         return read_value(service.read_service_info)
 
     def read_measurements(plan_id: str | None = None, after: StrictInt = 0, limit: StrictInt = 100) -> dict[str, Any]:
-        """Read five KPI summaries, version attestations and a bounded measurement trace. Missing values are unknown."""
+        """Read automatic canonical lifecycle KPIs, semantic receipts, versions and bounded traces. Includes receipt_contract with the complete remote-readable record_measurement contract. Missing values are unknown."""
         return read_value(lambda: service.read_measurements(plan_id, after, limit))
 
     def record_measurement(observation: MeasurementInput) -> dict[str, Any]:
-        """Append an idempotent measurement without changing planning state. See references/measurements.md for data contracts."""
+        """Append an idempotent receipt without changing planning state. First read read_measurements.receipt_contract for fields, authentication and examples. Reuse the same source_record_id and immutable body for retries; submit usage deltas once."""
         value = observation.model_dump(mode="python")
         owner, worker = value.pop("orchestrator_token"), value.pop("attempt_token")
         return read_value(lambda: service.record_measurement(value, owner, worker))

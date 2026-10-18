@@ -16,7 +16,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ASSETS = ("index.html", "app.js", "style.css")
+ASSETS = ("index.html", "app.js", "style.css", "measurements.css")
 PYTHON_IMAGE = (
     "python:3.13.16-slim-bookworm@sha256:"
     "a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641"
@@ -108,7 +108,7 @@ INSTALLED_PROBE = textwrap.dedent(r'''
                         if message["type"] == "http.response.body")
         return start["status"], dict(start["headers"]), body
 
-    for name, content_type in (("app.js", b"text/javascript"), ("style.css", b"text/css")):
+    for name, content_type in (("app.js", b"text/javascript"), ("style.css", b"text/css"), ("measurements.css", b"text/css")):
         status, headers, body = asyncio.run(get("/" + name))
         assert status == 200, f"Installed asset route failed: {name}"
         assert headers[b"content-type"].startswith(content_type), f"Wrong asset content type: {name}"
@@ -273,7 +273,7 @@ class TestService(unittest.TestCase):
         self.assertEqual(allowed, {"!Dockerfile", "!.dockerignore", "!pyproject.toml", "!uv.lock",
                                    "!adaptive_planning/", "!adaptive_planning/*.py", "!assets/",
                                    "!assets/dashboard/", "!assets/dashboard/index.html",
-                                   "!assets/dashboard/app.js", "!assets/dashboard/style.css"})
+                                   "!assets/dashboard/app.js", "!assets/dashboard/style.css", "!assets/dashboard/measurements.css"})
 
 
 if __name__ == "__main__":

@@ -1,0 +1,28 @@
+# Automatic measurements and an operational dashboard
+
+User outcome: continue adaptive planning through Codex and AGY on Windows and Mac, then review trustworthy KPIs after a month. Replace the raw measurements page with a readable dashboard. Update the skill only where client signals are necessary. Deploy to the existing Mac container and retain its store, grants, network configuration and canonical history.
+
+## Collection contract
+
+1. Derive mechanical lifecycle metrics from canonical persisted records on report reads. This covers historical and future calls through every client, requires no client hooks, cannot miss a committed transaction, and does not append synthetic canonical events. Include accepted versus independently reviewed outcomes, checkpoints, failed/blocked checks, invalidations, reviews, revisions and attempt/result elapsed intervals. A failed check is not automatically a regression or wasted work. An invalidation is an observed withdrawn result, not necessarily an escaped production defect.
+2. Retain the existing append-only semantic receipt ledger for explicit defects, corrective rework, person time, client usage and workflow/model versions. Preserve authentication and exact attempt/result binding. Never infer missing cost or usage as zero, never derive billing from account-wide usage, and never present accepted results as independently reviewed without canonical matching review evidence.
+3. Add a short required skill instruction: submit context on creation/resume or changed settings, and submit evidence-backed rework/defect/usage receipts at existing checkpoints when observed. Do not add a separate user reporting ritual. A self-describing server contract must be accessible to remote MCP clients. Automatic client-native usage collection is delivered only where verified client interfaces support it; any unavailable hooks remain explicit limitations rather than invented automation.
+4. Keep service code fingerprint, receipt schema and client workflow/skill versions available for comparisons. Separate operational plans, fixtures and unclassified records; default dashboard to operational.
+
+## Dashboard contract
+
+Use a calm, readable operational interface: light workspace, strong typography, restrained teal, an overview with acceptance progress and collection coverage, five KPI groups, plan comparison, and an inspectable trace. Include semantic counts with denominators and units. Show insufficient evidence as a meaningful empty state. Keep raw JSON behind a secondary details control/link. Mobile layout must remain usable with long plan names. No external asset dependency, inline script, relaxed CSP, fabricated trends, or inferred financial savings. Preserve existing plan dashboard and all read-only/authentication boundaries.
+
+Five groups: outcomes (accepted and independently verified separately); regressions (explicit defects and canonical invalidations distinctly); corrective rework (observed effort with coverage); time (elapsed lifecycle time versus measured active/wait/blocked/person time distinctly); resources (client usage/billing receipts and coverage). Timeline shows actual activity, not an improvement claim. Version comparison is descriptive and conditional on adequate coverage, not a causal experiment.
+
+## Acceptance
+
+Meaningful regression tests cover canonical derivation, exact independent review binding, missing data, fixtures, receipt idempotency, self-describing contract and HTML escaping. Verify desktop and mobile UI, keyboard controls, local assets and absence of console errors. Fresh independent cross-family plan review before implementation, then change review before rollout. Run appropriate focused and full service checks once after integration. Preserve runtime database prefix/epoch/token/volume across rollout and copy only authorized installed-skill files on both hosts. Record exact scope and remaining client telemetry limitations.
+
+## Plan review dispositions
+
+- Classification: preserve explicit classification only; title matching is not evidence. Default to tagged operational metrics, always show fixture and unclassified counts and a direct control to inspect each. An unclassified plan must never disappear silently or enter an operational denominator implicitly.
+- Review semantics: derive `accepted_with_linked_review` only from exact accepted attempt/checkpoint/artifact and selected review event. The service enforces a distinct recorded reviewer identity; model family/team independence remains unknown unless separately attested. Do not label this count cross-family verification or production correctness.
+- Receipt deduplication: the existing ledger already enforces `(epoch, source_record_id)` with a canonical-payload digest; exact retries replay and changed payload conflicts. Clients retain the immutable body and use scoped native-event IDs or a hash of immutable content; never retry with a fresh ID. Keep the standalone tool to preserve the 29 canonical command schemas and their transaction/replay semantics. The extra call occurs at existing checkpoints without a user reporting ritual; do not claim zero extra calls.
+- Resource coverage: include canonical attempt/checkpoint/event volume automatically and qualify token/billing coverage separately. Existing global MCP traces remain explicitly global until exact plan attribution exists.
+- Time: show calendar lifecycle/attempt spans only. Neither checkpoint spacing nor intra-attempt spacing proves active work. Active/person/wait measures require observed intervals or receipts; do not infer them from timestamps. Provide closed-span median with its denominator and unfinished counts.

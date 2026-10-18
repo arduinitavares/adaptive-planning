@@ -17,7 +17,8 @@ from adaptive_planning.types import DomainError
 METRICS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_tokens", "tool_calls",
            "worker_seconds", "human_seconds", "reviewer_seconds")
 KINDS = {"context", "outcome", "defect", "effort", "coverage"}
-VERSION_FIELDS = {"workflow_version", "skill_version", "model_id", "provider", "effort"}
+VERSION_FIELDS = {"workflow_version", "skill_version", "model_id", "provider", "effort",
+                  "client_name", "client_version", "client_os", "collector_version"}
 MAX_ROWS = 20000
 
 
@@ -73,7 +74,7 @@ def validate_observation(value):
     if kind == "context":
         for name, item in data.items():
             _text(item, 500)
-        if "case_kind" in data and (data["case_kind"] not in ("operational", "fixture", "unknown") or value["attempt_id"] is not None):
+        if "case_kind" in data and (data["case_kind"] not in ("operational", "fixture", "unknown") or value["attempt_id"] is not None or value["step_id"] is not None):
             raise DomainError("invalid", "Classification is plan scoped")
     else:
         _text(data.get("evidence"))
@@ -102,8 +103,8 @@ def validate_observation(value):
     if kind == "effort":
         if data.get("activity_kind") not in ("plan", "implement", "verify", "review", "debug", "recover"):
             raise DomainError("invalid", "Activity category is required")
-        if type(data.get("corrective_rework")) is not bool:
-            raise DomainError("invalid", "Corrective rework must be explicit")
+        if "corrective_rework" not in data or data["corrective_rework"] is not None and type(data["corrective_rework"]) is not bool:
+            raise DomainError("invalid", "Corrective rework must be true, false or explicitly unknown")
         if data["corrective_rework"]:
             _text(data.get("cause_id"), 2000)
         elif data.get("cause_id") is not None:
@@ -265,8 +266,13 @@ def report(cases, observations, service_version):
             for name in METRICS:
                 items = [r for r in efforts if name in r["data"].get("metrics", {}) and r["data"]["source"] != "estimate"]
                 complete = name in covered and all(r["sequence"] < covered[name] for r in items)
+                if rework:
+                    complete = complete and all(r["data"]["corrective_rework"] is not None for r in items)
+                    items = [r for r in items if r["data"]["corrective_rework"] is not None]
                 chosen = [r for r in items if not rework or r["data"]["corrective_rework"]]
                 known = sum(r["data"]["metrics"][name] for r in chosen) if items or complete else None
+                if rework and known == 0 and not complete:
+                    known = None
                 result[name] = {"known_sum": known, "coverage": "client_attested_complete" if complete else "partial" if items else "none"}
             return result
         defects = {}

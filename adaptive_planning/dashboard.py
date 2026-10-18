@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import re
-import json
 from html import escape
 from importlib import resources
 from pathlib import Path
@@ -174,37 +173,18 @@ def _plan_index_arguments(values: dict[str, str]) -> tuple[str | None, str | Non
 def dashboard_routes(service: PlanningService) -> list[BaseRoute]:
     def measurements_page(request):
         def read():
-            values = _query(request, {"plan_id", "after", "limit"})
+            from adaptive_planning.measurement_dashboard import COHORTS, render_measurements
+            is_api = request.url.path == "/api/measurements"
+            allowed = {"plan_id", "after", "limit"} | (set() if is_api else {"cohort"})
+            values = _query(request, allowed)
+            cohort = values.get("cohort", "all" if values.get("plan_id") else "operational")
+            if cohort not in COHORTS:
+                raise DomainError("invalid", "Unsupported measurement cohort")
             data = service.read_measurements(values.get("plan_id"), _integer(values, "after", 0), _integer(values, "limit", 100))
-            _bounded_json(data)
-            if request.url.path == "/api/measurements":
-                return _bounded_json(data)
-            def show(value):
-                return escape(json.dumps(value, ensure_ascii=False, indent=2))
-            cards = []
-            for item in data["plans"]:
-                labels = (("1. Outcomes", item["outcomes"]), ("2. Regressions", item["regressions"]),
-                          ("3. Corrective rework", item["rework"]), ("4. Time", item["time"]),
-                          ("5. Resources", {"resources": item["resources"], "estimated_resources": item["estimated_resources"], "money": item["money"]}))
-                sections = "".join(f"<details><summary>{label}</summary><pre>{show(value)}</pre></details>" for label, value in labels)
-                url = "/measurements?" + urlencode({"plan_id": item["plan_id"]})
-                cards.append(f'<section><h2><a href="{escape(url, quote=True)}">{escape(item["title"])}</a></h2>'
-                             f'<p>{escape(item["case_kind"])}; {escape(item["status"])}; {item["observation_count"]} observations</p>'
-                             f'{sections}<details><summary>Version contexts</summary><pre>{show(item["versions"])}</pre></details></section>')
-            next_link = ""
-            if data["next_after"] is not None:
-                next_values = {**values, "after": str(data["next_after"])}
-                next_link = f'<p><a href="/measurements?{escape(urlencode(next_values), quote=True)}">Next observations</a></p>'
-            body = ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-                    '<title>Planning measurements</title><link rel="stylesheet" href="/style.css"></head><body><main>'
-                    '<p><a href="/">Plans</a> | <a href="/api/measurements">JSON report</a></p><h1>Planning measurements</h1>'
-                    '<p>Missing means unknown. Partial sums are lower bounds. Fixtures and unknown cases are excluded from operational comparisons.</p>'
-                    f'<pre>{show(data["cohort"])}</pre>' + "".join(cards) +
-                    f'<h2>Observation trace</h2><pre>{show(data["observations"])}</pre>{next_link}'
-                    f'<h2>Server MCP trace</h2><pre>{show(data["mcp_calls"])}</pre>'
-                    f'<h2>Collection health and service version</h2><pre>{show(data["collection_health"])}\n{show(data["service_version"])}</pre>'
-                    f'<h2>Interpretation</h2><pre>{show(data["limitations"])}</pre></main></body></html>')
-            return HTMLResponse(body, headers=HEADERS)
+            response = _bounded_json(data)  # Bound the full report before cohort filtering.
+            if is_api:
+                return response
+            return HTMLResponse(render_measurements(data, cohort, values), headers=HEADERS)
         return _public_read(read)
 
     def index(request):
@@ -290,6 +270,9 @@ def dashboard_routes(service: PlanningService) -> list[BaseRoute]:
     def stylesheet(request):
         return Response(_asset("style.css"), media_type="text/css", headers=HEADERS)
 
+    def measurements_stylesheet(request):
+        return Response(_asset("measurements.css"), media_type="text/css", headers=HEADERS)
+
     return [Route("/", index, methods=["GET", "HEAD"]),
             Route("/measurements", measurements_page, methods=["GET", "HEAD"]),
             Route("/api/measurements", measurements_page, methods=["GET", "HEAD"]),
@@ -301,4 +284,5 @@ def dashboard_routes(service: PlanningService) -> list[BaseRoute]:
             Route("/api/plans/{plan_id}/events", api_events, methods=["GET", "HEAD"]),
             Route("/api/plans/{plan_id}/recovery-warnings", api_recovery_warnings, methods=["GET", "HEAD"]),
             Route("/app.js", script, methods=["GET", "HEAD"]),
+            Route("/measurements.css", measurements_stylesheet, methods=["GET", "HEAD"]),
             Route("/style.css", stylesheet, methods=["GET", "HEAD"])]
