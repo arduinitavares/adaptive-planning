@@ -13,7 +13,8 @@
       <div class="header-top">
         <div class="header-brand">
           <span class="brand-title">LIVE PLAN</span>
-          <a id="plan-index-link" href="/" hidden>All plans</a>
+          <a id="plan-index-link" class="nav-pill-link" href="/" hidden>All plans</a>
+          <a id="measurements-link" class="nav-pill-link service-only-link" href="/measurements">Measurements</a>
           <div id="conn-pill" class="status-pill status-pill--connecting" role="status" aria-live="polite">
             <span class="pill-dot" aria-hidden="true"></span>
             <span id="conn-label">Connecting…</span>
@@ -147,9 +148,12 @@
         <div id="coordination-list" class="coordination-list"></div>
         <h3>Recovery (read-only descriptions)</h3>
         <p id="recovery-state"></p>
-        <p>Stale attempts require owner confirmation, replacement, rejection or release after host work is checked.
-          Reservations need explicit stopped or isolated evidence. Reassessment and invalidation holds require
-          owner decisions and evidence. A restored store requires host inventory and resource reconciliation.</p>
+        <details class="recovery-guidance">
+          <summary>Recovery &amp; host reconciliation policy</summary>
+          <p>Stale attempts require owner confirmation, replacement, rejection or release after host work is checked.
+            Reservations need explicit stopped or isolated evidence. Reassessment and invalidation holds require
+            owner decisions and evidence. A restored store requires host inventory and resource reconciliation.</p>
+        </details>
         <h3>Published activity and evidence</h3>
         <p id="events-summary"></p>
         <ol id="service-events" class="service-events"></ol>

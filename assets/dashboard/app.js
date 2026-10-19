@@ -367,7 +367,12 @@
     }
 
     function renderHeader(plan) {
-      setText(goalHeading, plan.objective || 'Untitled Plan');
+      const objText = plan.objective || 'Untitled Plan';
+      setText(goalHeading, objText);
+      if (goalHeading && typeof goalHeading.setAttribute === 'function') {
+        goalHeading.setAttribute('data-caveman', cavemanUltra(objText, 8));
+        goalHeading.setAttribute('data-full', objText);
+      }
 
       if (plan.taskId) {
         taskIdRow.hidden = false;
@@ -619,6 +624,7 @@
         setText(titleEl, step.title);
         titleEl.title = step.title;
         titleEl.setAttribute('aria-label', step.title);
+        titleEl.setAttribute('data-caveman', cavemanUltra(step.title, 6));
 
         const isNext = plan && plan.nextStepId === step.id && step.status !== 'complete' && step.status !== 'retired';
         if (nextBadge) {
@@ -1113,24 +1119,92 @@
       return node;
     }
 
+    function formatCardTime(isoString) {
+      if (!isoString) return '';
+      const d = new Date(isoString);
+      if (isNaN(d.getTime())) return String(isoString);
+      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const day = String(d.getUTCDate()).padStart(2, '0');
+      const mon = months[d.getUTCMonth()];
+      const yr = d.getUTCFullYear();
+      const hr = String(d.getUTCHours()).padStart(2, '0');
+      const min = String(d.getUTCMinutes()).padStart(2, '0');
+      const rel = formatTimeAgo(isoString);
+      return rel && rel !== '—' ? `${day} ${mon} ${yr}, ${hr}:${min} UTC · ${rel}` : `${day} ${mon} ${yr}, ${hr}:${min} UTC`;
+    }
+
+    const CAVEMAN_STOP = new Set([
+      'the', 'a', 'an', 'into', 'with', 'for', 'from', 'by', 'to', 'and', 'of', 'in',
+      'on', 'at', 'is', 'are', 'be', 'been', 'this', 'that', 'its', 'their', 'current',
+      'future', 'optional', 'authorized', 'remaining', 'work', 'system', 'initial'
+    ]);
+
+    function cavemanUltra(text, maxWords = 7) {
+      if (!text || typeof text !== 'string') return '';
+      let s = text.replace(/\s*\([^)]*\)/g, '').trim().replace(/\.+$/, '');
+      s = s
+        .replace(/\bwithout\s+(\w+)ing\b/gi, 'no-$1')
+        .replace(/\bwithout\b/gi, 'no')
+        .replace(/\barchitecture\b/gi, 'arch')
+        .replace(/\bconfiguration\b/gi, 'config')
+        .replace(/\bcomputer vision\b/gi, 'CV')
+        .replace(/\bcalibration\b/gi, 'calib')
+        .replace(/\bcontinuation\b/gi, 'cont')
+        .replace(/\bpersistence\b/gi, 'persist')
+        .replace(/\bacceptance\b/gi, 'accept')
+        .replace(/\bsynchronization\b/gi, 'sync')
+        .replace(/\binspection\b/gi, 'inspect')
+        .replace(/\bcontainer-specific\b/gi, 'container')
+        .replace(/\bzero-downtime\b/gi, '0-downtime');
+      const rawWords = s.split(/\s+/).map(w => w.replace(/^[,;:]+|[,;:]+$/g, '')).filter(Boolean);
+      const kept = [];
+      const seen = new Set();
+      for (const w of rawWords) {
+        const lw = w.toLowerCase();
+        if (CAVEMAN_STOP.has(lw)) continue;
+        if (seen.has(lw) && lw.length > 3) continue;
+        seen.add(lw);
+        kept.push(w);
+      }
+      const list = kept.length ? kept : rawWords;
+      const out = list.slice(0, maxWords).join(' ');
+      return list.length > maxWords ? out + '…' : out;
+    }
+
+    function shortPlanId(planId) {
+      if (!planId || typeof planId !== 'string') return '';
+      return planId.length > 16 ? `${planId.slice(0, 8)}…${planId.slice(-4)}` : planId;
+    }
+
     function renderServiceIndex(views) {
       const list = document.getElementById('plan-list');
       list.textContent = '';
       for (const view of views) {
         const card = textElement('article', 'plan-card', '');
         card.dataset.planId = view.plan_id;
+        card.dataset.status = view.status;
+        card.setAttribute('data-status', view.status);
+        card.setAttribute('data-full-objective', view.draft.objective);
         const heading = textElement('h2', '', '');
         const link = textElement('a', '', view.draft.objective);
         link.setAttribute('href', '/plans/' + encodeURIComponent(view.plan_id));
+        link.setAttribute('data-caveman', cavemanUltra(view.draft.objective));
         heading.appendChild(link);
         card.appendChild(heading);
-        card.appendChild(textElement('p', 'plan-card-meta', `${view.status} · Rev #${view.metadata.revision}`));
-        const published = textElement('p', '', 'Published: ');
+        const meta = textElement('p', 'plan-card-meta', `${view.status} · Rev #${view.metadata.revision}`);
+        meta.dataset.status = view.status;
+        meta.setAttribute('data-status', view.status);
+        card.appendChild(meta);
+        const published = textElement('p', 'plan-card-published', 'Published: ');
         const time = textElement('time', '', view.published_at);
         time.setAttribute('datetime', view.published_at);
+        time.setAttribute('data-pretty', formatCardTime(view.published_at));
         published.appendChild(time);
         card.appendChild(published);
-        card.appendChild(textElement('code', 'task-id-code', view.plan_id));
+        const code = textElement('code', 'task-id-code', view.plan_id);
+        code.setAttribute('title', view.plan_id);
+        code.setAttribute('data-short-id', shortPlanId(view.plan_id));
+        card.appendChild(code);
         if (view.draft.workflow !== null && view.draft.workflow !== undefined) {
           card.appendChild(textElement('p', 'workflow-info', 'Workflow: ' +
             Object.entries(view.draft.workflow).map(([key, value]) => `${key}: ${value}`).join('; ')));
@@ -1256,7 +1330,7 @@
         link = textElement('a', '', '');
         heading.appendChild(link);
         meta = textElement('p', 'plan-card-meta', '');
-        published = textElement('p', '', 'Published: ');
+        published = textElement('p', 'plan-card-published', 'Published: ');
         time = textElement('time', '', '');
         published.appendChild(time);
         code = textElement('code', 'task-id-code', '');
@@ -1268,10 +1342,23 @@
       // Equality checks preserve matching SSR descendants, including their text nodes.
       setText(link, plan.objective);
       if (link.getAttribute('href') !== href) link.setAttribute('href', href);
+      const caveman = cavemanUltra(plan.objective);
+      if (link.getAttribute('data-caveman') !== caveman) link.setAttribute('data-caveman', caveman);
+      if (card.getAttribute('data-full-objective') !== plan.objective) card.setAttribute('data-full-objective', plan.objective);
       setText(meta, `${plan.status} · Rev #${plan.revision}`);
       setText(time, plan.published_at);
       if (time.getAttribute('datetime') !== plan.published_at) time.setAttribute('datetime', plan.published_at);
       setText(code, plan.plan_id);
+      card.dataset.status = plan.status;
+      if (card.getAttribute('data-status') !== plan.status) card.setAttribute('data-status', plan.status);
+      meta.dataset.status = plan.status;
+      if (meta.getAttribute('data-status') !== plan.status) meta.setAttribute('data-status', plan.status);
+      published.className = 'plan-card-published';
+      const pretty = formatCardTime(plan.published_at);
+      if (time.getAttribute('data-pretty') !== pretty) time.setAttribute('data-pretty', pretty);
+      const shortId = shortPlanId(plan.plan_id);
+      if (code.getAttribute('data-short-id') !== shortId) code.setAttribute('data-short-id', shortId);
+      if (code.getAttribute('title') !== plan.plan_id) code.setAttribute('title', plan.plan_id);
       return card;
     }
 
@@ -1717,6 +1804,23 @@
     const containerEl = document.getElementById('graph-container');
     if (containerEl && typeof ResizeObserver !== 'undefined') {
       new ResizeObserver(() => { if (currentPlan) renderGraph(currentPlan); }).observe(containerEl);
+    }
+
+    if (typeof document.addEventListener === 'function') {
+      document.addEventListener('click', function (e) {
+        const target = e && e.target;
+        if (!target || typeof target.closest !== 'function') return;
+        if (target.closest('a')) return;
+        const card = target.closest('.plan-card');
+        if (card && card.classList) {
+          card.classList.toggle('is-expanded');
+          return;
+        }
+        const goal = target.closest('#goal-heading');
+        if (goal && goal.classList) {
+          goal.classList.toggle('is-expanded');
+        }
+      });
     }
 
     const initialize = serviceMode ? initService : initEvents;

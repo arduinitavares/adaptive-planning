@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from html import escape
 from importlib import resources
 from pathlib import Path
@@ -33,17 +34,106 @@ def _asset(name: str) -> bytes:
     return (Path(__file__).resolve().parent.parent / "assets" / "dashboard" / name).read_bytes()
 
 
+_CAVEMAN_STOP = {
+    "the", "a", "an", "into", "with", "for", "from", "by", "to", "and", "of", "in",
+    "on", "at", "is", "are", "be", "been", "this", "that", "its", "their", "current",
+    "future", "optional", "authorized", "remaining", "work", "system", "initial",
+}
+_CAVEMAN_SUBS = (
+    (r"\bwithout\s+(\w+)ing\b", r"no-\1"),
+    (r"\bwithout\b", "no"),
+    (r"\barchitecture\b", "arch"),
+    (r"\bconfiguration\b", "config"),
+    (r"\bcomputer vision\b", "CV"),
+    (r"\bcalibration\b", "calib"),
+    (r"\bcontinuation\b", "cont"),
+    (r"\bpersistence\b", "persist"),
+    (r"\bacceptance\b", "accept"),
+    (r"\bsynchronization\b", "sync"),
+    (r"\binspection\b", "inspect"),
+    (r"\bcontainer-specific\b", "container"),
+    (r"\bzero-downtime\b", "0-downtime"),
+)
+
+
+def _caveman_ultra(text: str, max_words: int = 7) -> str:
+    cleaned = re.sub(r"\s*\([^)]*\)", "", str(text).strip()).rstrip(".")
+    for pat, rep in _CAVEMAN_SUBS:
+        cleaned = re.sub(pat, rep, cleaned, flags=re.IGNORECASE)
+    words = [w.strip(",;:") for w in cleaned.split()]
+    kept: list[str] = []
+    seen: set[str] = set()
+    for word in words:
+        lw = word.lower()
+        if not word or lw in _CAVEMAN_STOP:
+            continue
+        if lw in seen and len(lw) > 3:
+            continue
+        seen.add(lw)
+        kept.append(word)
+    if not kept:
+        kept = words
+    result = " ".join(kept[:max_words])
+    return result + "…" if len(kept) > max_words else result
+
+
+def _format_time(value: str) -> str:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%d %b %Y, %H:%M %Z")
+    except (ValueError, AttributeError):
+        return value
+
+
+def _short_id(plan_id: str) -> str:
+    return f"{plan_id[:8]}…{plan_id[-4:]}" if len(plan_id) > 16 else plan_id
+
+
 def _plan_link(plan_id: str) -> str:
     return "/plans/" + quote(plan_id, safe="")
 
 
+def _status_chart(statuses: list[str]) -> str:
+    total = len(statuses)
+    if not total:
+        return ""
+    order = (("complete", "Complete"), ("running", "Running"), ("planning", "Planning"),
+             ("blocked", "Blocked"), ("stopped", "Stopped"))
+    counts = {k: sum(1 for s in statuses if s == k) for k, _ in order}
+    pills = []
+    rects = []
+    x = 0.0
+    width_total = 1000.0
+    for key, label in order:
+        c = counts[key]
+        if not c:
+            continue
+        pct = round(c * 100 / total)
+        w = max(12.0, round(width_total * (c / total), 1))
+        if x + w > width_total:
+            w = max(4.0, width_total - x)
+        rects.append(f'<rect class="chart-seg chart-seg--{key}" x="{x:.1f}" y="0" width="{w:.1f}" height="10" rx="4"></rect>')
+        x += w + 4.0
+        pills.append(f'<span class="chart-chip chart-chip--{key}"><b>{c}</b> {label} <small>{pct}%</small></span>')
+    svg = (f'<svg class="status-bar-svg" viewBox="0 0 1000 10" preserveAspectRatio="none" aria-hidden="true">'
+           + "".join(rects) + "</svg>")
+    return f'<div class="index-chart-strip"><div class="chart-chips">{"".join(pills)}</div>{svg}</div>'
+
+
 def _plan_card(plan_id: str, objective: str, status: str, revision: int, published_at: str,
                workflow: str = "", attributes: str = "") -> str:
+    pretty_time = _format_time(published_at)
+    short_id = _short_id(plan_id)
+    caveman = _caveman_ultra(objective)
     return (
-        '<article class="plan-card"' + attributes + '><h2><a href="' + escape(_plan_link(plan_id), quote=True) + '">'
-        + escape(objective) + '</a></h2><p class="plan-card-meta">'
-        + escape(status) + " · Rev #" + str(revision) + '</p><p>Published: <time>'
-        + escape(published_at) + '</time></p><code class="task-id-code">' + escape(plan_id)
+        '<article class="plan-card" data-status="' + escape(status, quote=True)
+        + '" data-full-objective="' + escape(objective, quote=True) + '"' + attributes
+        + '><h2><a href="' + escape(_plan_link(plan_id), quote=True)
+        + '" data-caveman="' + escape(caveman, quote=True) + '">'
+        + escape(objective) + '</a></h2><p class="plan-card-meta" data-status="' + escape(status, quote=True) + '">'
+        + escape(status) + " · Rev #" + str(revision) + '</p><p class="plan-card-published">Published: <time datetime="'
+        + escape(published_at, quote=True) + '" data-pretty="' + escape(pretty_time, quote=True) + '">'
+        + escape(published_at) + '</time></p><code class="task-id-code" title="' + escape(plan_id, quote=True)
+        + '" data-short-id="' + escape(short_id, quote=True) + '">' + escape(plan_id)
         + "</code>" + workflow + "</article>")
 
 
@@ -57,21 +147,29 @@ def render_plan_index(plans: tuple[PlanView, ...]) -> str:
         cards.append(_plan_card(
             view.plan_id, view.draft.objective, view.status, view.metadata.revision, view.published_at, workflow))
     content = "".join(cards) or '<p class="empty-message">No committed plans.</p>'
-    return _index_document(content, "/api/plans")
+    return _index_document(content, "/api/plans", chart=_status_chart([v.status for v in plans]))
 
 
-def _index_document(content: str, plans_url: str, navigation: str | None = None) -> str:
+def _index_document(content: str, plans_url: str, navigation: str | None = None, chart: str = "") -> str:
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
-        '<title>Shared plans</title><link rel="stylesheet" href="/style.css"></head>'
+        '<title>Shared plans | Adaptive planning</title><link rel="stylesheet" href="/style.css"></head>'
         '<body data-mode="service" data-plans-url="' + escape(plans_url, quote=True)
-        + '"><div class="app-container">'
-        '<header class="app-header"><div class="header-top"><h1>Shared plans</h1>'
+        + '"><header class="site-header"><div class="header-inner">'
+        '<a class="brand" href="/">Adaptive planning</a>'
+        '<nav aria-label="Main navigation"><a href="/" aria-current="page">Plans</a>'
+        '<a href="/measurements">Measurements</a></nav>'
         '<div id="conn-pill" class="status-pill status-pill--connecting" role="status">'
-        '<span id="conn-label">Connecting…</span></div></div>'
-        '<p>Read-only dashboard of committed publications. Host edits are not controlled by this service.</p>'
-        '<div id="reconnect-banner" class="banner banner--warning" hidden role="alert">'
+        '<span class="pill-dot" aria-hidden="true"></span>'
+        '<span id="conn-label">Connecting…</span></div></div></header>'
+        '<div class="app-container">'
+        '<header class="app-header app-header--index"><div class="header-top"><div class="index-heading">'
+        '<h1>Shared plans</h1>'
+        '<details class="caveman-details"><summary>read-only · click for info</summary>'
+        '<p class="header-subtitle">Read-only dashboard of committed publications. Host edits are not controlled by this service.</p>'
+        '</details></div></div>' + chart
+        + '<div id="reconnect-banner" class="banner banner--warning" hidden role="alert">'
         '<span id="reconnect-text"></span></div></header>'
         '<main id="plan-list" class="plan-list" aria-label="Committed plans">' + content + '</main>'
         + (navigation or "") + '</div><script src="/app.js"></script></body></html>')
@@ -109,7 +207,8 @@ def render_compact_plan_index(page: dict, limit: int | None = None, cursor: tupl
         links.append(("newer", "Newer", _index_target("/", nav_limit, ("before", page["previous_cursor"]))))
     if page["next_cursor"] is not None:
         links.append(("older", "Older", _index_target("/", nav_limit, ("after", page["next_cursor"]))))
-    return _index_document(cards, _index_target("/api/plan-index", limit, cursor), _index_navigation(links))
+    chart = _status_chart([item["status"] for item in page["plans"]])
+    return _index_document(cards, _index_target("/api/plan-index", limit, cursor), _index_navigation(links), chart=chart)
 
 
 def render_plan_index_restart(limit: int | None = None, cursor: tuple[str, str] | None = None) -> str:
