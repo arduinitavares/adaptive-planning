@@ -2,7 +2,7 @@
 name: adaptive-planning
 description: Use when a multi-step task has uncertain dependencies or outcomes, new observations could invalidate later steps, or the user requests iterative replanning, a rolling plan, or a receding planning horizon.
 metadata:
-  version: "2026-10-18-receipts-1"
+  version: "2026-10-23-superpowers-planning-1"
 ---
 
 # Adaptive Planning
@@ -30,6 +30,26 @@ Skill invocation does not expand permissions. Preserve required
 approvals and applicable testing, debugging, and review workflows.
 Takeover of a plan changes coordination authority but is not scope
 renewal; execution boundaries remain strictly bound to user authorization.
+
+## Maintained plan authoring
+
+Before an initial plan or a material replan, load `superpowers:writing-plans`.
+The user does not need to name both skills. Resolve the current installed
+companion through the active skill catalog or a supplied path.
+Read [the integration contract](references/superpowers-planning.md) before authoring.
+Apply the companion's task structure and self-review to the current planning horizon.
+Do not copy its templates into this skill or pin a versioned installation path.
+
+Keep full outcome coverage in the plan and its linked roadmap.
+Give ready work concrete actions, artifacts, dependencies, and verification checks.
+Keep distant work provisional until its expansion conditions are met.
+Use the same authoring standard when evidence changes the remaining plan.
+An unchanged reassessment does not require another authoring pass.
+
+If the companion cannot load, report the exact gap.
+Continue with the existing Adaptive Planning rules for a clearly labelled provisional plan.
+Do not claim Superpowers authoring or self-review for that plan.
+Preserve all existing coordination, evidence, authorization, and recovery rules.
 
 ## Plan language
 
@@ -180,10 +200,14 @@ sweep and recovery before new progress can occur.
 
 The framework-neutral instruction contract follows six generic stages:
 `publish/resume -> assign/start -> act/verify -> checkpoint/reassess -> resolve/review/accept -> eligible next work`.
-Workflow document references and phase metadata are optional; no specific
-Superpowers sequence is required.
+The service remains framework-neutral. Document references and phase metadata
+remain optional schema fields. This skill requires the maintained authoring
+workflow above, with an explicit provisional fallback when the companion cannot load.
+Preserve the selected execution workflow and its review gates.
 
 1. **Publish or resume.**
+   - Before initial publication, apply the maintained plan-authoring contract.
+     Save detailed plan files only within existing write authorization.
    - Initial plan: Publish the objective, acceptance criteria, constraints,
      known facts, assumptions, and bounded steps. Keep stable step IDs, explicit
      dependencies, and concrete next checks; keep distant steps coarse.
@@ -236,6 +260,9 @@ Superpowers sequence is required.
      path, branch, commit, and version. Edits that leave downstream definitions
      and tracked references unchanged do not by themselves require material reassessment.
      An unchanged reassessment must have `proposed_draft=None`.
+   - Before proposing a material revision, apply the maintained authoring contract
+     to affected pending work. This includes corrective work after invalidation.
+     Record actual evidence promptly, even when the revised plan is not yet available.
    - Safe pause relay: If work must pause, the relay records actual
      state truthfully without fabricating completion.
 

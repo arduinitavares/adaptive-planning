@@ -4,6 +4,9 @@ The live dashboard provides real-time visualization of the canonical adaptive pl
 The selected adaptive-planning MCP instance provides the authoritative
 dashboard for its plans. Discover its URLs through that connection.
 Apply the Plan language policy in [SKILL.md](../SKILL.md#plan-language).
+For initial authoring and material replanning, apply the
+[maintained Superpowers integration](superpowers-planning.md).
+Detailed task documents support the current graph. They do not replace its lifecycle authority.
 
 Review new authored text with `simplified-technical-english` before publishing.
 This includes `objective`, step `title`, `check`, `summary`, `details`,

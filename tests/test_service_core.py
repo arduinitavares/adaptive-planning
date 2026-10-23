@@ -238,7 +238,7 @@ class TestServiceCore(unittest.TestCase):
                     self.assertEqual(resp.status, 200)
                     body = resp.read()
                     resp.close()
-                    self.assertIn(b"Live Plan Dashboard Stylesheet", body)
+                    self.assertEqual(body, (ROOT / "assets" / "dashboard" / "style.css").read_bytes())
                 finally:
                     conn.close()
 

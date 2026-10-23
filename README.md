@@ -58,13 +58,19 @@ Use an empty destination. If a copy is already installed, review its local
 changes before replacing or updating it. A development checkout can live
 elsewhere; the agent must be able to discover or read its `SKILL.md`.
 
+Install Superpowers separately so `superpowers:writing-plans` is discoverable.
+Adaptive Planning loads the current installed companion automatically for initial
+plans and material replanning. It does not bundle a copy or pin an installation path.
+If the companion cannot load, the agent reports the gap and labels the plan
+provisional. Existing Adaptive Planning coordination remains available.
+
 Install `simplified-technical-english` as a separate companion skill.
 The agent must be able to discover or read its `SKILL.md` and references.
 Adaptive planning loads this companion for new plan and report text.
 It does not silently substitute another writing style if the companion
 is unavailable.
 
-Ordinary planning uses the two skills' Markdown instructions. The shared planning
+Ordinary planning composes these Markdown instructions. The shared planning
 service defaults to persistent MCP; see [docs/operations.md](docs/operations.md).
 For isolated legacy compatibility, the standalone local dashboard requires
 Python 3.10+ and a browser, using the Python standard library and local assets,
@@ -97,6 +103,17 @@ and client guides for [Codex](docs/clients/codex.md),
 [Antigravity](docs/clients/antigravity.md), and [Copilot](docs/clients/copilot.md). The server owns saved state, not
 models, dispatch, or Superpowers methodology; the agent follows its chosen
 workflow and records checkpoints and feedback.
+
+The agent uses maintained Superpowers guidance to write detailed near-term tasks.
+Adaptive Planning keeps the bounded horizon, dependencies, evidence, reviews,
+and explicit owner acceptance. Later outcomes remain visible in the roadmap with
+their prerequisites and expansion conditions. Material discoveries trigger the
+same authoring standard for affected work. An unchanged checkpoint keeps its plan.
+See [the integration contract](references/superpowers-planning.md).
+
+For a candidate checkout, give the agent that checkout's `SKILL.md` path and ask
+it to use the relative references there. This permits branch testing without
+replacing the installed skill or changing the running service.
 
 Plans and reports use `simplified-technical-english` for new human-readable
 text. Instructions and explanations follow their respective language rules.
