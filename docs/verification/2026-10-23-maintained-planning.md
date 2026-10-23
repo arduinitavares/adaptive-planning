@@ -1,5 +1,23 @@
 # Maintained planning verification
 
+## Current result
+
+The branch candidate is ready for user testing. The post-review five-case set
+plus the focused full-horizon case passed the scoped planning rubric. All six
+loaded the maintained companion. Seven earlier boundary checks also passed;
+their original source snapshots and limits remain recorded below.
+
+The final runtime regression run passed: **894 passed, 1 Windows-only skip**.
+JavaScript syntax and dashboard DOM checks passed. Service, dashboard, schema,
+deployment, and installed-skill files remain unchanged.
+
+Independent Opus review found one Important readiness gap. The coordinator fixed
+it in one pass and verified RED-to-GREEN behavior plus the full suite. Nine Minor
+items remain deferred. The provider truncated part of the review evidence appendix;
+this is not a claim of a full-packet review, live client discovery, or strict STE
+conformance. No re-review was dispatched, per the Native workflow's fix budget.
+
+
 ## Scope and provenance
 
 - Branch: `dev/superpowers-rolling-plans`.
@@ -92,8 +110,8 @@ Two fresh Opus supplied-packet reviews examined the design before implementation
   this delivery.
 
 The remaining re-review findings were concrete protocol and documentation gaps.
-The coordinator resolved them in the spec, plan, and this record. Final change
-review will examine the resulting artifact and observed verification.
+The coordinator resolved them in the spec, plan, and this record. The final change
+review and its dispositions are recorded below.
 
 ## Candidate results
 
@@ -102,16 +120,19 @@ of five). It was not accepted as green: sample 2 proposed implementation with
 unknown paths and contracts as ready work, and sample 5 assigned invented item
 numbers to an unread checklist. The coordinator added explicit separation of
 source facts and proposed designs, discovery readiness, and honest self-review.
-The final five-case set passed the applicable authoring rubric. All five requested
+The coordinator initially scored the pre-review five-case set as passing. The
+independent review correctly challenged cases 2 and 3: their ready graph steps
+bundled discovery with unknown or externally gated execution. Those two scores
+are superseded by the Important finding below; the pre-review set is not green. All five requested
 `READ_SKILL: superpowers:writing-plans` before authoring. The affected samples
 were rerun within that final set. The complete responses and observed execution
 receipts are retained in [the behavior evidence](2026-10-23-planning-behavior.json).
 
-| Final case | Observed result |
+| Pre-review case | Observed result |
 | --- | --- |
 | 1. Initial software | Ready source discovery; design and implementation remain provisional; plan-only stop |
-| 2. Material revision | Accepted `inspect` and ready sibling `report` retained; discovery precedes code edits; dependent `import` stays provisional |
-| 3. Physical pilot | Two discovery tracks; supplier prerequisites gate commissioning; no fabricated completion proof or software tests |
+| 2. Material revision — FAIL after review | Accepted `inspect` and ready sibling `report` retained; discovery precedes code edits; dependent `import` stays provisional |
+| 3. Physical pilot — FAIL after review | Two discovery tracks; supplier prerequisites gate commissioning; no fabricated completion proof or software tests |
 | 4. First-step revision | Revised task detail; unknown contracts remain provisional with holds; no further execution |
 | 5. Horizon two | Two active tasks; unread checklist stays unknown; later outcomes retain prerequisites and expansion conditions |
 
@@ -142,11 +163,81 @@ The STE surface scanner produced candidate flags for mixed procedure and
 descriptive prose. The official dictionary and governed termbase are unavailable.
 This is an Issue 9-oriented candidate, not a strict STE conformance claim.
 
-Final skill SHA-256: `c530abd6faa5d7b2ebc1107c4da66a8f31d3873a706e9e3b572687f1906b7873`.
-Final integration-reference SHA-256: `e74b2e80bc7012f7951e1c59a0904f0f7e564a5914006cdd0a23171f6b4b1514`.
-All 22 behavior responses completed with natural exit zero; no real tool activity
+Pre-review skill SHA-256: `c530abd6faa5d7b2ebc1107c4da66a8f31d3873a706e9e3b572687f1906b7873`.
+Pre-review integration-reference SHA-256: `e74b2e80bc7012f7951e1c59a0904f0f7e564a5914006cdd0a23171f6b4b1514`.
+The 22 pre-review behavior runs completed with natural exit zero; no real tool activity
 was observed. The `native-review-red` case name identifies the diagnostic run;
 it passed before any review-gate wording change, so no such change was made.
+
+## Independent change review and disposition
+
+Fresh Opus High reviewed commit `1f75adce13882df57feccc816ed519b1b62e8115`.
+The [complete review](2026-10-23-independent-review.md) records no Critical issue,
+one Important issue, and nine Minor items. Its verdict was **With fixes**.
+
+Important 1 is accepted. A graph step must not become ready merely because its
+first checkbox is discovery. The repair separates the verifiable discovery outcome from provisional
+execution, including when the graph horizon is full. A pending task can become
+discovery-only; later execution stays in the roadmap until a slot opens, its
+details are authored, and owner-controlled reassessment synchronizes the graph.
+The original final-2 and final-3 outputs are retained as RED evidence. The explicit full-horizon diagnostic passed even before the fix, showing prompt
+sensitivity; it is supplemental, not RED evidence. The fresh post-fix five-case set and the full-horizon case passed.
+
+| Post-fix case | Result |
+| --- | --- |
+| `fixed-1` initial software | Discovery-only ready task; implementation provisional; all outcomes covered; plan-only stop |
+| `fixed-2` material replan | `parse` narrowed to discovery; explicit stop before code edits; `import` held and `report` retained |
+| `fixed-3` physical pilot | Separate preparation inspection and commissioning nodes; commissioning blocked on supplier proof |
+| `fixed-4` first-step | Affected tasks remain held and provisional; exact versions unknown; no further step executed |
+| `fixed-5` horizon two | Two discovery tasks; all four execution outcomes retained outside the horizon |
+| `fixed-6` full horizon | Stable `parse`, `import`, `report` retained; discovery checkpoint frees a slot before `parse_impl` promotion |
+
+Exact RED evidence: pre-review `final-2` made the mixed `parse` task eligible and
+`final-3` marked mixed discovery/commissioning ready. Exact GREEN evidence:
+`fixed-2` says "Do not execute parser code edits inside this discovery task";
+`fixed-3` gives commissioning its own blocked graph node; `fixed-6` stops before
+code edits and requires checkpoint, acceptance, authoring, and synchronization.
+
+Post-fix integration-reference SHA-256:
+`934fcf0968a2f12c9c5b10c7bd427ea9f8adb09e8fbf08f7fcf5b5e1903588b2`.
+The `SKILL.md` hash remains the pre-review hash. All 29 behavior runs are preserved
+with requested reads, source manifests, final responses, effective model and mode,
+and observed process exits. No real tool activity was observed. Final suite:
+895 tests in 241.390 seconds, `OK (skipped=1)`, exit zero. Node DOM test: exit zero.
+
+The review packet was truncated by the provider partway through final-4. The
+reviewer saw all normative integration source but did not receive all supplied
+behavior evidence or the companion appendix. The review is consequently narrower
+than the packet file. No full-packet review or second reviewer verdict is claimed.
+The coordinator inspected the omitted evidence directly and retains it here.
+
+Deferred Minor items under the Native workflow's one-fix-pass rule:
+
+1. Top-level self-review wording can be clearer about full outcome coverage.
+2. Top-level material-proposal wording can name the owner explicitly.
+3. Unexposed companion version/hash can have an explicit `not exposed` instruction.
+4. Mandated execution-header wording can be clearer for non-software and selected methods.
+5. Incompatible-companion and newly available-companion edge cases can be defined more tightly.
+6. The short trigger wording can consistently say material change.
+7. Simulation language coverage is limited: STE was pre-satisfied, and host policy was supplied in prompts. Full STE conformance is not tested.
+8. The physical sample rendered ASCII without a specifically ASCII request; this incidental output error remains recorded.
+9. The baseline CSS test correction could be split into a separate commit for selective cherry-picking.
+
+Coordinator dispositions for every behavior the reviewer declined to judge:
+
+| Set-aside item | Coordinator ruling | Cost if wrong |
+| --- | --- | --- |
+| final-5 | Inspected directly; horizon and unknown-source checks passed before the readiness fix | Another output defect may remain; fresh post-fix sample required |
+| Six boundary cases | Inspected all six complete responses; retain narrowly scoped results | Other client behavior remains untested |
+| Native diagnostic | Inspected explicit no-per-task-review response | A less explicit prompt may still over-review |
+| Baseline and rejected candidates | Inspected complete outputs and retained their failures | Model variance limits causal certainty |
+| Maintained writing-plans content | Read installed content and verified its hash; no vendored template added | A future incompatible companion needs explicit fallback |
+| Design approval versus complete-task | Existing authority controls; discovery/design remains required when material choices are unresolved | Incorrect boundary interpretation could overstep scope |
+| Real client discovery | Leave to explicit candidate-path branch testing; make no end-to-end claim | Catalog differences may prevent automatic loading |
+| Simulated API snippets | Do not treat them as executable API examples; runtime suite tests actual contracts | Readers must not copy invented parameters from evidence transcripts |
+| Host-policy output | Disclose supplied policy as simulation context, not generic skill behavior | Context can influence results |
+| Suite details and unchanged runtime | Coordinator ran and inspected the suite and verified the full diff | macOS cannot exercise the Windows-only skipped case |
+| Acceptance item 5 | Fresh independent source review occurred; preserve its partial-packet limitation | Evidence coverage remains partly coordinator-assessed |
 
 ## Coordinator rulings and practical costs
 
@@ -171,6 +262,14 @@ it passed before any review-gate wording change, so no such change was made.
 | Service identity, HTTP/LAN, availability and legacy compatibility | Instance, HTTP, LAN, availability, interop, and corrected legacy asset test passed |
 | Language, first-step, plan-only and complete-task boundaries | Existing instructions retained; synthetic boundary cases assessed with stated limits |
 | Installed skill and running service | Installed hash matches baseline; no installed-copy write or service mutation |
+
+## Settlement
+
+All 32 task-owned model processes completed with natural exit zero. The actual
+event audit observed no tool activity or delegated children. All five task-owned
+Orca terminals were closed after their jobs and process groups settled. No unrelated
+session was closed. The original raw evidence remains in task-owned scratch;
+the relevant responses, review, rulings, and ledger are retained in this branch.
 
 ## Branch testing
 

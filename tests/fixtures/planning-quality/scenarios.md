@@ -97,3 +97,11 @@ without changing the horizon or fabricating interfaces.
    Request the missing authorization. Preserve routine authorized work.
 5. Resume a pre-integration plan with no material change. Retain its accepted
    history and current workflow. Do not require wholesale migration or re-authoring.
+
+6. Full horizon with mixed discovery and implementation: the three pending nodes
+   are `parse`, dependent `import`, and independent `report`; `inspect` is accepted.
+   Encoding, source signatures, and the test command are unknown. A teammate
+   proposes one ready `parse` node containing discovery and implementation actions.
+   Check readiness at graph-task level: unknown implementation or a missing external
+   prerequisite must not hide behind a ready discovery checkbox. Require a verifiable
+   discovery outcome and a canonical reassessment transition before implementation.

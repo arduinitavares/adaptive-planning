@@ -76,8 +76,8 @@
 - [x] Verify `git diff af207546607d43ffa3b0cb8d23b4dca121f36b43 -- adaptive_planning assets scripts pyproject.toml uv.lock Dockerfile compose.yaml` is empty.
 - [x] Check untracked files with `git status --porcelain` for the same protected paths.
 - [x] Compare the installed skill hash with its recorded baseline hash.
-- [ ] Obtain a fresh cross-family whole-change review through Orca.
-- [ ] Resolve material findings within the review budget. Record deferred minor findings.
+- [x] Obtain a fresh cross-family whole-change review through Orca.
+- [x] Resolve material findings within the review budget. Record deferred minor findings.
 - [x] Record the candidate path, test limits, and how to test without replacing the installed skill.
 
 **Expected:** All existing checks pass or have explicit baseline dispositions. The user can test the branch before merging.

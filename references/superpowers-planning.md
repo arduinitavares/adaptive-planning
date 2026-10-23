@@ -39,6 +39,19 @@ A placeholder path or "run the repository tests" does not make an implementation
 Keep that work provisional. Make source inspection or contract discovery the next verifiable action.
 The self-review must report unresolved facts; it must not certify placeholder instructions as executable.
 
+Assess readiness for the whole graph task, not only its first checkbox.
+Do not mark a task ready when it combines discovery with implementation or physical actions
+that still depend on unknown facts or missing external prerequisites.
+Separate discovery into its own verifiable graph task.
+If the horizon is full, narrow the affected pending task to discovery only.
+Retain the later execution outcome in the provisional roadmap until a slot opens.
+Keep accepted history and unaffected steps intact. Synchronize the changed pending definitions
+and dependencies through the owner's material reassessment before discovery starts.
+After discovery, record its checkpoint and reassess the provisional execution work.
+Use the companion to author concrete execution details from that evidence.
+Synchronize the new definitions and document references before that execution becomes eligible.
+Do not continue into implementation or commissioning within the discovery task.
+
 One graph step normally corresponds to one independently verifiable document task.
 Keep the task's action checkboxes inside its detailed document.
 Do not create graph nodes for every sentence, command, or checkbox.
